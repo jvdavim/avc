@@ -1,0 +1,97 @@
+name: Bug report
+description: Something in AVC does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report.
+
+        **Do not report security vulnerabilities here.** See [SECURITY.md](https://github.com/jvdavim/avc/blob/main/SECURITY.md).
+
+        If this involves data loss or cache corruption, please include the output of `avc doctor` and `avc status` below.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The command you ran and what it did, including the exact error text.
+      placeholder: |
+        $ avc pull --remote origin
+        avc: remote object missing for model.bin
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps to reproduce, ideally starting from `git init`.
+      placeholder: |
+        git init repro && cd repro
+        printf 'test\n' > model.bin
+        avc init
+        avc add model.bin
+        ...
+    validations:
+      required: true
+
+  - type: input
+    id: avc-version
+    attributes:
+      label: AVC version
+      description: Output of `avc --version`, or the commit SHA if built from source.
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`.
+    validations:
+      required: true
+
+  - type: input
+    id: git-version
+    attributes:
+      label: Git version
+      description: Output of `git --version`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Output of `avc status` and `avc doctor`, plus the relevant pointer file if applicable.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I checked the [known limitations](https://github.com/jvdavim/avc/blob/main/docs/roadmap.md) and this is not one of them.
+          required: true

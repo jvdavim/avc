@@ -1,0 +1,54 @@
+name: Feature request
+description: Suggest a capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the **problem** before the solution. "I need to check out an
+        artifact as of an old commit, and today I have to do X" is more useful than
+        "add a `--rev` flag" — it leaves room for a better design.
+
+        Check the [roadmap](https://github.com/jvdavim/avc/blob/main/docs/roadmap.md)
+        first. If it is already listed, a comment saying you need it helps prioritize.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what makes it hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Optional. What you have in mind, if you have something specific.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Workarounds you tried, and why they fall short.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI commands or output
+        - Pointer format or SPEC
+        - Remotes and transfers
+        - Cache or garbage collection
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to work on this.

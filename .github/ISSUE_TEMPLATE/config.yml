@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or design discussion
+    url: https://github.com/jvdavim/avc/discussions
+    about: Ask a question or propose an idea before opening an issue.
+  - name: Documentation
+    url: https://github.com/jvdavim/avc/tree/main/docs
+    about: Getting started, CLI reference, configuration, and architecture.
+  - name: Report a security vulnerability
+    url: https://github.com/jvdavim/avc/security/advisories/new
+    about: Report privately. Do not open a public issue.
