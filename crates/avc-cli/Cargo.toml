@@ -1,0 +1,17 @@
+[package]
+name = "avc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Artifact Version Control command-line interface"
+
+[[bin]]
+name = "avc"
+path = "src/main.rs"
+
+[dependencies]
+avc-core = { path = "../avc-core" }
+clap.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true

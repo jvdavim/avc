@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/avc-cli",
+    "crates/avc-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "1"
+toml = "0.8"
+url = "2"

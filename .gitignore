@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# AVC local cache and state
+/.avc/cache/
+/.avc/state/
+/.avc/config.local.toml
+
+# Local environment and editor files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
