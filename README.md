@@ -16,6 +16,7 @@ stays in it.
 
 ```bash
 avc add model.bin      # hash it, cache it, write model.bin.avc
+avc add data/          # or a whole directory, as one artifact
 git add model.bin.avc  # commit the pointer, not the 4 GB
 avc push               # send the bytes to your object store
 ```
@@ -37,7 +38,10 @@ avc push               # send the bytes to your object store
 - 🎯 **Explicit providers.** Transport is chosen by URL scheme, never guessed
   from a hostname.
 - 🧩 **Deduplicates by construction.** Identical bytes have one key, whether they
-  appear in ten paths or ten branches.
+  appear in ten paths, ten branches, or twice inside one tracked directory.
+- 📁 **Directories are one artifact.** `avc add data/` tracks a whole tree behind
+  a single pointer; editing one file in a thousand re-versions the directory
+  without re-storing the other 999.
 - 🦀 **Small dependency tree.** Nine direct dependencies, no async runtime. S3
   is spoken over plain HTTP with a hand-written SigV4 signer rather than a
   cloud SDK. A tool guarding your artifacts should not be a supply-chain
@@ -137,10 +141,27 @@ See [Getting Started](docs/getting-started.md) for the full walkthrough.
 
 ### Tracking
 
-`avc add` starts tracking a file; `avc commit` records a new version of one
-already tracked. Both stream the file through SHA-256, deduplicate against the
-cache, and write a canonical pointer. `avc remove` stops tracking without
+`avc add` starts tracking a file or a directory; `avc commit` records a new
+version of one already tracked. Both stream through SHA-256, deduplicate against
+the cache, and write a canonical pointer. `avc remove` stops tracking without
 deleting anything.
+
+A directory is one artifact with one pointer:
+
+```bash
+avc add data/
+```
+
+```text
+tracked data/ (3 file(s), 17 B, sha256:bb292f…)
+```
+
+Every file beneath it is hashed and cached, and a **manifest** naming them is
+stored as an object of its own — so a directory is `n + 1` ordinary objects,
+moving through push, pull, and gc like any other. The manifest's hash is the
+directory's identity, which makes a file edited, added, removed, or renamed
+anywhere inside it show up as `modified`. Unchanged files are never re-stored,
+and identical files are stored once.
 
 ### Pointers
 
@@ -158,6 +179,9 @@ object:
   media_type: null
 ```
 
+A directory pointer adds `kind: directory` and names its manifest object; the
+field is absent for files, so file pointers are unchanged.
+
 Validation is strict — unknown fields are rejected, and `path` may not escape the
 repository root. A pointer drives filesystem writes, so it is treated as
 untrusted input.
@@ -165,7 +189,8 @@ untrusted input.
 ### Inspection
 
 `avc status` reports working-tree state (`ok`, `modified`, `missing`) and cache
-state (`cached`, `cache-missing`) per artifact. `avc list --remote origin` shows
+state (`cached`, `cache-missing`) per artifact — a directory is re-scanned into
+a manifest and reported the same way. `avc list --remote origin` shows
 what a remote holds **without downloading bytes**. `avc doctor` re-hashes cached
 objects and fails on any drift.
 

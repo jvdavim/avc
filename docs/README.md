@@ -35,6 +35,11 @@ AVC keeps those bytes out of Git. Running `avc add model.bin`:
 3. Writes a small pointer file, `model.bin.avc`, that you commit to Git.
 4. Adds `model.bin` itself to `.gitignore`.
 
+`avc add data/` does the same for a whole directory: every file beneath it is
+hashed and cached, and a manifest naming them becomes one more object, so the
+directory is a single artifact behind a single `data.avc` pointer — see
+[Concepts](concepts.md#directories).
+
 Cloning the repository gives you the pointer. `avc pull` fetches the bytes.
 Git history stays small, and the pointer gives you an exact, verifiable identity
 for the artifact at every commit.

@@ -18,6 +18,7 @@ avc/
     │       ├── object.rs       # ObjectId, cache key derivation
     │       ├── path.rs         # repository path validation and normalization
     │       ├── pointer.rs      # Pointer, ObjectMetadata, canonical YAML
+    │       ├── tree.rs         # Tree, TreeEntry, directory manifests
     │       └── remote/         # object transport
     │           ├── mod.rs          # ObjectStore trait, key layout, dispatch
     │           ├── file.rs         # file:// backend
@@ -93,6 +94,19 @@ The `s3+https` and `s3+http` branches are the ones with real logic: host (with
 port, if any) becomes `endpoint_url`, the first path segment becomes the bucket,
 and the remainder becomes the prefix.
 
+### `tree.rs` — directory manifests
+
+A tracked directory has no storage of its own: its object is a `Tree`, a sorted,
+unique list of `TreeEntry` values whose paths are relative to the directory
+rather than to the repository. `Tree::new` does the sorting, so a manifest never
+depends on directory-iteration order and one directory has exactly one identity.
+
+`Tree::parse` is held to the same standard as `Pointer::parse` and for the same
+reason — a manifest decides where `checkout` writes. Entry paths go through
+`validate_repo_path`, unknown fields are rejected, and a manifest that arrives
+unsorted or with a repeated path is refused rather than normalized: it did not
+come from `Tree::new`, so its hash is not the hash of the content it claims.
+
 ### `remote/` — object transport
 
 `ObjectStore` is the whole interface: `put`, `get`, `exists`, `list`, all keyed
@@ -118,15 +132,17 @@ error code survives into the message the user sees.
 ### `lib.rs` — errors and tests
 
 One `Error` enum via `thiserror`, covering invalid object IDs, invalid paths,
-invalid remotes, unsupported pointer versions, YAML failures, I/O, missing
-remote objects, missing credentials, unimplemented providers, and provider
-failures. `Error::is_provider_failure` is what separates exit code `3` from `1`.
+invalid remotes, unsupported pointer and manifest versions, invalid manifests,
+YAML failures, I/O, missing remote objects, missing credentials, unimplemented
+providers, and provider failures. `Error::is_provider_failure` is what separates exit code `3` from `1`.
 Public `Result<T>` alias.
 
 Unit tests live beside the code they cover; `lib.rs` holds those for hashing,
-pointers, paths, and remote scheme parsing. `tests/object_store.rs` asserts one
-contract against both backends — the S3 half runs against a real server when
-`AVC_TEST_S3_ENDPOINT` is set.
+pointers, manifests, paths, and remote scheme parsing. `tests/object_store.rs`
+asserts one contract against both backends — the S3 half runs against a real
+server when `AVC_TEST_S3_ENDPOINT` is set. `crates/avc-cli/tests/directory.rs`
+drives the binary itself through the directory workflow, remote round trip
+included.
 
 ## `avc-cli`
 
@@ -154,6 +170,10 @@ why a `pull` will not clobber a locally modified file.
 | `find_root` | Walks up from cwd to the first `.git` |
 | `load_repo` / `save_config` | Reads and writes `.avc/config.toml` |
 | `pointer_files` / `collect_files` | Recursive `*.avc` scan, skipping `.git` and `target` |
+| `scan_directory` / `collect_artifact_files` | Hash every regular file under a tracked directory, skipping symlinks |
+| `load_tree` / `write_manifest` | Read a verified manifest out of the cache; write one into it |
+| `required_objects` | Expand a pointer into the objects it needs — manifest first |
+| `materialize` | Write one cached object into the worktree, honoring `--force` |
 | `parse_pointer` | Reads and validates one pointer |
 | `cache_path` / `remote_path` | Compose a location from `ObjectId::cache_key()` |
 | `choose_remote` | Resolves `--remote`, else `default_remote` |
@@ -171,7 +191,7 @@ add(paths)
   └─ load_repo()                       find .git, read .avc/config.toml
      └─ add_one(repo, "model.bin", require_pointer=false)
         ├─ normalize_repo_path()       reject traversal        [core::path]
-        ├─ is_file()                   reject directories
+        ├─ is_dir()/is_file()          pick file or directory tracking
         ├─ hash_file()                 streaming SHA-256       [core::hashing]
         ├─ Pointer::new()              build + validate        [core::pointer]
         ├─ cache_path()                objects/sha256/1d/1dfc… [core::object]
@@ -179,6 +199,29 @@ add(paths)
         ├─ append_ignore_path()        add "model.bin" to .gitignore
         └─ write_atomic()              write model.bin.avc
 ```
+
+## Data flow: `avc add data/`
+
+A directory takes the same path, with one indirection: its object is a manifest
+of the files beneath it rather than bytes of its own.
+
+```text
+add(paths)
+  └─ add_one(repo, "data", require_pointer=false)
+     └─ track_directory()
+        ├─ scan_directory()            walk, skip symlinks, hash each file
+        │   └─ TreeEntry::new()        path relative to data/    [core::tree]
+        ├─ store_in_cache()            one object per distinct file
+        ├─ Tree::new()                 sort + validate           [core::tree]
+        ├─ write_manifest()            manifest becomes an object too
+        ├─ Pointer::new_directory()    kind: directory           [core::pointer]
+        ├─ append_ignore_path()        add "data/" to .gitignore
+        └─ write_atomic()              write data.avc
+```
+
+Because a manifest is an ordinary object, `push`, `pull`, and `gc` need no
+directory-specific transport — only `required_objects` to expand one pointer
+into the `1 + n` objects it references.
 
 `avc-core` supplies validation and identity; `avc-cli` supplies placement and
 durability.
@@ -215,6 +258,10 @@ Changes that break any of these need a SPEC change first, discussed in an issue:
 7. No command deletes remote data.
 8. Providers are chosen by scheme only.
 9. Hashing memory does not scale with file size.
+10. A directory's manifest is canonical — sorted, unique, and relative to the
+    directory — so one directory has one identity.
+11. A manifest is verified against its pointer before it is parsed, and its
+    entry paths are validated before they are joined onto a worktree path.
 
 ## Known structural gaps
 
@@ -226,8 +273,9 @@ good first contributions, see [Roadmap](roadmap.md):
 - **`parse_pointer` calls `find_root()` on every invocation**, so scanning N
   pointers walks the directory tree N times. Harmless at current scale, wasteful
   at large ones.
-- **No CLI integration tests.** `avc-core` has unit tests and an `ObjectStore`
-  contract suite, but nothing drives the `avc` binary end to end.
+- **Thin CLI integration tests.** `crates/avc-cli/tests/directory.rs` drives the
+  binary end to end for directory artifacts; the file workflows still have no
+  equivalent.
 - **`gc` reachability ignores Git history**, considering only worktree pointers.
 - **Retries and timeouts are absent** in the S3 transport: one attempt, no deadline.
 
@@ -236,6 +284,7 @@ good first contributions, see [Roadmap](roadmap.md):
 | You want to change… | Start in |
 | --- | --- |
 | The pointer format | `crates/avc-core/src/pointer.rs` **and** `SPEC.md` |
+| The directory manifest format | `crates/avc-core/src/tree.rs` **and** `SPEC.md` |
 | Hash algorithm or chunking | `crates/avc-core/src/hashing.rs`, `object.rs` |
 | Path safety rules | `crates/avc-core/src/path.rs` |
 | A new remote scheme | `crates/avc-core/src/config.rs` |

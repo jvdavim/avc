@@ -2,7 +2,7 @@
 
 This walkthrough takes you from an empty directory to an artifact pushed to a
 remote and pulled back. It uses a local `file://` remote, so it needs no
-credentials and no network — see [step 6](#6-configure-a-remote) for the S3
+credentials and no network — see [step 7](#7-configure-a-remote) for the S3
 equivalent.
 
 ## Requirements
@@ -98,7 +98,45 @@ object:
 `media_type` is optional metadata; `avc add` does not infer it, so it is written
 as `null`.
 
-## 4. Check state
+## 4. Track a directory
+
+A directory is tracked the same way, as **one artifact with one pointer**:
+
+```bash
+mkdir -p data/raw
+printf 'first\n'  > data/raw/one.csv
+printf 'second\n' > data/raw/two.csv
+avc add data/
+```
+
+```text
+tracked data/ (2 file(s), 13 B, sha256:…)
+```
+
+Every file beneath `data/` is hashed and cached; a manifest naming them becomes
+an object of its own, and `data.avc` points at it. Only `data.avc` goes into
+Git — `data/` is added to `.gitignore`.
+
+```bash
+cat data.avc
+```
+
+```yaml
+version: 1
+path: data
+kind: directory
+object:
+  algorithm: sha256
+  hash: 0e80f9d32ad0dfdf6de8dce2230f3b7ce722720a3c3cf6ba3c4876a04c463456
+  size: 266
+  media_type: application/vnd.avc.tree+yaml
+```
+
+The directory's identity is that manifest's hash, so editing, adding, removing,
+or renaming any file inside it makes the whole artifact `modified` — record the
+new contents with `avc commit data`.
+
+## 5. Check state
 
 ```bash
 avc status
@@ -106,21 +144,23 @@ avc status
 
 ```text
 ok      cached  model.bin
+ok      cached  data/
 ```
 
 The first column is the working-tree state (`ok`, `modified`, or `missing`); the
-second is cache state (`cached` or `cache-missing`).
+second is cache state (`cached` or `cache-missing`). A directory is `cached`
+only when its manifest and every file it names are in the cache.
 
-## 5. Commit to Git
+## 6. Commit to Git
 
-Pointer files and shareable configuration belong in Git. The artifact does not.
+Pointer files and shareable configuration belong in Git. The artifacts do not.
 
 ```bash
-git add .avc/config.toml model.bin.avc .gitignore
-git commit -m "Track model artifact"
+git add .avc/config.toml model.bin.avc data.avc .gitignore
+git commit -m "Track model and data artifacts"
 ```
 
-## 6. Configure a remote
+## 7. Configure a remote
 
 For local development, use a `file://` remote — a plain directory that stands in
 for an object store.
@@ -152,7 +192,7 @@ avc remote list
 * origin File /tmp/avc-remote
 ```
 
-## 7. Push and pull
+## 8. Push and pull
 
 Check what the remote has, without downloading anything:
 
@@ -163,7 +203,11 @@ avc list --remote origin
 ```text
 PATH    SIZE    OBJECT  REMOTE
 model.bin       17      sha256:1dfc4d…       missing
+data/   13      sha256:0e80f9…       missing
 ```
+
+For a directory, `SIZE` is the total bytes of the files it holds, and `REMOTE`
+reads `available` only once the manifest *and* every file it names are there.
 
 Upload the bytes:
 
@@ -174,13 +218,14 @@ avc push
 Now simulate a fresh clone by deleting the artifact and restoring it:
 
 ```bash
-rm model.bin
+rm -rf model.bin data
 avc status          # missing  cached  model.bin
-avc pull            # downloads to cache, then materializes the file
+avc pull            # downloads to cache, then materializes the artifacts
 avc status          # ok       cached  model.bin
+find data -type f   # the whole directory is back
 ```
 
-## 8. Update an artifact
+## 9. Update an artifact
 
 When the file changes, `status` reports it:
 
@@ -198,6 +243,16 @@ git add model.bin.avc && git commit -m "Update model"
 avc push
 ```
 
+The same applies to a directory. Change one file in it and only that file
+becomes a new object; the rest are already stored:
+
+```bash
+printf 'third\n' > data/raw/three.csv
+avc status          # modified  cached  data/
+avc commit data
+avc push
+```
+
 The old object stays in the cache so older commits remain checkoutable. Reclaim
 space once you no longer need it:
 
@@ -211,7 +266,7 @@ avc gc              # delete objects no pointer in the worktree references
 > historical commits are considered unreachable. See
 > [CLI Reference](cli.md#avc-gc).
 
-## 9. Verify integrity
+## 10. Verify integrity
 
 ```bash
 avc doctor

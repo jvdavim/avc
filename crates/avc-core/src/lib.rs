@@ -6,13 +6,15 @@ mod object;
 mod path;
 mod pointer;
 pub mod remote;
+mod tree;
 
 pub use config::{Provider, RemoteConfig};
 pub use hashing::{hash_file, hash_reader, HashResult, StreamHasher};
 pub use object::{ObjectId, ALGORITHM};
 pub use path::{normalize_repo_path, pointer_path, validate_repo_path};
-pub use pointer::{Artifact, ObjectMetadata, Pointer, POINTER_VERSION};
+pub use pointer::{Artifact, ArtifactKind, ObjectMetadata, Pointer, POINTER_VERSION};
 pub use remote::{Credentials, LocalRemoteOverride, ObjectStore, RemoteObject};
+pub use tree::{Tree, TreeEntry, TREE_MEDIA_TYPE, TREE_VERSION};
 
 /// Errors returned by core validation and serialization operations.
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +27,10 @@ pub enum Error {
     InvalidRemote(String),
     #[error("unsupported pointer version: {0}")]
     UnsupportedPointerVersion(u32),
+    #[error("unsupported directory manifest version: {0}")]
+    UnsupportedTreeVersion(u32),
+    #[error("invalid directory manifest: {0}")]
+    InvalidTree(String),
     #[error("pointer serialization failed: {0}")]
     PointerSerialization(#[from] serde_yaml::Error),
     #[error("I/O error: {0}")]
@@ -107,6 +113,64 @@ mod tests {
             pointer_path("données/模型.bin").unwrap().to_str().unwrap(),
             "données/模型.bin.avc"
         );
+    }
+
+    #[test]
+    fn directory_pointer_names_its_manifest_and_files_stay_unchanged() {
+        let manifest =
+            ObjectId::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                .unwrap();
+        let pointer = Pointer::new_directory("data", manifest.clone(), 387).unwrap();
+        assert!(pointer.is_directory());
+        let yaml = pointer.serialize_canonical().unwrap();
+        assert_eq!(
+            yaml,
+            "version: 1\npath: data\nkind: directory\nobject:\n  algorithm: sha256\n  hash: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n  size: 387\n  media_type: application/vnd.avc.tree+yaml\n"
+        );
+        assert_eq!(Pointer::parse(&yaml).unwrap(), pointer);
+
+        // A file pointer keeps the bytes it had before directories existed,
+        // and a pointer written by an older AVC still parses as a file.
+        let file = Pointer::new("model.bin", manifest, 42, None).unwrap();
+        let yaml = file.serialize_canonical().unwrap();
+        assert!(!yaml.contains("kind"));
+        assert_eq!(Pointer::parse(&yaml).unwrap().kind, ArtifactKind::File);
+    }
+
+    #[test]
+    fn manifest_order_is_canonical_so_a_directory_has_one_identity() {
+        let object = |byte: char| {
+            ObjectId::new(std::iter::repeat(byte).take(64).collect::<String>()).unwrap()
+        };
+        let entry = |path: &str, byte: char| TreeEntry::new(path, object(byte), 1).unwrap();
+
+        // Discovery order must not change the manifest, or the same directory
+        // would hash differently on two machines.
+        let one = Tree::new(vec![entry("nested/b.bin", 'b'), entry("a.bin", 'a')]).unwrap();
+        let two = Tree::new(vec![entry("a.bin", 'a'), entry("nested/b.bin", 'b')]).unwrap();
+        assert_eq!(one, two);
+        assert_eq!(one.total_size(), 2);
+        let yaml = one.serialize_canonical().unwrap();
+        assert_eq!(Tree::parse(&yaml).unwrap(), one);
+
+        // A manifest is untrusted input that decides where checkout writes.
+        assert!(Tree::parse(
+            "version: 1\nentries:\n- path: ../escape\n  algorithm: sha256\n  hash: aa\n  size: 1\n"
+        )
+        .is_err());
+        assert!(Tree::parse("version: 2\nentries: []\n").is_err());
+        assert!(Tree::parse("version: 1\nentries: []\nextra: true\n").is_err());
+        // Unsorted or duplicated entries did not come from `Tree::new`.
+        let unsorted = yaml.replace("- path: a.bin", "- path: z.bin");
+        assert!(Tree::parse(&unsorted).is_err());
+    }
+
+    #[test]
+    fn a_trailing_slash_names_the_same_artifact() {
+        assert_eq!(normalize_repo_path("data/").unwrap(), "data");
+        assert_eq!(normalize_repo_path("data/nested//").unwrap(), "data/nested");
+        assert_eq!(pointer_path("data/").unwrap().to_str().unwrap(), "data.avc");
+        assert!(normalize_repo_path("/").is_err());
     }
 
     #[test]

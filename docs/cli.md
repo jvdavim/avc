@@ -96,7 +96,7 @@ avc remote list
 
 ## `avc add`
 
-Track one or more files.
+Track one or more files or directories.
 
 ```bash
 avc add <path> [<path>...]
@@ -113,11 +113,43 @@ avc add model.bin data/train.parquet
 tracked model.bin (sha256:1dfc4d…)
 ```
 
-Fails if the path is not a regular file. **Directories are rejected** — pass
-individual files.
+Fails if the path is neither a regular file nor a directory.
 
 Re-running `add` on a changed file updates the pointer to the new content and
 adds a new cache object. The previous object remains until `gc`.
+
+### Directories
+
+A directory is one artifact with one pointer, the way `dvc add` treats one:
+
+```bash
+avc add data/
+```
+
+```text
+tracked data/ (3 file(s), 17 B, sha256:bb292f…)
+```
+
+Every regular file beneath the directory is hashed and cached, and a **manifest**
+naming them is stored as an object of its own. `data/` gets a single pointer at
+`data.avc`, and `data/` is added to `.gitignore`. A trailing slash is optional
+everywhere — `avc add data/` and `avc add data` name the same artifact.
+
+The directory's identity is its manifest's hash, so a file edited, added,
+removed, or renamed anywhere beneath it makes the whole artifact `modified`.
+Re-run `avc commit data` to record the new contents.
+
+Files are deduplicated across the whole repository: identical files inside a
+directory, or shared with a separately tracked artifact, are stored once. See
+[Concepts](concepts.md#directories) for the manifest format.
+
+Two directories are refused rather than tracked misleadingly:
+
+- an empty directory — `directory contains no files to track: <path>`
+- one containing a `.avc` file, which pointer discovery would read as a pointer
+  and the manifest would record as content
+
+Symlinks beneath the directory are skipped, not followed.
 
 ## `avc commit`
 
@@ -127,8 +159,9 @@ Record a new version of an **already-tracked** artifact.
 avc commit <path> [<path>...] [--force]
 ```
 
-Identical to `add`, except it first requires that a pointer already exists for
-the path, failing with `no pointer exists for <path>` if not.
+Identical to `add` — directories included — except it first requires that a
+pointer already exists for the path, failing with `no pointer exists for <path>`
+if not.
 
 `--force` skips that requirement, making `commit --force` behave like `add`.
 
@@ -161,8 +194,14 @@ Tab-separated columns: working-tree state, cache state, path.
 
 | Cache | Meaning |
 | --- | --- |
-| `cached` | Referenced object is present in `.avc/cache` |
-| `cache-missing` | Not present; `pull` before `checkout` |
+| `cached` | Every object the artifact needs is present in `.avc/cache` |
+| `cache-missing` | At least one is not; `pull` before `checkout` |
+
+Directories are shown with a trailing slash and follow the same states: a
+directory is re-scanned and re-hashed into a manifest, so `modified` covers a
+file edited, added, removed, or renamed anywhere beneath it, and `missing` means
+the directory itself is gone. It is `cached` only when its manifest *and* every
+file the manifest names are cached, because anything less cannot be checked out.
 
 Unparseable pointers are reported as `invalid <path>: <error>` and skipped rather
 than aborting the run.
@@ -196,6 +235,14 @@ Availability is resolved with a single prefixed listing of the remote, not one
 request per artifact, so a repository with a thousand pointers costs one round
 trip. Objects in the bucket that AVC did not write are ignored.
 
+For a directory, `SIZE` is the total bytes of the files it contains, not the size
+of its manifest, and `REMOTE` reads `available` only when the manifest *and*
+every file it names are on the remote — a half-uploaded directory cannot be
+restored. Reading those numbers needs the manifest, so `list` fetches it from
+the remote when it is not cached. A manifest is metadata of a few bytes per
+file; artifact bytes are still never downloaded. When the manifest is on neither
+side, the file list is unknowable and the row reads `-` and `missing`.
+
 > **Limitation:** `gs://` and `az://` remotes fail with
 > `provider adapter not implemented`.
 
@@ -221,6 +268,10 @@ Objects already present on the remote are skipped — reported as
 `up to date <path>` — because content-addressed objects are immutable and
 re-uploading identical bytes is pure cost. Uploads stream in bounded memory.
 
+A directory uploads as its files followed by its manifest — `pushed data/ (4
+object(s))` — in that order, so a manifest on the remote never names bytes that
+have not arrived yet. Duplicate files are uploaded once.
+
 > **Limitation:** no multipart upload. A very large artifact is a single `PUT`,
 > and a dropped connection restarts it. `gs://` and `az://` fail with
 > `provider adapter not implemented`.
@@ -244,6 +295,10 @@ the conflict deliberately with `avc checkout --force` if that is what you want.
 
 Fails with `remote object not found: <hash>` if the remote lacks the object.
 Objects already in the cache are not re-downloaded.
+
+A directory downloads its manifest first — until that has arrived and been
+verified, the rest of its objects are unknown — then every file the manifest
+names, then materializes the tree.
 
 Each download is hashed as it is written and checked against its pointer's size
 and digest before it becomes visible in the cache. An object that does not match
@@ -278,8 +333,16 @@ uncommitted changes to the artifact.**
 
 Fails with `cache object missing for <path>` when the object is not cached.
 
-> Path filtering here matches the *pointer file path*, so `avc checkout model.bin`
-> selects `model.bin.avc`.
+For a directory, the check is applied per file — `refusing to replace modified
+file data/a.bin` — and checkout stops there rather than overwriting the rest.
+Files present in the directory that the manifest does not name are **left
+alone**: `checkout` never deletes. A directory that has been restored on top of
+unrelated leftovers therefore still reads as `modified`; remove the extras
+yourself.
+
+> Naming a path that has no pointer is an error rather than a silent no-op, and
+> a trailing slash is accepted: `avc checkout data/` and `avc checkout data`
+> both select `data.avc`.
 
 ---
 
@@ -315,7 +378,17 @@ avc gc --dry-run     # would remove /path/.avc/cache/objects/sha256/9a/9a3b1c…
 avc gc               # removed 9a3b1c…
 ```
 
-Reachability is computed from pointer files **in the current working tree only**.
+Reachability is computed from pointer files **in the current working tree only**,
+and spans manifests: a directory keeps its manifest object and every file object
+that manifest names.
+
+If a directory's manifest is not in the cache, its file list is unknowable, so
+`gc` stops rather than guessing:
+
+```text
+avc: cache object missing for data; run `avc pull data`; refusing to delete
+objects that may still be referenced
+```
 
 > **This is the sharpest edge in `0.1.0`.** Objects referenced only by another
 > branch, a stash, or an older commit are treated as unreachable and deleted. If
@@ -339,9 +412,9 @@ avc doctor
 doctor: repository, pointers, and available cache objects are valid
 ```
 
-Checks that the Git worktree exists, that every pointer parses and validates, and
-that every *present* cache object re-hashes to the size and digest its pointer
-claims. Objects that are absent from the cache are skipped, not reported as
+Checks that the Git worktree exists, that every pointer parses and validates,
+that every cached directory manifest parses, and that every *present* cache
+object re-hashes to the size and digest its pointer or manifest entry claims. Objects that are absent from the cache are skipped, not reported as
 errors — use `avc status` to find those.
 
 Fails on the first corrupt object with `corrupt cache object for <path>`.

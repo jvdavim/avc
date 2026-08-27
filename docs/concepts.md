@@ -52,8 +52,78 @@ because it drives filesystem writes:
   key means the pointer came from a version AVC does not understand, and
   guessing would be worse than failing.
 
+An optional `kind` field follows `path`. It is absent for a file — so every file
+pointer keeps the bytes it has always had — and reads `directory` for a tracked
+directory.
+
 Non-ASCII paths are fully supported: `données/模型.bin` produces
 `données/模型.bin.avc`.
+
+## Directories
+
+`avc add data/` tracks a whole directory as **one artifact with one pointer**,
+the way `dvc add` does. Nothing new is stored to make that work: the directory's
+object is a *manifest* listing the files beneath it, and that manifest is an
+ordinary content-addressed object.
+
+```yaml
+# data.avc — the pointer Git commits
+version: 1
+path: data
+kind: directory
+object:
+  algorithm: sha256
+  hash: bb292fab8a187957aa96cb2f30b7d70951ce58a4ba83f1ca04b90ca7d3988eac
+  size: 387
+  media_type: application/vnd.avc.tree+yaml
+```
+
+```yaml
+# the manifest object that hash names
+version: 1
+entries:
+- path: a.bin
+  algorithm: sha256
+  hash: b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060
+  size: 6
+- path: nested/b.bin
+  algorithm: sha256
+  hash: f2c82decdd7181cf98945929a62598db7e6b477e11f6e0eb0ae97020eff151ad
+  size: 5
+- path: nested/dup.bin
+  algorithm: sha256
+  hash: b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060
+  size: 6
+```
+
+A directory of *n* files is `n + 1` objects, all in the same keyspace, cache, and
+transport as any other. Several things follow:
+
+- **The manifest's hash is the directory's identity.** A file edited, added,
+  removed, or renamed anywhere beneath it produces a different manifest, so the
+  artifact reads as `modified` and `avc commit data` records the new version.
+- **Unchanged files cost nothing to re-version.** Editing one file in a
+  thousand-file directory adds one object and one manifest; the other 999 are
+  already stored.
+- **Deduplication is unchanged.** `a.bin` and `nested/dup.bin` above hold the
+  same bytes and share one object — as would an identical file in another
+  directory, another artifact, or another branch.
+- **Entry paths are relative to the tracked directory**, not to the repository,
+  so moving a directory reuses every object it already had.
+- **Order is canonical.** Entries are sorted and unique, so the manifest never
+  depends on the order the filesystem enumerated the tree in, and two machines
+  agree on the hash.
+- **Nothing leaks.** The manifest is an object like any other; a remote still
+  sees only hashes and sizes. The names inside it are visible only to whoever
+  can already read the bytes.
+
+A manifest is untrusted input, because it decides where `checkout` writes: entry
+paths are validated exactly as a pointer's `path` is, and the manifest's own
+bytes are verified against the pointer before they are parsed.
+
+Symlinks beneath a tracked directory are skipped rather than followed. An empty
+directory, or one containing a `.avc` file, is refused — see
+[CLI Reference](cli.md#directories).
 
 ## Objects
 
@@ -126,20 +196,21 @@ prefix, and endpoint.
 
 `avc status` reports two independent axes per artifact.
 
-**Working tree**, from re-hashing the file on disk:
+**Working tree**, from re-hashing the file — or re-scanning the directory — on
+disk:
 
 | State | Meaning |
 | --- | --- |
-| `ok` | The file exists and its hash matches the pointer |
-| `modified` | The file exists but its content differs from the pointer |
-| `missing` | No file at that path |
+| `ok` | The artifact exists and its hash matches the pointer |
+| `modified` | It exists but its content differs from the pointer |
+| `missing` | Nothing at that path |
 
 **Cache**:
 
 | State | Meaning |
 | --- | --- |
-| `cached` | The referenced object is in `.avc/cache` |
-| `cache-missing` | It is not; `avc pull` is needed before checkout |
+| `cached` | Every object the artifact needs is in `.avc/cache` |
+| `cache-missing` | At least one is not; `avc pull` is needed before checkout |
 
 `missing` + `cached` is the normal state right after a fresh clone plus pull of
 the cache. `ok` + `cache-missing` happens when you produced the file locally
@@ -174,7 +245,8 @@ Four rules the implementation upholds:
 
 1. **Dirty files are never clobbered.** `checkout` re-hashes an existing target
    and refuses to overwrite content that differs from the pointer, unless
-   `--force` is given.
+   `--force` is given — per file, inside a directory. Nor does it delete: a file
+   a manifest does not name is left where it is.
 2. **Writes are atomic.** Temp file, `fsync`, rename.
 3. **Reads are verified.** Size and SHA-256 are both checked.
 4. **No remote deletion.** No command in `0.1.0` deletes remote data. `gc`

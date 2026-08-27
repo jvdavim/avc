@@ -32,12 +32,13 @@ pub fn normalize_repo_path(path: impl AsRef<Path>) -> Result<String> {
         .to_str()
         .ok_or_else(|| Error::InvalidPath(path.display().to_string()))?
         .replace('\\', "/");
+    // Shells complete directories with a trailing slash, so `avc add data/`
+    // and `avc add data` must name one artifact and one pointer file.
+    let value = value.trim_end_matches('/').to_owned();
     validate_repo_path(&value)?;
     Ok(value)
 }
 
 pub fn pointer_path(path: impl AsRef<Path>) -> Result<PathBuf> {
-    let path = path.as_ref();
-    validate_repo_path(&normalize_repo_path(path)?)?;
-    Ok(PathBuf::from(format!("{}.avc", path.display())))
+    Ok(PathBuf::from(format!("{}.avc", normalize_repo_path(path)?)))
 }

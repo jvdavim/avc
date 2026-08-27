@@ -263,23 +263,221 @@ fn commit(paths: &[String], force: bool) -> Result<(), Failure> {
 fn add_one(repo: &Repo, value: &str, require_pointer: bool) -> Result<(), Failure> {
     let relative = avc_core::normalize_repo_path(Path::new(value))?;
     let source = repo.root.join(&relative);
-    if !source.is_file() {
-        return Err(format!("artifact is not a regular file: {value}").into());
-    }
     let pointer = repo.root.join(avc_core::pointer_path(&relative)?);
     if require_pointer && !pointer.exists() {
         return Err(format!("no pointer exists for {value}").into());
     }
-    let hash = avc_core::hash_file(&source)?;
-    let pointer_value = avc_core::Pointer::new(&relative, hash.object.clone(), hash.size, None)?;
-    let object = cache_path(repo, &hash.object);
-    if !object.exists() {
-        copy_atomic(&source, &object)?;
-    }
-    append_ignore_path(&repo.root, &relative)?;
+    // A directory is checked first: `is_file` follows symlinks, and the two
+    // tests are mutually exclusive, so the order only decides the message a
+    // path that is neither gets.
+    let (pointer_value, summary) = if source.is_dir() {
+        track_directory(repo, &relative)?
+    } else if source.is_file() {
+        track_file(repo, &relative)?
+    } else {
+        return Err(format!("artifact is not a regular file or directory: {value}").into());
+    };
+    append_ignore_path(
+        &repo.root,
+        &ignore_line(&relative, pointer_value.is_directory()),
+    )?;
     write_atomic(&pointer, pointer_value.serialize_canonical()?.as_bytes())?;
-    println!("tracked {relative} ({})", hash.object);
+    println!("tracked {summary}");
     Ok(())
+}
+
+/// Hash a file, store its bytes, and describe it.
+fn track_file(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, String), Failure> {
+    let source = repo.root.join(relative);
+    let hash = avc_core::hash_file(&source)?;
+    store_in_cache(repo, &source, &hash.object)?;
+    let pointer = avc_core::Pointer::new(relative, hash.object.clone(), hash.size, None)?;
+    Ok((pointer, format!("{relative} ({})", hash.object)))
+}
+
+/// Hash every file beneath a directory, store them, and store the manifest
+/// that names them.
+///
+/// The manifest is an object like any other, so a directory costs one extra
+/// object and travels through push, pull, and gc unchanged. Files that already
+/// exist in the cache — including identical files inside the same directory —
+/// are not copied twice.
+fn track_directory(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, String), Failure> {
+    let root = repo.root.join(relative);
+    let scanned = scan_directory(&root)?;
+    if scanned.is_empty() {
+        return Err(format!("directory contains no files to track: {relative}").into());
+    }
+    // Pointers are discovered by scanning the worktree for `.avc` files, so
+    // one inside a tracked directory would be both content and pointer. Say so
+    // now rather than leaving a repository whose `push` cannot parse itself.
+    if let Some((_, entry)) = scanned
+        .iter()
+        .find(|(_, entry)| entry.path.ends_with(".avc"))
+    {
+        return Err(format!(
+            "refusing to track {relative}: it contains the pointer file {}/{}",
+            relative, entry.path
+        )
+        .into());
+    }
+    for (source, entry) in &scanned {
+        store_in_cache(repo, source, &entry.object_id()?)?;
+    }
+    let tree = avc_core::Tree::new(scanned.into_iter().map(|(_, entry)| entry).collect())?;
+    let manifest = write_manifest(repo, &tree)?;
+    let pointer =
+        avc_core::Pointer::new_directory(relative, manifest.object.clone(), manifest.size)?;
+    Ok((
+        pointer,
+        format!(
+            "{relative}/ ({} file(s), {}, {})",
+            tree.entries.len(),
+            human_size(tree.total_size()),
+            manifest.object
+        ),
+    ))
+}
+
+/// Every regular file beneath `root`, paired with the manifest entry that
+/// describes it.
+///
+/// Entry paths are relative to `root`, and ordering is left to
+/// `Tree::new`, so the manifest never depends on directory-iteration order.
+fn scan_directory(root: &Path) -> Result<Vec<(PathBuf, avc_core::TreeEntry)>, Failure> {
+    let mut files = Vec::new();
+    collect_artifact_files(root, root, &mut files)?;
+    let mut scanned = Vec::with_capacity(files.len());
+    for (source, relative) in files {
+        let hash = avc_core::hash_file(&source)?;
+        scanned.push((
+            source,
+            avc_core::TreeEntry::new(relative, hash.object, hash.size)?,
+        ));
+    }
+    Ok(scanned)
+}
+
+/// Walk `directory`, collecting regular files as (absolute path, path relative
+/// to `root`).
+///
+/// Symlinks are skipped rather than followed: following them would let a link
+/// out of the directory pull unrelated bytes in, and a link back into it loop
+/// forever.
+fn collect_artifact_files(
+    root: &Path,
+    directory: &Path,
+    output: &mut Vec<(PathBuf, String)>,
+) -> Result<(), Failure> {
+    for entry in fs::read_dir(directory).map_err(io_error)? {
+        let path = entry.map_err(io_error)?.path();
+        let kind = fs::symlink_metadata(&path).map_err(io_error)?.file_type();
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            collect_artifact_files(root, &path, output)?;
+        } else if kind.is_file() {
+            let relative = path.strip_prefix(root).map_err(io_error)?;
+            output.push((path.clone(), avc_core::normalize_repo_path(relative)?));
+        }
+    }
+    Ok(())
+}
+
+/// Copy an artifact's bytes into the cache unless that object is already there.
+fn store_in_cache(repo: &Repo, source: &Path, object: &avc_core::ObjectId) -> Result<(), Failure> {
+    let destination = cache_path(repo, object);
+    if !destination.exists() {
+        copy_atomic(source, &destination)?;
+    }
+    Ok(())
+}
+
+/// Serialize a manifest into the cache and report the object it became.
+fn write_manifest(repo: &Repo, tree: &avc_core::Tree) -> Result<avc_core::HashResult, Failure> {
+    let bytes = tree.serialize_canonical()?.into_bytes();
+    let manifest = avc_core::hash_reader(&mut bytes.as_slice())?;
+    let destination = cache_path(repo, &manifest.object);
+    if !destination.exists() {
+        write_atomic(&destination, &bytes)?;
+    }
+    Ok(manifest)
+}
+
+/// Read a directory pointer's manifest out of the cache.
+///
+/// The bytes are verified against the pointer before they are parsed: a
+/// manifest decides where `checkout` writes, so it is treated as untrusted
+/// input even coming off the local disk.
+fn load_tree(repo: &Repo, pointer: &avc_core::Pointer) -> Result<avc_core::Tree, Failure> {
+    let object = pointer.object_id()?;
+    let path = cache_path(repo, &object);
+    if !path.is_file() {
+        return Err(format!(
+            "cache object missing for {}; run `avc pull {}`",
+            pointer.path, pointer.path
+        )
+        .into());
+    }
+    let bytes = fs::read(&path).map_err(io_error)?;
+    let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
+    if actual.size != pointer.object.size || actual.object != object {
+        return Err(format!("corrupt cache object for {}", pointer.path).into());
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("directory manifest for {} is not UTF-8", pointer.path))?;
+    Ok(avc_core::Tree::parse(&text)?)
+}
+
+/// Every object a pointer needs, manifest first.
+///
+/// A file needs one object; a directory needs its manifest plus one object per
+/// file it names. Duplicates are collapsed, so a directory holding the same
+/// bytes twice transfers them once.
+fn required_objects(
+    repo: &Repo,
+    pointer: &avc_core::Pointer,
+) -> Result<Vec<(avc_core::ObjectId, u64)>, Failure> {
+    let object = pointer.object_id()?;
+    let mut required = vec![(object, pointer.object.size)];
+    if pointer.is_directory() {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in load_tree(repo, pointer)?.entries {
+            if seen.insert(entry.hash.clone()) {
+                required.push((entry.object_id()?, entry.size));
+            }
+        }
+    }
+    Ok(required)
+}
+
+/// The `.gitignore` line for a tracked artifact.
+///
+/// A directory gets a trailing slash so the pattern cannot also match a file
+/// of the same name elsewhere in the tree.
+fn ignore_line(relative: &str, directory: bool) -> String {
+    if directory {
+        format!("{relative}/")
+    } else {
+        relative.to_owned()
+    }
+}
+
+/// Byte counts for humans, so a directory summary is readable at a glance.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn status() -> Result<(), Failure> {
@@ -294,28 +492,71 @@ fn status() -> Result<(), Failure> {
             }
         };
         count += 1;
-        let artifact = repo.root.join(&pointer.path);
-        let state = if !artifact.exists() {
-            "missing"
-        } else {
-            let actual = avc_core::hash_file(&artifact)?;
-            if actual.object != pointer.object_id()? || actual.size != pointer.object.size {
-                "modified"
-            } else {
-                "ok"
-            }
-        };
-        let cache = if cache_path(&repo, &pointer.object_id()?).exists() {
+        let state = worktree_state(&repo, &pointer)?;
+        let cache = if cached_completely(&repo, &pointer)? {
             "cached"
         } else {
             "cache-missing"
         };
-        println!("{state}\t{cache}\t{}", pointer.path);
+        println!("{state}\t{cache}\t{}", display_path(&pointer));
     }
     if count == 0 {
         println!("no AVC pointers found");
     }
     Ok(())
+}
+
+/// Compare an artifact against its pointer.
+///
+/// A directory is re-scanned and re-hashed into a manifest: its identity is
+/// that manifest's hash, so a file added, removed, renamed, or edited anywhere
+/// beneath it reads as `modified` exactly as an edited file does.
+fn worktree_state(repo: &Repo, pointer: &avc_core::Pointer) -> Result<&'static str, Failure> {
+    let artifact = repo.root.join(&pointer.path);
+    if pointer.is_directory() {
+        if !artifact.is_dir() {
+            return Ok("missing");
+        }
+        let scanned = scan_directory(&artifact)?;
+        let tree = avc_core::Tree::new(scanned.into_iter().map(|(_, entry)| entry).collect())?;
+        let bytes = tree.serialize_canonical()?.into_bytes();
+        let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
+        return Ok(if actual.object.hash() == pointer.object.hash {
+            "ok"
+        } else {
+            "modified"
+        });
+    }
+    if !artifact.exists() {
+        return Ok("missing");
+    }
+    let actual = avc_core::hash_file(&artifact)?;
+    if actual.object != pointer.object_id()? || actual.size != pointer.object.size {
+        Ok("modified")
+    } else {
+        Ok("ok")
+    }
+}
+
+/// Whether every object the artifact needs is in the cache.
+///
+/// A directory whose manifest is cached but whose files are not cannot be
+/// checked out, so it is reported as `cache-missing` rather than `cached`.
+fn cached_completely(repo: &Repo, pointer: &avc_core::Pointer) -> Result<bool, Failure> {
+    if !cache_path(repo, &pointer.object_id()?).exists() {
+        return Ok(false);
+    }
+    if !pointer.is_directory() {
+        return Ok(true);
+    }
+    Ok(required_objects(repo, pointer)?
+        .iter()
+        .all(|(object, _)| cache_path(repo, object).exists()))
+}
+
+/// How a pointer's path is shown, with a trailing slash for a directory.
+fn display_path(pointer: &avc_core::Pointer) -> String {
+    ignore_line(&pointer.path, pointer.is_directory())
 }
 
 fn list(remote_name: Option<&str>) -> Result<(), Failure> {
@@ -337,50 +578,140 @@ fn list(remote_name: Option<&str>) -> Result<(), Failure> {
     for pointer_path in pointers {
         let pointer = parse_pointer(&pointer_path)?;
         let object = pointer.object_id()?;
-        let remote_state = if present.contains(object.hash()) {
-            "available"
+        // A directory is available only when its manifest *and* every file it
+        // names are on the remote; a half-uploaded directory is not restorable.
+        let (size, remote_state) = if pointer.is_directory() {
+            match remote_tree(&repo, store.as_ref(), &pointer, &present)? {
+                Some(tree) => {
+                    let complete = present.contains(object.hash())
+                        && tree
+                            .entries
+                            .iter()
+                            .all(|entry| present.contains(&entry.hash));
+                    (
+                        tree.total_size().to_string(),
+                        if complete { "available" } else { "missing" },
+                    )
+                }
+                // Without the manifest the file list is unknowable, and the
+                // remote demonstrably cannot restore the directory.
+                None => ("-".to_string(), "missing"),
+            }
         } else {
-            "missing"
+            (
+                pointer.object.size.to_string(),
+                if present.contains(object.hash()) {
+                    "available"
+                } else {
+                    "missing"
+                },
+            )
         };
         println!(
             "{}\t{}\t{}\t{}",
-            pointer.path, pointer.object.size, object, remote_state
+            display_path(&pointer),
+            size,
+            object,
+            remote_state
         );
     }
     Ok(())
 }
 
+/// The manifest for a directory pointer, from the cache or, failing that, from
+/// the remote.
+///
+/// A manifest is metadata measured in bytes per file, not artifact content, so
+/// fetching one keeps `list` honest about a directory's size and availability
+/// without breaking its promise not to download artifacts.
+fn remote_tree(
+    repo: &Repo,
+    store: &dyn avc_core::ObjectStore,
+    pointer: &avc_core::Pointer,
+    present: &std::collections::HashSet<String>,
+) -> Result<Option<avc_core::Tree>, Failure> {
+    let object = pointer.object_id()?;
+    if cache_path(repo, &object).is_file() {
+        return Ok(Some(load_tree(repo, pointer)?));
+    }
+    if !present.contains(object.hash()) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    std::io::copy(&mut store.get(&object)?, &mut bytes).map_err(io_error)?;
+    let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
+    if actual.size != pointer.object.size || actual.object != object {
+        return Err(format!(
+            "remote object for {} does not match its pointer",
+            pointer.path
+        )
+        .into());
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("directory manifest for {} is not UTF-8", pointer.path))?;
+    Ok(Some(avc_core::Tree::parse(&text)?))
+}
+
 fn checkout(paths: &[String], force: bool) -> Result<(), Failure> {
     let repo = load_repo()?;
-    let selected = pointer_files(&repo.root)?.into_iter().filter(|path| {
-        paths.is_empty()
-            || paths.iter().any(|value| {
-                avc_core::pointer_path(value)
-                    .map(|pointer| pointer == *path)
-                    .unwrap_or(false)
-            })
-    });
-    for pointer_path in selected {
-        let pointer = parse_pointer(&pointer_path)?;
-        let object = cache_path(&repo, &pointer.object_id()?);
-        if !object.is_file() {
-            return Err(format!("cache object missing for {}", pointer.path).into());
-        }
-        let target = repo.root.join(&pointer.path);
-        if target.exists() && !force {
-            let actual = avc_core::hash_file(&target)?;
-            if actual.object.hash() != pointer.object.hash {
-                return Err(format!(
-                    "refusing to replace modified file {}; use --force",
-                    pointer.path
-                )
-                .into());
+    for pointer in selected_pointers(&repo, paths)? {
+        if pointer.is_directory() {
+            let tree = load_tree(&repo, &pointer)?;
+            for entry in &tree.entries {
+                let label = format!("{}/{}", pointer.path, entry.path);
+                materialize(
+                    &repo,
+                    &entry.object_id()?,
+                    &repo.root.join(&pointer.path).join(&entry.path),
+                    &entry.hash,
+                    force,
+                    &label,
+                )?;
             }
+            println!(
+                "checked out {}/ ({} file(s))",
+                pointer.path,
+                tree.entries.len()
+            );
+            continue;
         }
-        copy_atomic(&object, &target)?;
+        materialize(
+            &repo,
+            &pointer.object_id()?,
+            &repo.root.join(&pointer.path),
+            &pointer.object.hash,
+            force,
+            &pointer.path,
+        )?;
         println!("checked out {}", pointer.path);
     }
     Ok(())
+}
+
+/// Write one cached object into the working tree.
+///
+/// The refusal to clobber differing content applies per file, so a directory
+/// checkout stops on the first locally modified file rather than overwriting
+/// the ones before it and then complaining.
+fn materialize(
+    repo: &Repo,
+    object: &avc_core::ObjectId,
+    target: &Path,
+    expected_hash: &str,
+    force: bool,
+    label: &str,
+) -> Result<(), Failure> {
+    let source = cache_path(repo, object);
+    if !source.is_file() {
+        return Err(format!("cache object missing for {label}").into());
+    }
+    if target.exists() && !force {
+        let actual = avc_core::hash_file(target)?;
+        if actual.object.hash() != expected_hash {
+            return Err(format!("refusing to replace modified file {label}; use --force").into());
+        }
+    }
+    copy_atomic(&source, target)
 }
 
 fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
@@ -388,21 +719,34 @@ fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     let store = open_store(&repo, remote_name)?;
     let mut uploaded = 0;
     for pointer in selected_pointers(&repo, paths)? {
-        let object_id = pointer.object_id()?;
-        let source = cache_path(&repo, &object_id);
-        if !source.is_file() {
-            return Err(format!("cache object missing for {}", pointer.path).into());
+        // A directory expands into its manifest plus one object per file; the
+        // manifest is uploaded last, so it never names bytes that are not
+        // there yet.
+        let mut required = required_objects(&repo, &pointer)?;
+        required.reverse();
+        let mut sent = 0;
+        for (object_id, size) in required {
+            let source = cache_path(&repo, &object_id);
+            if !source.is_file() {
+                return Err(format!("cache object missing for {}", pointer.path).into());
+            }
+            // Objects are immutable, so re-uploading identical bytes is pure
+            // cost. Asking first turns a repeated push into a cheap no-op.
+            if store.exists(&object_id)? {
+                continue;
+            }
+            let mut file = File::open(&source).map_err(io_error)?;
+            store.put(&object_id, size, &mut file)?;
+            sent += 1;
         }
-        // Objects are immutable, so re-uploading identical bytes is pure cost.
-        // Asking first turns a repeated push into a cheap no-op.
-        if store.exists(&object_id)? {
-            println!("up to date {}", pointer.path);
-            continue;
+        uploaded += sent;
+        if sent == 0 {
+            println!("up to date {}", display_path(&pointer));
+        } else if pointer.is_directory() {
+            println!("pushed {}/ ({sent} object(s))", pointer.path);
+        } else {
+            println!("pushed {} ({})", pointer.path, pointer.object_id()?);
         }
-        let mut file = File::open(&source).map_err(io_error)?;
-        store.put(&object_id, pointer.object.size, &mut file)?;
-        println!("pushed {} ({})", pointer.path, object_id);
-        uploaded += 1;
     }
     println!("pushed {uploaded} object(s) to {}", store.describe());
     Ok(())
@@ -412,16 +756,60 @@ fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     let repo = load_repo()?;
     let store = open_store(&repo, remote_name)?;
     for pointer in selected_pointers(&repo, paths)? {
+        // The manifest has to land first: until it is here and verified, the
+        // rest of a directory's objects are unknown.
         let object_id = pointer.object_id()?;
-        let destination = cache_path(&repo, &object_id);
-        if destination.is_file() {
-            continue;
+        let fetched = fetch_object(
+            &repo,
+            store.as_ref(),
+            &object_id,
+            pointer.object.size,
+            &pointer.path,
+        )?;
+        if pointer.is_directory() {
+            let tree = load_tree(&repo, &pointer)?;
+            let mut files = 0;
+            for entry in &tree.entries {
+                let label = format!("{}/{}", pointer.path, entry.path);
+                if fetch_object(
+                    &repo,
+                    store.as_ref(),
+                    &entry.object_id()?,
+                    entry.size,
+                    &label,
+                )? {
+                    files += 1;
+                }
+            }
+            let total = files + usize::from(fetched);
+            if total > 0 {
+                println!("pulled {}/ ({total} object(s))", pointer.path);
+            }
+        } else if fetched {
+            println!("pulled {}", pointer.path);
         }
-        let mut body = store.get(&object_id)?;
-        download_verified(&mut body, &destination, &pointer)?;
-        println!("pulled {}", pointer.path);
     }
     checkout(paths, false)
+}
+
+/// Ensure one object is in the cache, downloading it if it is not.
+///
+/// Reports whether a transfer actually happened, so a pull that had nothing to
+/// do says nothing rather than claiming work.
+fn fetch_object(
+    repo: &Repo,
+    store: &dyn avc_core::ObjectStore,
+    object: &avc_core::ObjectId,
+    size: u64,
+    label: &str,
+) -> Result<bool, Failure> {
+    let destination = cache_path(repo, object);
+    if destination.is_file() {
+        return Ok(false);
+    }
+    let mut body = store.get(object)?;
+    download_verified(&mut body, &destination, object, size, label)?;
+    Ok(true)
 }
 
 /// Stream a download into the cache, verifying size and digest before the
@@ -429,11 +817,15 @@ fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
 ///
 /// The hash is computed while the bytes are written, so a 40 GB artifact is
 /// never read twice and a truncated or corrupted transfer never lands in the
-/// cache under a name that claims it is intact.
+/// cache under a name that claims it is intact. `label` names the artifact the
+/// object belongs to, which for a file inside a tracked directory is not the
+/// pointer's own path.
 fn download_verified(
     body: &mut dyn std::io::Read,
     destination: &Path,
-    pointer: &avc_core::Pointer,
+    expected: &avc_core::ObjectId,
+    size: u64,
+    label: &str,
 ) -> Result<(), Failure> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(io_error)?;
@@ -462,11 +854,11 @@ fn download_verified(
             return Err(error.into());
         }
     };
-    if actual.size != pointer.object.size || actual.object.hash() != pointer.object.hash {
+    if actual.size != size || actual.object != *expected {
         let _ = fs::remove_file(&temporary);
         return Err(format!(
-            "remote object for {} does not match its pointer: expected {} bytes of {}, got {} bytes of {}",
-            pointer.path, pointer.object.size, pointer.object.hash, actual.size, actual.object.hash()
+            "remote object for {label} does not match its pointer: expected {size} bytes of {}, got {} bytes of {}",
+            expected.hash(), actual.size, actual.object.hash()
         )
         .into());
     }
@@ -490,14 +882,19 @@ fn remove(paths: &[String]) -> Result<(), Failure> {
 
 fn gc(_remote: Option<&str>, dry_run: bool) -> Result<(), Failure> {
     let repo = load_repo()?;
-    let reachable: std::collections::HashSet<_> = pointer_files(&repo.root)?
-        .into_iter()
-        .filter_map(|path| {
-            parse_pointer(&path)
-                .ok()
-                .and_then(|p| p.object_id().ok().map(|id| id.hash().to_owned()))
-        })
-        .collect();
+    // Reachability now spans manifests, so a pointer that cannot be read or
+    // expanded aborts the run: guessing would delete objects a directory still
+    // needs, and that is not recoverable from the cache.
+    let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in pointer_files(&repo.root)? {
+        let pointer = parse_pointer(&path)?;
+        let required = required_objects(&repo, &pointer).map_err(|error| {
+            format!("{error}; refusing to delete objects that may still be referenced")
+        })?;
+        for (object, _) in required {
+            reachable.insert(object.hash().to_owned());
+        }
+    }
     let objects = cache_objects(&repo)?;
     for object in objects {
         if !reachable.contains(&object.0) {
@@ -519,15 +916,42 @@ fn doctor() -> Result<(), Failure> {
     }
     for path in pointer_files(&repo.root)? {
         let pointer = parse_pointer(&path)?;
-        let object = cache_path(&repo, &pointer.object_id()?);
-        if object.exists() {
-            let actual = avc_core::hash_file(&object)?;
-            if actual.size != pointer.object.size || actual.object != pointer.object_id()? {
-                return Err(format!("corrupt cache object for {}", pointer.path).into());
+        verify_cached(
+            &repo,
+            &pointer.object_id()?,
+            pointer.object.size,
+            &pointer.path,
+        )?;
+        if pointer.is_directory() && cache_path(&repo, &pointer.object_id()?).exists() {
+            // `load_tree` re-verifies and parses the manifest, so a manifest
+            // that is intact but unreadable is caught here too.
+            for entry in load_tree(&repo, &pointer)?.entries {
+                let label = format!("{}/{}", pointer.path, entry.path);
+                verify_cached(&repo, &entry.object_id()?, entry.size, &label)?;
             }
         }
     }
     println!("doctor: repository, pointers, and available cache objects are valid");
+    Ok(())
+}
+
+/// Re-hash one cache object, if it is present, against what a pointer or
+/// manifest entry claims it is. Absent objects are not an error; `status`
+/// reports those.
+fn verify_cached(
+    repo: &Repo,
+    object: &avc_core::ObjectId,
+    size: u64,
+    label: &str,
+) -> Result<(), Failure> {
+    let path = cache_path(repo, object);
+    if !path.exists() {
+        return Ok(());
+    }
+    let actual = avc_core::hash_file(&path)?;
+    if actual.size != size || actual.object != *object {
+        return Err(format!("corrupt cache object for {label}").into());
+    }
     Ok(())
 }
 
@@ -576,10 +1000,10 @@ fn append_ignore(root: &Path) -> Result<(), Failure> {
     }
     Ok(())
 }
-fn append_ignore_path(root: &Path, relative: &str) -> Result<(), Failure> {
+fn append_ignore_path(root: &Path, entry: &str) -> Result<(), Failure> {
     let path = root.join(".gitignore");
     let old = fs::read_to_string(&path).unwrap_or_default();
-    if old.lines().any(|line| line == relative) {
+    if old.lines().any(|line| line == entry) {
         return Ok(());
     }
     let suffix = if old.ends_with('\n') || old.is_empty() {
@@ -587,7 +1011,7 @@ fn append_ignore_path(root: &Path, relative: &str) -> Result<(), Failure> {
     } else {
         "\n"
     };
-    write_atomic(&path, format!("{old}{suffix}{relative}\n").as_bytes())
+    write_atomic(&path, format!("{old}{suffix}{entry}\n").as_bytes())
 }
 fn pointer_files(root: &Path) -> Result<Vec<PathBuf>, Failure> {
     let mut files = Vec::new();
@@ -655,19 +1079,23 @@ fn load_local_override(
 
 /// The pointers a command should act on: all of them, or just the paths named.
 fn selected_pointers(repo: &Repo, paths: &[String]) -> Result<Vec<avc_core::Pointer>, Failure> {
+    // Normalizing first is what lets `avc push data/` reach the pointer whose
+    // path is `data`, the way a shell completes a directory name.
+    let wanted = paths
+        .iter()
+        .map(|value| avc_core::normalize_repo_path(Path::new(value)).map_err(Failure::from))
+        .collect::<Result<Vec<String>, Failure>>()?;
     let mut selected = Vec::new();
     for pointer_path in pointer_files(&repo.root)? {
         let pointer = parse_pointer(&pointer_path)?;
-        if paths.is_empty() || paths.iter().any(|value| value == &pointer.path) {
+        if wanted.is_empty() || wanted.iter().any(|value| value == &pointer.path) {
             selected.push(pointer);
         }
     }
-    if !paths.is_empty() {
-        // A typo in a path should not be reported as "nothing to do".
-        for value in paths {
-            if !selected.iter().any(|pointer| &pointer.path == value) {
-                return Err(format!("no pointer exists for {value}").into());
-            }
+    // A typo in a path should not be reported as "nothing to do".
+    for value in &wanted {
+        if !selected.iter().any(|pointer| &pointer.path == value) {
+            return Err(format!("no pointer exists for {value}").into());
         }
     }
     Ok(selected)

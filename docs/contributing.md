@@ -89,8 +89,10 @@ Unit tests live at the bottom of `crates/avc-core/src/lib.rs`. When adding one:
   parsing are security boundaries; the interesting cases are the ones that should
   fail.
 
-There is no CLI integration harness yet. Building one is on the
-[Roadmap](roadmap.md) and would be a welcome contribution.
+CLI-level behaviour is tested by driving the binary itself, in
+`crates/avc-cli/tests/directory.rs`. Only the directory workflow is covered
+there today; extending it to the file workflows would be a welcome
+contribution.
 
 ### Code style
 

@@ -119,8 +119,14 @@ cargo test -p avc-core --test object_store -- --ignored
 Any new backend should be added to that suite rather than given its own, so all
 transports are held to one standard.
 
-There is **no CLI integration test harness yet**. Building one is on the
-[Roadmap](roadmap.md) and is a high-value, low-prerequisite contribution.
+`crates/avc-cli/tests/directory.rs` drives the built binary through the
+directory workflow — add, status, checkout, gc, and a push/clone/pull round trip
+against a `file://` remote — using `env!("CARGO_BIN_EXE_avc")` and a
+self-cleaning temp directory. It needs no Git binary: AVC only looks for a
+`.git` entry, so the fixture creates one.
+
+The file workflows still have no equivalent coverage. Extending that harness is
+a high-value, low-prerequisite contribution.
 
 ## Testing against MinIO
 

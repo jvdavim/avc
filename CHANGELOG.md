@@ -13,6 +13,24 @@ include a breaking format change. See
 
 ### Added
 
+- **Directory artifacts.** `avc add data/` tracks a whole directory as one
+  artifact with one pointer, the way `dvc add data/` does. Every file beneath it
+  is hashed and cached, and a manifest naming them is stored as an object of its
+  own, so the directory's identity is that manifest's digest. `status`,
+  `commit`, `push`, `pull`, `checkout`, `list`, `gc`, and `doctor` all
+  understand directories; `push` and `pull` order the manifest so a remote never
+  holds one that names bytes it lacks. Files are deduplicated across the whole
+  repository, so re-versioning a thousand-file directory after one edit stores
+  one new file object and one new manifest.
+- Optional `kind` field in the pointer format, `file` or `directory`. It is
+  omitted for files, so existing file pointers keep byte-identical output and
+  parse unchanged.
+- Directory manifest format (`version: 1`, sorted unique entries relative to the
+  tracked directory) — see [`SPEC.md`](SPEC.md#directory-format).
+- A trailing slash is accepted wherever a path is: `avc add data/` and
+  `avc add data` name the same artifact.
+- CLI integration tests (`crates/avc-cli/tests/directory.rs`) driving the binary
+  end to end, including a push/clone/pull round trip through a `file://` remote.
 - **S3 compatibility layer.** `push`, `pull`, and `list` now transfer bytes to
   Amazon S3 and to any S3-compatible service — MinIO, Cloudflare R2, Ceph,
   Backblaze B2 — via `s3://`, `s3+https://`, and the new `s3+http://` scheme.
@@ -45,6 +63,15 @@ include a breaking format change. See
   check, and a doc build.
 - Issue and pull request templates, and Dependabot configuration.
 
+### Changed
+
+- `avc gc` now fails instead of collecting when it cannot read a directory's
+  manifest, because reachability would otherwise be a guess and the objects it
+  deleted might still be needed. It also no longer silently skips pointers it
+  cannot parse.
+- `avc checkout` now reports a named path with no pointer as an error rather
+  than ignoring it, matching `push` and `pull`.
+
 ## [0.1.0]
 
 Initial prototype release. Iteration 0 — formats are provisional.
@@ -76,7 +103,7 @@ Initial prototype release. Iteration 0 — formats are provisional.
   referenced solely by another branch or by history are treated as unreachable.
 - `avc gc --remote` is accepted but ignored.
 - `avc list` requires a `file://` remote. *(Resolved for S3 in Unreleased.)*
-- Directories cannot be tracked; only regular files.
+- Directories cannot be tracked; only regular files. *(Resolved in Unreleased.)*
 - `avc status` re-hashes every artifact on each run.
 - Exit code `3` is reserved by `SPEC.md` but not yet emitted.
   *(Resolved in Unreleased.)*

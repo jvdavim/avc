@@ -35,12 +35,12 @@ release.
 - Exit code `3` for provider and operational failures
 - Remote artifact listing without downloading bytes
 - Automatic `.gitignore` management
+- Directory artifacts — `avc add data/` tracks a whole tree as one artifact
 
 ### Not implemented
 
 - GCS and Azure transport — `gs://` and `az://` URLs configure but do not transfer
 - IAM instance roles, ECS task roles, SSO, and `assume-role`
-- Directory artifacts
 - Git revision selection (`--rev`, checkout of an artifact as of an old commit)
 - Concurrent or resumable transfers (no multipart upload; a push restarts on failure)
 - Machine-readable output
@@ -96,11 +96,15 @@ freely.
 
 **Good first issue** for `remote list`.
 
-### Directory artifacts
+### Partial directory materialization
 
-`SPEC.md` currently rejects directories outright. Supporting them means deciding
-whether a directory is a tree object or a manifest of file objects, and how
-partial materialization works. Needs a design discussion before code.
+A directory is checked out whole. Fetching or materializing a subset — `avc pull
+data/train` — needs a way to name a path inside a manifest, and a definition of
+what `status` should report for a directory only partly on disk.
+
+Related: `checkout` never deletes, so a file the manifest does not name is left
+in place and keeps the directory reading as `modified`. Removing extras needs an
+explicit, guarded flag rather than silent deletion.
 
 ### Git revision selection
 
@@ -138,8 +142,9 @@ The pointer format leaves "provisional" and becomes stable when:
 1. Clone, branch, merge, push, pull, and recovery have run against a real
    multi-contributor repository.
 2. At least one cloud adapter is in production use.
-3. Directory-artifact design is settled — even if the decision is "never" —
-   because it may need a pointer field.
+3. Directory-artifact design has settled in practice. The `kind` field and the
+   manifest format landed in `0.1.0`; freezing them means committing to
+   manifest-of-file-objects over a nested tree object.
 
 At that point `version: 1` freezes and any change requires `version: 2` plus a
 migration path.
