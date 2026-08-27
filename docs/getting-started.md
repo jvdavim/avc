@@ -1,8 +1,9 @@
 # Getting Started
 
 This walkthrough takes you from an empty directory to an artifact pushed to a
-remote and pulled back. It uses a local `file://` remote, which is the only
-transport implemented in `0.1.0`.
+remote and pulled back. It uses a local `file://` remote, so it needs no
+credentials and no network — see [step 6](#6-configure-a-remote) for the S3
+equivalent.
 
 ## Requirements
 
@@ -128,6 +129,18 @@ for an object store.
 mkdir -p /tmp/avc-remote
 avc remote add origin file:///tmp/avc-remote
 ```
+
+Everything below works identically against S3 or an S3-compatible service. To
+follow along with a local MinIO instead:
+
+```bash
+avc remote add origin s3+http://localhost:9000/my-bucket/artifacts
+export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
+```
+
+For real S3, use `s3://my-bucket/artifacts` and your usual AWS environment
+variables or `~/.aws/credentials`. See
+[Configuration](configuration.md#credentials).
 
 The first remote you add becomes the default. Confirm it:
 

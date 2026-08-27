@@ -26,49 +26,50 @@ release.
 - Safe `checkout` with dirty-file protection
 - Local garbage collection
 - Offline `file://` remotes for `push` and `pull`
+- Provider-neutral `ObjectStore` trait, with `file://` reimplemented against it
+- S3 transport for `s3://`, `s3+https://`, and `s3+http://`, covering Amazon S3,
+  MinIO, Cloudflare R2, Ceph, and Backblaze B2
+- SigV4 request signing, verified against `botocore` reference vectors
+- Credential resolution: environment, `.avc/config.local.toml`, `~/.aws/credentials`
+- Streaming uploads and verified streaming downloads in bounded memory
+- Exit code `3` for provider and operational failures
 - Remote artifact listing without downloading bytes
 - Automatic `.gitignore` management
 
 ### Not implemented
 
-- Any cloud transport — S3, GCS, and Azure URLs configure but do not transfer
+- GCS and Azure transport — `gs://` and `az://` URLs configure but do not transfer
+- IAM instance roles, ECS task roles, SSO, and `assume-role`
 - Directory artifacts
 - Git revision selection (`--rev`, checkout of an artifact as of an old commit)
-- Concurrent or resumable transfers
-- Credential resolution
+- Concurrent or resumable transfers (no multipart upload; a push restarts on failure)
 - Machine-readable output
 - Remote garbage collection
 
 ## Near term
 
-### 1. Provider transfer trait
+### 1. GCS and Azure adapters
 
-**The blocking item for everything cloud.** Today `push`, `pull`, and `list` each
-test `Provider::File` inline and hard-code a filesystem copy. Extract a
-provider-neutral trait — `put`, `get`, `exists`, `list` over object keys — and
-reimplement the `file://` backend against it.
+Same `ObjectStore` trait as S3, same shape. The trait and the credential
+plumbing are in place, so these are now additive rather than architectural.
 
-This must land before any adapter, or the adapters will each grow their own
-divergent notion of what a transfer is.
+### 2. Multipart upload
 
-### 2. S3 adapter
+A push of a 40 GB artifact is a single `PUT`. A dropped connection restarts it,
+and some S3-compatible servers cap a single-part upload well below that. Add
+multipart with a part size that adapts to object size.
 
-First real adapter, behind the trait above. Covers `s3://` and `s3+https://`,
-which brings MinIO, Cloudflare R2, Ceph, and Backblaze B2 along with it.
+### 3. Retries and timeouts
 
-Requires deciding credential precedence — see [Configuration](configuration.md).
-The intent is provider-standard chains first, `.avc/config.local.toml` second, so
-AVC does not become another place secrets leak from.
+The S3 transport currently makes one attempt with no timeout. A transient 500 or
+a stalled socket should be retried with backoff, and a hung connection should
+fail rather than hang forever. **Good first issue.**
 
-### 3. GCS and Azure adapters
+### 4. Extended credential chain
 
-Same trait, same shape as S3.
-
-### 4. Exit code fidelity
-
-`SPEC.md` reserves `3` for provider and operational failures, but the CLI
-currently returns `1` for everything. Once adapters exist there is a real
-distinction to draw, and scripts can rely on it.
+IAM instance roles, ECS task roles, and SSO. Each is an HTTP call to a metadata
+endpoint that yields temporary credentials; the `x-amz-security-token` path they
+need is already implemented and tested.
 
 ## Medium term
 

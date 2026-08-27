@@ -5,12 +5,14 @@ mod hashing;
 mod object;
 mod path;
 mod pointer;
+pub mod remote;
 
 pub use config::{Provider, RemoteConfig};
-pub use hashing::{hash_file, hash_reader, HashResult};
+pub use hashing::{hash_file, hash_reader, HashResult, StreamHasher};
 pub use object::{ObjectId, ALGORITHM};
 pub use path::{normalize_repo_path, pointer_path, validate_repo_path};
 pub use pointer::{Artifact, ObjectMetadata, Pointer, POINTER_VERSION};
+pub use remote::{Credentials, LocalRemoteOverride, ObjectStore, RemoteObject};
 
 /// Errors returned by core validation and serialization operations.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +29,25 @@ pub enum Error {
     PointerSerialization(#[from] serde_yaml::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("remote object not found: {0}")]
+    ObjectNotFound(String),
+    #[error("no credentials found for profile '{0}'; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or add them to .avc/config.local.toml")]
+    MissingCredentials(String),
+    #[error("provider adapter not implemented: {0}")]
+    UnsupportedProvider(&'static str),
+    #[error("{0}")]
+    Provider(String),
+}
+
+impl Error {
+    /// Whether this is a provider or operational failure rather than a user,
+    /// data, or state error. `SPEC.md` reserves exit code 3 for these.
+    pub fn is_provider_failure(&self) -> bool {
+        matches!(
+            self,
+            Error::Provider(_) | Error::MissingCredentials(_) | Error::UnsupportedProvider(_)
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -8,7 +8,7 @@ Status: Iteration 0 prototype contract. Formats remain provisional until clone, 
 - Pointer placement: sibling file with `.avc` appended. `model.bin` uses `model.bin.avc`; the artifact path itself remains ignored by Git.
 - Hash: SHA-256 over exact file bytes, streamed in bounded memory.
 - Minimum Rust: 1.75. Minimum Git: 2.30. Intended OSes: macOS, Linux, and Windows.
-- Remote providers: explicit `s3://`, `s3+https://`, `gs://`, and `az://` schemes. `file://` is supported as an offline development remote. Provider is never inferred from arbitrary hostnames.
+- Remote providers: explicit `s3://`, `s3+https://`, `s3+http://`, `gs://`, and `az://` schemes. `file://` is supported as an offline development remote. Provider is never inferred from arbitrary hostnames.
 
 ## Pointer Format
 
@@ -32,7 +32,13 @@ Logical object key is `objects/sha256/<first-two-hash-characters>/<full-hash>`. 
 
 ## Repository Configuration
 
-Tracked `.avc/config.toml` contains provider, bucket/container, prefix, endpoint, and remote names. Credentials never belong in tracked config. Local credential overrides belong in ignored `.avc/config.local.toml` and should prefer provider-standard credential chains.
+Tracked `.avc/config.toml` contains provider, bucket/container, prefix, endpoint, and remote names. Credentials never belong in tracked config. Local credential overrides belong in ignored `.avc/config.local.toml`, and provider-standard credential chains take precedence over it.
+
+## Object Transport
+
+All remotes are reached through one provider-neutral interface over object keys: `put`, `get`, `exists`, and `list`. Backends receive object identities only and never a repository path. Transfers stream in bounded memory. A download is verified against its pointer's size and digest before it becomes visible in the cache; a mismatch leaves no partial object behind.
+
+S3 requests are signed with AWS Signature Version 4. Because object keys are content-addressed, the `x-amz-content-sha256` of an upload is the object's own digest, so payload bytes are never read twice. Amazon S3 is addressed virtual-hosted-style; a remote with an explicit endpoint is addressed path-style unless overridden.
 
 ## Safety
 

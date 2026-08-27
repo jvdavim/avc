@@ -68,14 +68,16 @@ avc remote add <name> <provider-url>
 avc remote add origin file:///tmp/avc-remote
 avc remote add origin s3://my-bucket/artifacts
 avc remote add minio s3+https://storage.example.com/my-bucket/artifacts
+avc remote add local s3+http://localhost:9000/my-bucket/artifacts
 ```
 
 The URL is decomposed into provider, bucket/container, prefix, and optional
 endpoint, then written to `.avc/config.toml`. Adding a name that already exists
 **replaces** it. The first remote added becomes `default_remote`.
 
-Only `file://`, `s3://`, `s3+https://`, `gs://`, and `az://` are accepted. A bare
-`https://` URL is rejected — see [Configuration](configuration.md).
+Only `file://`, `s3://`, `s3+https://`, `s3+http://`, `gs://`, and `az://` are
+accepted. A bare `https://` URL is rejected — see
+[Configuration](configuration.md).
 
 ## `avc remote list`
 
@@ -190,8 +192,12 @@ data/train.parquet      4194304 sha256:9a3b1c…       missing
 
 Uses the default remote when `--remote` is omitted.
 
-> **Limitation:** requires a `file://` remote. Against a cloud provider it fails
-> with `remote listing is unavailable until provider adapter is implemented`.
+Availability is resolved with a single prefixed listing of the remote, not one
+request per artifact, so a repository with a thousand pointers costs one round
+trip. Objects in the bucket that AVC did not write are ignored.
+
+> **Limitation:** `gs://` and `az://` remotes fail with
+> `provider adapter not implemented`.
 
 ---
 
@@ -208,10 +214,21 @@ With no paths, pushes every tracked artifact; otherwise only the paths given
 paths exactly as they appear in `avc status`).
 
 Fails with `cache object missing for <path>` if the object is not in the local
-cache — run `add`/`commit` or `pull` first.
+cache — run `add`/`commit` or `pull` first. Naming a path that has no pointer is
+an error rather than a silent no-op.
 
-> **Limitation:** `file://` remotes only. Others fail with `only file:// remotes
-> are implemented; cloud adapters are planned next`.
+Objects already present on the remote are skipped — reported as
+`up to date <path>` — because content-addressed objects are immutable and
+re-uploading identical bytes is pure cost. Uploads stream in bounded memory.
+
+> **Limitation:** no multipart upload. A very large artifact is a single `PUT`,
+> and a dropped connection restarts it. `gs://` and `az://` fail with
+> `provider adapter not implemented`.
+>
+> The skip check is a `HEAD` request. S3 answers `HEAD` on a missing object with
+> `403` rather than `404` when the credentials lack `s3:ListBucket`, so a
+> write-only credential makes `push` fail rather than upload. Grant
+> `s3:ListBucket` alongside `s3:PutObject`.
 
 ## `avc pull`
 
@@ -225,9 +242,16 @@ avc pull [<path>...] [--remote <name>]
 it will refuse to overwrite a locally modified file. Fetch the bytes and resolve
 the conflict deliberately with `avc checkout --force` if that is what you want.
 
-Fails with `remote object missing for <path>` if the remote lacks the object.
+Fails with `remote object not found: <hash>` if the remote lacks the object.
+Objects already in the cache are not re-downloaded.
 
-> **Limitation:** `file://` remotes only.
+Each download is hashed as it is written and checked against its pointer's size
+and digest before it becomes visible in the cache. An object that does not match
+is rejected with `remote object for <path> does not match its pointer`, and no
+partial file is left behind.
+
+> **Limitation:** no ranged or resumable download. `gs://` and `az://` fail with
+> `provider adapter not implemented`.
 
 ---
 
@@ -335,10 +359,19 @@ Fails on the first corrupt object with `corrupt cache object for <path>`.
 | `2` | Invalid CLI usage |
 | `3` | Provider or operational failure |
 
-**Current implementation:** `avc` emits `0` on success and `1` for every runtime
-error; `2` comes from argument parsing. Code `3` is reserved but not yet emitted,
-because no provider adapter exists to fail. Do not depend on `1` versus `3` to
-distinguish user error from infrastructure failure until the adapters land.
+**Current implementation:** all four are emitted. `2` comes from argument
+parsing. `3` covers provider and operational failures — an unreachable endpoint,
+a rejected signature, missing credentials, or a provider with no adapter. `1`
+covers everything else, including a remote object that fails to match its
+pointer, which is a data error rather than an infrastructure one.
+
+```bash
+avc push; case $? in
+  0) echo "pushed" ;;
+  1) echo "repository or data problem" ;;
+  3) echo "storage unreachable — safe to retry" ;;
+esac
+```
 
 Runtime errors are written to stderr as `avc: <message>`.
 

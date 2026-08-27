@@ -89,10 +89,11 @@ avc remote add origin s3://my-bucket/artifacts/v1
 The prefix may be omitted: `s3://my-bucket` is valid and stores objects at the
 bucket root.
 
-### `s3+https://` — S3-compatible services
+### `s3+https://` and `s3+http://` — S3-compatible services
 
 For MinIO, Cloudflare R2, Ceph, Backblaze B2, and similar. The host becomes the
 endpoint; the **first path segment is the bucket**, and the rest is the prefix.
+A port, if given, is preserved.
 
 ```bash
 avc remote add minio s3+https://storage.example.com/my-bucket/artifacts
@@ -106,6 +107,25 @@ avc remote add minio s3+https://storage.example.com/my-bucket/artifacts
 | `endpoint_url` | `https://storage.example.com` |
 
 A bucket segment is required; `s3+https://storage.example.com/` is rejected.
+
+`s3+http://` is the same thing without TLS, for a MinIO or Ceph instance on a
+trusted network:
+
+```bash
+avc remote add minio s3+http://localhost:9000/my-bucket/artifacts
+```
+
+The scheme is spelled out rather than inferred, so nobody sends credentials in
+the clear without having typed the word `http`.
+
+### Addressing style
+
+Amazon S3 is addressed virtual-hosted-style
+(`https://my-bucket.s3.us-east-1.amazonaws.com/key`), because path-style is
+deprecated there. Any remote with a custom `endpoint_url` is addressed
+path-style (`http://localhost:9000/my-bucket/key`), which is what
+S3-compatible servers expect. Override with `force_path_style` in
+`.avc/config.local.toml` if your server disagrees.
 
 ### `gs://` — Google Cloud Storage
 
@@ -154,25 +174,71 @@ sizes and the fact that two repositories reference identical content.
 
 **Never put credentials in `.avc/config.toml`.** It is committed to Git.
 
-`0.1.0` does not perform any cloud authentication, because no cloud adapter is
-implemented. When the adapters land, the intended precedence is:
+For S3 remotes, credentials resolve in this order — first match wins:
 
-1. Provider-standard credential chains — `AWS_ACCESS_KEY_ID` and friends,
-   `~/.aws/credentials`, IAM instance roles, `GOOGLE_APPLICATION_CREDENTIALS`,
-   Azure managed identity.
-2. `.avc/config.local.toml`, for machine-specific overrides.
+| Order | Source | Keys |
+| --- | --- | --- |
+| 1 | Environment | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` |
+| 2 | `.avc/config.local.toml` | `access_key_id`, `secret_access_key`, `session_token` |
+| 3 | `~/.aws/credentials` | `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token` for `$AWS_PROFILE`, else `[default]` |
 
-Provider-standard chains are preferred so AVC does not become another place
-secrets can leak from. See [Roadmap](roadmap.md).
+Provider-standard chains come first so a repository-local file can be
+overridden but never silently override the environment — AVC does not become
+another place secrets leak from.
+
+Region and endpoint resolve on the same principle:
+
+| Setting | Order |
+| --- | --- |
+| Region | `AWS_REGION` → `AWS_DEFAULT_REGION` → `config.local.toml` → `~/.aws/config` → `us-east-1` |
+| Endpoint | `AWS_ENDPOINT_URL_S3` → `AWS_ENDPOINT_URL` → `config.local.toml` → `endpoint_url` in `config.toml` |
+
+`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` relocate the shared files.
+
+Most S3-compatible servers ignore the region but still require the signature to
+commit to one, which is why `us-east-1` is the final fallback rather than an
+error.
+
+### Not supported
+
+IAM instance roles, ECS task roles, SSO, and `assume-role` are **not**
+implemented. On an EC2 or ECS runner, export static credentials or inject
+temporary ones (including `AWS_SESSION_TOKEN`) through the environment. See
+[Roadmap](roadmap.md).
 
 ## `.avc/config.local.toml`
 
-Gitignored by `avc init`. Reserved for machine-local overrides such as an
-alternate endpoint for a developer's local MinIO, or credentials that cannot come
-from a provider chain.
+Gitignored by `avc init`. Holds machine-local overrides such as an alternate
+endpoint for a developer's local MinIO, or credentials that cannot come from a
+provider chain.
 
-It is **not read by `0.1.0`** — the file is created as ignored so that adding it
-later is not a breaking change.
+Remotes are matched to `config.toml` by `name`:
+
+```toml
+[[remotes]]
+name = "origin"
+endpoint_url = "http://localhost:9000"
+region = "us-east-1"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+# session_token = "..."       # for temporary credentials
+# profile = "minio-dev"       # which ~/.aws/credentials section to read
+# force_path_style = true     # override the addressing default
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Must match a remote in `config.toml`; other entries are ignored |
+| `endpoint_url` | Replaces the tracked endpoint for this machine |
+| `region` | SigV4 signing region |
+| `access_key_id` / `secret_access_key` | Static credentials |
+| `session_token` | Temporary-credential token, sent as `x-amz-security-token` |
+| `profile` | `~/.aws/credentials` section to read when no key is set here |
+| `force_path_style` | `true` for `endpoint/bucket/key`, `false` for virtual-hosted |
+
+A malformed `config.local.toml` is an error rather than a silent fallback:
+ignoring it would mean sending a request to the wrong endpoint, or with no
+credentials at all.
 
 ## `.gitignore` management
 

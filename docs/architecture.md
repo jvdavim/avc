@@ -17,19 +17,27 @@ avc/
     │       ├── hashing.rs      # streaming SHA-256
     │       ├── object.rs       # ObjectId, cache key derivation
     │       ├── path.rs         # repository path validation and normalization
-    │       └── pointer.rs      # Pointer, ObjectMetadata, canonical YAML
+    │       ├── pointer.rs      # Pointer, ObjectMetadata, canonical YAML
+    │       └── remote/         # object transport
+    │           ├── mod.rs          # ObjectStore trait, key layout, dispatch
+    │           ├── file.rs         # file:// backend
+    │           ├── s3.rs           # S3 and S3-compatible REST transport
+    │           ├── sigv4.rs        # AWS Signature Version 4
+    │           ├── credentials.rs  # credential, region, endpoint resolution
+    │           └── xml.rs          # minimal reader for S3 responses
     └── avc-cli/                # binary: the `avc` command
         └── src/main.rs         # clap definitions and all command workflows
 ```
 
 The split is deliberate: **`avc-core` knows nothing about the filesystem layout
-of a repository or about commands.** It holds the format contract. `avc-cli`
-holds the workflows. That boundary is what will let cloud adapters and a future
-library API be built without rewriting the format rules.
+of a repository or about commands.** It holds the format contract and the
+transport. `avc-cli` holds the workflows. That boundary is what lets a new
+adapter — or a future library API — be added without touching the format rules.
 
 ## `avc-core`
 
-Pure domain logic. Its only I/O is reading bytes to hash them.
+Domain logic plus transport. Everything outside `remote/` is pure: its only I/O
+is reading bytes to hash them.
 
 ### `object.rs` — content addresses
 
@@ -81,18 +89,44 @@ neither read nor written.
 
 `Provider` is the closed set `File | S3 | Gcs | Azure`. `RemoteConfig::from_url`
 matches on scheme and nothing else, then decomposes host and path per provider.
-The `s3+https` branch is the one with real logic: host becomes `endpoint_url`,
-the first path segment becomes the bucket, the remainder becomes the prefix.
+The `s3+https` and `s3+http` branches are the ones with real logic: host (with
+port, if any) becomes `endpoint_url`, the first path segment becomes the bucket,
+and the remainder becomes the prefix.
+
+### `remote/` — object transport
+
+`ObjectStore` is the whole interface: `put`, `get`, `exists`, `list`, all keyed
+by `ObjectId`. **A backend never sees a repository path**, which is what keeps
+the no-path-leakage guarantee structural rather than a matter of discipline.
+`remote::open` dispatches on the `Provider` already decided by `RemoteConfig`;
+it never inspects a hostname.
+
+`sigv4.rs` implements AWS Signature Version 4 directly. This is a deliberate
+trade: the alternative is an SDK plus an async runtime, against a signature that
+is four hashes over strings the caller already holds. Content addressing makes
+the expensive part free — an upload's `x-amz-content-sha256` *is* the object's
+digest, so payload bytes are never read twice. Its tests assert against
+`botocore`-generated vectors, so the module is checked against an independent
+implementation rather than against itself.
+
+`s3.rs` picks addressing style from configuration: virtual-hosted for Amazon S3,
+path-style whenever an endpoint is set. It sets `content-length` explicitly,
+because S3 rejects the chunked encoding an HTTP client would otherwise choose,
+and it configures the agent to deliver 4xx and 5xx as responses so S3's own XML
+error code survives into the message the user sees.
 
 ### `lib.rs` — errors and tests
 
 One `Error` enum via `thiserror`, covering invalid object IDs, invalid paths,
-invalid remotes, unsupported pointer versions, YAML failures, and I/O. Public
-`Result<T>` alias.
+invalid remotes, unsupported pointer versions, YAML failures, I/O, missing
+remote objects, missing credentials, unimplemented providers, and provider
+failures. `Error::is_provider_failure` is what separates exit code `3` from `1`.
+Public `Result<T>` alias.
 
-The five unit tests live at the bottom of `lib.rs` and cover streaming hash
-correctness, canonical round-tripping, rejection of malformed pointers, Unicode
-paths, and remote scheme parsing.
+Unit tests live beside the code they cover; `lib.rs` holds those for hashing,
+pointers, paths, and remote scheme parsing. `tests/object_store.rs` asserts one
+contract against both backends — the S3 half runs against a real server when
+`AVC_TEST_S3_ENDPOINT` is set.
 
 ## `avc-cli`
 
@@ -187,18 +221,15 @@ Changes that break any of these need a SPEC change first, discussed in an issue:
 Honest accounting of where the current shape will need to change — several are
 good first contributions, see [Roadmap](roadmap.md):
 
-- **No transfer abstraction.** `push`, `pull`, and `list` each check
-  `matches!(remote.provider, Provider::File)` and inline the copy. A provider
-  trait needs to be extracted before any cloud adapter is written.
-- **`main.rs` is ~590 lines** and holds every workflow. It wants splitting into a
+- **`main.rs` is ~700 lines** and holds every workflow. It wants splitting into a
   module per command group once it grows further.
 - **`parse_pointer` calls `find_root()` on every invocation**, so scanning N
   pointers walks the directory tree N times. Harmless at current scale, wasteful
   at large ones.
-- **No integration tests.** All five tests are unit tests in `avc-core`. Nothing
-  exercises the CLI end to end.
+- **No CLI integration tests.** `avc-core` has unit tests and an `ObjectStore`
+  contract suite, but nothing drives the `avc` binary end to end.
 - **`gc` reachability ignores Git history**, considering only worktree pointers.
-- **Exit codes 1 and 3 are not distinguished**, because no provider can fail yet.
+- **Retries and timeouts are absent** in the S3 transport: one attempt, no deadline.
 
 ## Where to make a change
 

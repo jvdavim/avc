@@ -105,19 +105,75 @@ struct Remote {
     endpoint_url: Option<String>,
 }
 
+/// Contents of the gitignored `.avc/config.local.toml`.
+#[derive(Debug, Deserialize, Default)]
+struct LocalConfig {
+    #[serde(default)]
+    remotes: Vec<avc_core::LocalRemoteOverride>,
+}
+
 struct Repo {
     root: PathBuf,
     config: Config,
 }
 
-fn main() {
-    if let Err(error) = run(Cli::parse().command) {
-        eprintln!("avc: {error}");
-        std::process::exit(1);
+/// Exit code for expected user, data, or state errors. See `SPEC.md`.
+const EXIT_USER_ERROR: i32 = 1;
+/// Exit code for provider or operational failures. See `SPEC.md`.
+const EXIT_PROVIDER_ERROR: i32 = 3;
+
+/// A failure, carrying the exit code it should produce.
+struct Failure {
+    message: String,
+    code: i32,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: EXIT_USER_ERROR,
+        }
     }
 }
 
-fn run(command: Command) -> Result<(), String> {
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl From<avc_core::Error> for Failure {
+    fn from(error: avc_core::Error) -> Self {
+        // Now that transfers can fail for reasons outside the repository,
+        // there is a real distinction to draw between a bad request and an
+        // unreachable or unauthorized remote.
+        let code = if error.is_provider_failure() {
+            EXIT_PROVIDER_ERROR
+        } else {
+            EXIT_USER_ERROR
+        };
+        Self {
+            message: error.to_string(),
+            code,
+        }
+    }
+}
+
+fn main() {
+    if let Err(failure) = run(Cli::parse().command) {
+        eprintln!("avc: {}", failure.message);
+        std::process::exit(failure.code);
+    }
+}
+
+fn run(command: Command) -> Result<(), Failure> {
     match command {
         Command::Init => init(),
         Command::Remote { command } => remote(command),
@@ -134,7 +190,7 @@ fn run(command: Command) -> Result<(), String> {
     }
 }
 
-fn init() -> Result<(), String> {
+fn init() -> Result<(), Failure> {
     let root = find_root()?;
     if !root.join(".git").exists() {
         return Err("current directory is not a Git worktree".into());
@@ -150,12 +206,11 @@ fn init() -> Result<(), String> {
     Ok(())
 }
 
-fn remote(command: RemoteCommand) -> Result<(), String> {
+fn remote(command: RemoteCommand) -> Result<(), Failure> {
     let mut repo = load_repo()?;
     match command {
         RemoteCommand::Add(args) => {
-            let parsed = avc_core::RemoteConfig::from_url(&args.name, &args.provider_url)
-                .map_err(|e| e.to_string())?;
+            let parsed = avc_core::RemoteConfig::from_url(&args.name, &args.provider_url)?;
             repo.config
                 .remotes
                 .retain(|remote| remote.name != args.name);
@@ -189,7 +244,7 @@ fn remote(command: RemoteCommand) -> Result<(), String> {
     Ok(())
 }
 
-fn add(paths: &[String]) -> Result<(), String> {
+fn add(paths: &[String]) -> Result<(), Failure> {
     let repo = load_repo()?;
     for value in paths {
         add_one(&repo, value, false)?;
@@ -197,7 +252,7 @@ fn add(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn commit(paths: &[String], force: bool) -> Result<(), String> {
+fn commit(paths: &[String], force: bool) -> Result<(), Failure> {
     let repo = load_repo()?;
     for value in paths {
         add_one(&repo, value, force)?;
@@ -205,38 +260,29 @@ fn commit(paths: &[String], force: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn add_one(repo: &Repo, value: &str, require_pointer: bool) -> Result<(), String> {
-    let relative = avc_core::normalize_repo_path(Path::new(value)).map_err(|e| e.to_string())?;
+fn add_one(repo: &Repo, value: &str, require_pointer: bool) -> Result<(), Failure> {
+    let relative = avc_core::normalize_repo_path(Path::new(value))?;
     let source = repo.root.join(&relative);
     if !source.is_file() {
-        return Err(format!("artifact is not a regular file: {value}"));
+        return Err(format!("artifact is not a regular file: {value}").into());
     }
-    let pointer = repo
-        .root
-        .join(avc_core::pointer_path(&relative).map_err(|e| e.to_string())?);
+    let pointer = repo.root.join(avc_core::pointer_path(&relative)?);
     if require_pointer && !pointer.exists() {
-        return Err(format!("no pointer exists for {value}"));
+        return Err(format!("no pointer exists for {value}").into());
     }
-    let hash = avc_core::hash_file(&source).map_err(|e| e.to_string())?;
-    let pointer_value = avc_core::Pointer::new(&relative, hash.object.clone(), hash.size, None)
-        .map_err(|e| e.to_string())?;
+    let hash = avc_core::hash_file(&source)?;
+    let pointer_value = avc_core::Pointer::new(&relative, hash.object.clone(), hash.size, None)?;
     let object = cache_path(repo, &hash.object);
     if !object.exists() {
         copy_atomic(&source, &object)?;
     }
     append_ignore_path(&repo.root, &relative)?;
-    write_atomic(
-        &pointer,
-        pointer_value
-            .serialize_canonical()
-            .map_err(|e| e.to_string())?
-            .as_bytes(),
-    )?;
+    write_atomic(&pointer, pointer_value.serialize_canonical()?.as_bytes())?;
     println!("tracked {relative} ({})", hash.object);
     Ok(())
 }
 
-fn status() -> Result<(), String> {
+fn status() -> Result<(), Failure> {
     let repo = load_repo()?;
     let mut count = 0;
     for pointer_path in pointer_files(&repo.root)? {
@@ -252,17 +298,14 @@ fn status() -> Result<(), String> {
         let state = if !artifact.exists() {
             "missing"
         } else {
-            let actual = avc_core::hash_file(&artifact).map_err(|e| e.to_string())?;
-            if actual.object != pointer.object_id().map_err(|e| e.to_string())?
-                || actual.size != pointer.object.size
-            {
+            let actual = avc_core::hash_file(&artifact)?;
+            if actual.object != pointer.object_id()? || actual.size != pointer.object.size {
                 "modified"
             } else {
                 "ok"
             }
         };
-        let cache = if cache_path(&repo, &pointer.object_id().map_err(|e| e.to_string())?).exists()
-        {
+        let cache = if cache_path(&repo, &pointer.object_id()?).exists() {
             "cached"
         } else {
             "cache-missing"
@@ -275,25 +318,26 @@ fn status() -> Result<(), String> {
     Ok(())
 }
 
-fn list(remote_name: Option<&str>) -> Result<(), String> {
+fn list(remote_name: Option<&str>) -> Result<(), Failure> {
     let repo = load_repo()?;
-    let remote = choose_remote(&repo, remote_name)?;
+    let store = open_store(&repo, remote_name)?;
     let pointers = pointer_files(&repo.root)?;
     if pointers.is_empty() {
         println!("no AVC pointers found");
         return Ok(());
     }
-    if !matches!(remote.provider, avc_core::Provider::File) {
-        return Err(format!(
-            "remote '{}' uses {:?}; remote listing is unavailable until provider adapter is implemented",
-            remote.name, remote.provider
-        ));
-    }
+    // One listing answers every pointer, so a repository with a thousand
+    // artifacts costs one round trip rather than a thousand HEAD requests.
+    let present: std::collections::HashSet<String> = store
+        .list()?
+        .into_iter()
+        .map(|found| found.object.hash().to_owned())
+        .collect();
     println!("PATH\tSIZE\tOBJECT\tREMOTE");
     for pointer_path in pointers {
         let pointer = parse_pointer(&pointer_path)?;
-        let object = pointer.object_id().map_err(|e| e.to_string())?;
-        let remote_state = if remote_path(remote, &object).is_file() {
+        let object = pointer.object_id()?;
+        let remote_state = if present.contains(object.hash()) {
             "available"
         } else {
             "missing"
@@ -306,7 +350,7 @@ fn list(remote_name: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn checkout(paths: &[String], force: bool) -> Result<(), String> {
+fn checkout(paths: &[String], force: bool) -> Result<(), Failure> {
     let repo = load_repo()?;
     let selected = pointer_files(&repo.root)?.into_iter().filter(|path| {
         paths.is_empty()
@@ -318,18 +362,19 @@ fn checkout(paths: &[String], force: bool) -> Result<(), String> {
     });
     for pointer_path in selected {
         let pointer = parse_pointer(&pointer_path)?;
-        let object = cache_path(&repo, &pointer.object_id().map_err(|e| e.to_string())?);
+        let object = cache_path(&repo, &pointer.object_id()?);
         if !object.is_file() {
-            return Err(format!("cache object missing for {}", pointer.path));
+            return Err(format!("cache object missing for {}", pointer.path).into());
         }
         let target = repo.root.join(&pointer.path);
         if target.exists() && !force {
-            let actual = avc_core::hash_file(&target).map_err(|e| e.to_string())?;
+            let actual = avc_core::hash_file(&target)?;
             if actual.object.hash() != pointer.object.hash {
                 return Err(format!(
                     "refusing to replace modified file {}; use --force",
                     pointer.path
-                ));
+                )
+                .into());
             }
         }
         copy_atomic(&object, &target)?;
@@ -338,61 +383,104 @@ fn checkout(paths: &[String], force: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), String> {
+fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     let repo = load_repo()?;
-    let remote = choose_remote(&repo, remote_name)?;
-    if !matches!(remote.provider, avc_core::Provider::File) {
-        return Err("only file:// remotes are implemented; cloud adapters are planned next".into());
-    }
-    for pointer_path in pointer_files(&repo.root)? {
-        let pointer = parse_pointer(&pointer_path)?;
-        if !paths.is_empty() && !paths.iter().any(|p| p == &pointer.path) {
+    let store = open_store(&repo, remote_name)?;
+    let mut uploaded = 0;
+    for pointer in selected_pointers(&repo, paths)? {
+        let object_id = pointer.object_id()?;
+        let source = cache_path(&repo, &object_id);
+        if !source.is_file() {
+            return Err(format!("cache object missing for {}", pointer.path).into());
+        }
+        // Objects are immutable, so re-uploading identical bytes is pure cost.
+        // Asking first turns a repeated push into a cheap no-op.
+        if store.exists(&object_id)? {
+            println!("up to date {}", pointer.path);
             continue;
         }
-        let object = cache_path(&repo, &pointer.object_id().map_err(|e| e.to_string())?);
-        if !object.is_file() {
-            return Err(format!("cache object missing for {}", pointer.path));
-        }
-        let destination = remote_path(remote, &pointer.object_id().map_err(|e| e.to_string())?);
-        copy_atomic(&object, &destination)?;
-        println!("pushed {}", pointer.object.hash);
+        let mut file = File::open(&source).map_err(io_error)?;
+        store.put(&object_id, pointer.object.size, &mut file)?;
+        println!("pushed {} ({})", pointer.path, object_id);
+        uploaded += 1;
     }
+    println!("pushed {uploaded} object(s) to {}", store.describe());
     Ok(())
 }
 
-fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), String> {
+fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     let repo = load_repo()?;
-    let remote = choose_remote(&repo, remote_name)?;
-    if !matches!(remote.provider, avc_core::Provider::File) {
-        return Err("only file:// remotes are implemented; cloud adapters are planned next".into());
-    }
-    for pointer_path in pointer_files(&repo.root)? {
-        let pointer = parse_pointer(&pointer_path)?;
-        if !paths.is_empty() && !paths.iter().any(|p| p == &pointer.path) {
+    let store = open_store(&repo, remote_name)?;
+    for pointer in selected_pointers(&repo, paths)? {
+        let object_id = pointer.object_id()?;
+        let destination = cache_path(&repo, &object_id);
+        if destination.is_file() {
             continue;
         }
-        let object_id = pointer.object_id().map_err(|e| e.to_string())?;
-        let source = remote_path(remote, &object_id);
-        if !source.is_file() {
-            return Err(format!("remote object missing for {}", pointer.path));
-        }
-        let destination = cache_path(&repo, &object_id);
-        copy_atomic(&source, &destination)?;
+        let mut body = store.get(&object_id)?;
+        download_verified(&mut body, &destination, &pointer)?;
         println!("pulled {}", pointer.path);
     }
     checkout(paths, false)
 }
 
-fn remove(paths: &[String]) -> Result<(), String> {
+/// Stream a download into the cache, verifying size and digest before the
+/// object becomes visible.
+///
+/// The hash is computed while the bytes are written, so a 40 GB artifact is
+/// never read twice and a truncated or corrupted transfer never lands in the
+/// cache under a name that claims it is intact.
+fn download_verified(
+    body: &mut dyn std::io::Read,
+    destination: &Path,
+    pointer: &avc_core::Pointer,
+) -> Result<(), Failure> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
+    let outcome = (|| -> Result<avc_core::HashResult, String> {
+        let mut file = File::create(&temporary).map_err(io_error)?;
+        let mut hasher = avc_core::StreamHasher::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = body.read(&mut buffer).map_err(io_error)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            file.write_all(&buffer[..read]).map_err(io_error)?;
+        }
+        file.sync_all().map_err(io_error)?;
+        hasher.finish().map_err(|error| error.to_string())
+    })();
+
+    let actual = match outcome {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    };
+    if actual.size != pointer.object.size || actual.object.hash() != pointer.object.hash {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "remote object for {} does not match its pointer: expected {} bytes of {}, got {} bytes of {}",
+            pointer.path, pointer.object.size, pointer.object.hash, actual.size, actual.object.hash()
+        )
+        .into());
+    }
+    fs::rename(&temporary, destination).map_err(io_error)?;
+    Ok(())
+}
+
+fn remove(paths: &[String]) -> Result<(), Failure> {
     let repo = load_repo()?;
     for value in paths {
-        let relative =
-            avc_core::normalize_repo_path(Path::new(value)).map_err(|e| e.to_string())?;
-        let pointer = repo
-            .root
-            .join(avc_core::pointer_path(&relative).map_err(|e| e.to_string())?);
+        let relative = avc_core::normalize_repo_path(Path::new(value))?;
+        let pointer = repo.root.join(avc_core::pointer_path(&relative)?);
         if !pointer.exists() {
-            return Err(format!("no pointer exists for {value}"));
+            return Err(format!("no pointer exists for {value}").into());
         }
         fs::remove_file(pointer).map_err(io_error)?;
         println!("untracked {relative}; artifact retained");
@@ -400,7 +488,7 @@ fn remove(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn gc(_remote: Option<&str>, dry_run: bool) -> Result<(), String> {
+fn gc(_remote: Option<&str>, dry_run: bool) -> Result<(), Failure> {
     let repo = load_repo()?;
     let reachable: std::collections::HashSet<_> = pointer_files(&repo.root)?
         .into_iter()
@@ -424,20 +512,18 @@ fn gc(_remote: Option<&str>, dry_run: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn doctor() -> Result<(), String> {
+fn doctor() -> Result<(), Failure> {
     let repo = load_repo()?;
     if !repo.root.join(".git").exists() {
         return Err("Git worktree not found".into());
     }
     for path in pointer_files(&repo.root)? {
         let pointer = parse_pointer(&path)?;
-        let object = cache_path(&repo, &pointer.object_id().map_err(|e| e.to_string())?);
+        let object = cache_path(&repo, &pointer.object_id()?);
         if object.exists() {
-            let actual = avc_core::hash_file(&object).map_err(|e| e.to_string())?;
-            if actual.size != pointer.object.size
-                || actual.object != pointer.object_id().map_err(|e| e.to_string())?
-            {
-                return Err(format!("corrupt cache object for {}", pointer.path));
+            let actual = avc_core::hash_file(&object)?;
+            if actual.size != pointer.object.size || actual.object != pointer.object_id()? {
+                return Err(format!("corrupt cache object for {}", pointer.path).into());
             }
         }
     }
@@ -445,7 +531,7 @@ fn doctor() -> Result<(), String> {
     Ok(())
 }
 
-fn find_root() -> Result<PathBuf, String> {
+fn find_root() -> Result<PathBuf, Failure> {
     let mut current = std::env::current_dir().map_err(io_error)?;
     loop {
         if current.join(".git").exists() {
@@ -456,7 +542,7 @@ fn find_root() -> Result<PathBuf, String> {
         }
     }
 }
-fn load_repo() -> Result<Repo, String> {
+fn load_repo() -> Result<Repo, Failure> {
     let root = find_root()?;
     let path = root.join(".avc/config.toml");
     if !path.exists() {
@@ -466,16 +552,16 @@ fn load_repo() -> Result<Repo, String> {
     let config = if text.trim().is_empty() {
         Config::default()
     } else {
-        toml::from_str(&text).map_err(|e| e.to_string())?
+        toml::from_str(&text).map_err(io_error)?
     };
     Ok(Repo { root, config })
 }
-fn save_config(repo: &Repo) -> Result<(), String> {
+fn save_config(repo: &Repo) -> Result<(), Failure> {
     let path = repo.root.join(".avc/config.toml");
-    let text = toml::to_string_pretty(&repo.config).map_err(|e| e.to_string())?;
+    let text = toml::to_string_pretty(&repo.config).map_err(io_error)?;
     write_atomic(&path, text.as_bytes())
 }
-fn append_ignore(root: &Path) -> Result<(), String> {
+fn append_ignore(root: &Path) -> Result<(), Failure> {
     let path = root.join(".gitignore");
     let old = fs::read_to_string(&path).unwrap_or_default();
     let marker = ".avc/cache/";
@@ -490,7 +576,7 @@ fn append_ignore(root: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn append_ignore_path(root: &Path, relative: &str) -> Result<(), String> {
+fn append_ignore_path(root: &Path, relative: &str) -> Result<(), Failure> {
     let path = root.join(".gitignore");
     let old = fs::read_to_string(&path).unwrap_or_default();
     if old.lines().any(|line| line == relative) {
@@ -503,12 +589,12 @@ fn append_ignore_path(root: &Path, relative: &str) -> Result<(), String> {
     };
     write_atomic(&path, format!("{old}{suffix}{relative}\n").as_bytes())
 }
-fn pointer_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+fn pointer_files(root: &Path) -> Result<Vec<PathBuf>, Failure> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
     Ok(files)
 }
-fn collect_files(root: &Path, directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_files(root: &Path, directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), Failure> {
     for entry in fs::read_dir(directory).map_err(io_error)? {
         let path = entry.map_err(io_error)?.path();
         if path.file_name().and_then(|n| n.to_str()) == Some(".git")
@@ -524,20 +610,70 @@ fn collect_files(root: &Path, directory: &Path, output: &mut Vec<PathBuf>) -> Re
     }
     Ok(())
 }
-fn parse_pointer(relative: &Path) -> Result<avc_core::Pointer, String> {
+fn parse_pointer(relative: &Path) -> Result<avc_core::Pointer, Failure> {
     let root = find_root()?;
     avc_core::Pointer::parse(&fs::read_to_string(root.join(relative)).map_err(io_error)?)
-        .map_err(|e| format!("{}: {e}", relative.display()))
+        .map_err(|error| format!("{}: {error}", relative.display()).into())
 }
 fn cache_path(repo: &Repo, object: &avc_core::ObjectId) -> PathBuf {
     repo.root.join(".avc/cache").join(object.cache_key())
 }
-fn remote_path(remote: &Remote, object: &avc_core::ObjectId) -> PathBuf {
-    PathBuf::from(&remote.bucket_or_container)
-        .join(&remote.prefix)
-        .join(object.cache_key())
+/// Build the transport for the selected remote.
+///
+/// Provider dispatch lives in `avc-core`; this only assembles the tracked
+/// configuration with any machine-local overrides before handing both over.
+fn open_store(repo: &Repo, name: Option<&str>) -> Result<Box<dyn avc_core::ObjectStore>, Failure> {
+    let remote = choose_remote(repo, name)?;
+    let local = load_local_override(repo, &remote.name)?;
+    let config = avc_core::RemoteConfig {
+        name: remote.name.clone(),
+        provider: remote.provider.clone(),
+        bucket_or_container: remote.bucket_or_container.clone(),
+        prefix: remote.prefix.clone(),
+        endpoint_url: remote.endpoint_url.clone(),
+    };
+    Ok(avc_core::remote::open(&config, local.as_ref())?)
 }
-fn choose_remote<'a>(repo: &'a Repo, name: Option<&str>) -> Result<&'a Remote, String> {
+
+/// Read `.avc/config.local.toml`, which is gitignored and holds credentials.
+///
+/// A malformed file is an error rather than a silent fallback: quietly ignoring
+/// it would send a request to the wrong endpoint, or with no credentials at all.
+fn load_local_override(
+    repo: &Repo,
+    name: &str,
+) -> Result<Option<avc_core::LocalRemoteOverride>, Failure> {
+    let path = repo.root.join(".avc/config.local.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(io_error)?;
+    let local: LocalConfig =
+        toml::from_str(&text).map_err(|error| format!(".avc/config.local.toml: {error}"))?;
+    Ok(local.remotes.into_iter().find(|remote| remote.name == name))
+}
+
+/// The pointers a command should act on: all of them, or just the paths named.
+fn selected_pointers(repo: &Repo, paths: &[String]) -> Result<Vec<avc_core::Pointer>, Failure> {
+    let mut selected = Vec::new();
+    for pointer_path in pointer_files(&repo.root)? {
+        let pointer = parse_pointer(&pointer_path)?;
+        if paths.is_empty() || paths.iter().any(|value| value == &pointer.path) {
+            selected.push(pointer);
+        }
+    }
+    if !paths.is_empty() {
+        // A typo in a path should not be reported as "nothing to do".
+        for value in paths {
+            if !selected.iter().any(|pointer| &pointer.path == value) {
+                return Err(format!("no pointer exists for {value}").into());
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn choose_remote<'a>(repo: &'a Repo, name: Option<&str>) -> Result<&'a Remote, Failure> {
     let selected = name
         .or(repo.config.default_remote.as_deref())
         .ok_or("no remote configured")?;
@@ -545,9 +681,9 @@ fn choose_remote<'a>(repo: &'a Repo, name: Option<&str>) -> Result<&'a Remote, S
         .remotes
         .iter()
         .find(|remote| remote.name == selected)
-        .ok_or_else(|| format!("remote not found: {selected}"))
+        .ok_or_else(|| format!("remote not found: {selected}").into())
 }
-fn cache_objects(repo: &Repo) -> Result<Vec<(String, PathBuf)>, String> {
+fn cache_objects(repo: &Repo) -> Result<Vec<(String, PathBuf)>, Failure> {
     let root = repo.root.join(".avc/cache/objects/sha256");
     let mut result = Vec::new();
     if !root.exists() {
@@ -566,7 +702,7 @@ fn cache_objects(repo: &Repo) -> Result<Vec<(String, PathBuf)>, String> {
     }
     Ok(result)
 }
-fn copy_atomic(source: &Path, destination: &Path) -> Result<(), String> {
+fn copy_atomic(source: &Path, destination: &Path) -> Result<(), Failure> {
     let mut input = File::open(source).map_err(io_error)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(io_error)?;
@@ -575,9 +711,10 @@ fn copy_atomic(source: &Path, destination: &Path) -> Result<(), String> {
     let mut output = File::create(&temporary).map_err(io_error)?;
     std::io::copy(&mut input, &mut output).map_err(io_error)?;
     output.sync_all().map_err(io_error)?;
-    fs::rename(&temporary, destination).map_err(io_error)
+    fs::rename(&temporary, destination).map_err(io_error)?;
+    Ok(())
 }
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_error)?;
     }
@@ -585,7 +722,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = File::create(&temporary).map_err(io_error)?;
     file.write_all(bytes).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
-    fs::rename(&temporary, path).map_err(io_error)
+    fs::rename(&temporary, path).map_err(io_error)?;
+    Ok(())
 }
 fn io_error(error: impl std::fmt::Display) -> String {
     error.to_string()

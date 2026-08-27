@@ -105,8 +105,34 @@ Run one test, with output:
 cargo test --workspace pointer_serialization -- --nocapture
 ```
 
+`tests/object_store.rs` holds one `ObjectStore` contract that both backends must
+satisfy. The `file://` half runs on every CI run; the S3 half is `#[ignore]`d
+until you point it at a real server:
+
+```bash
+export AVC_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+export AVC_TEST_S3_BUCKET=avc-test
+export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
+cargo test -p avc-core --test object_store -- --ignored
+```
+
+Any new backend should be added to that suite rather than given its own, so all
+transports are held to one standard.
+
 There is **no CLI integration test harness yet**. Building one is on the
 [Roadmap](roadmap.md) and is a high-value, low-prerequisite contribution.
+
+## Testing against MinIO
+
+```bash
+docker run -d --rm -p 9000:9000 -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+```
+
+Create a bucket (the MinIO console on `:9001`, or `mc mb local/avc-test`), then
+point a scratch repository at it as shown below. MinIO is the reference target
+for the S3 adapter: it exercises path-style addressing, a non-default port, and
+plain HTTP, which is the combination most likely to break a signer.
 
 ## A scratch repository for manual testing
 
@@ -129,6 +155,9 @@ printf 'example artifact\n' > model.bin
 "$AVC" init
 "$AVC" add model.bin
 "$AVC" remote add origin "file://$REMOTE"
+# Or, against a local MinIO:
+#   "$AVC" remote add origin "s3+http://localhost:9000/avc-test/artifacts"
+#   export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
 "$AVC" status
 "$AVC" push
 "$AVC" list --remote origin

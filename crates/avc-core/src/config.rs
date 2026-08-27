@@ -28,7 +28,7 @@ impl RemoteConfig {
         let parsed = Url::parse(raw).map_err(|_| Error::InvalidRemote(raw.into()))?;
         let provider = match parsed.scheme() {
             "file" => Provider::File,
-            "s3" | "s3+https" => Provider::S3,
+            "s3" | "s3+https" | "s3+http" => Provider::S3,
             "gs" => Provider::Gcs,
             "az" => Provider::Azure,
             _ => return Err(Error::InvalidRemote(raw.into())),
@@ -49,16 +49,28 @@ impl RemoteConfig {
             .host_str()
             .ok_or_else(|| Error::InvalidRemote(raw.into()))?;
         let path = parsed.path().trim_matches('/');
-        let (bucket_or_container, prefix, endpoint_url) = if parsed.scheme() == "s3+https" {
+        let compatible_scheme = match parsed.scheme() {
+            "s3+https" => Some("https"),
+            // Plain HTTP is for a MinIO or Ceph instance on a trusted network.
+            // It is spelled out in the URL so nobody sends credentials in the
+            // clear without having typed the word `http`.
+            "s3+http" => Some("http"),
+            _ => None,
+        };
+        let (bucket_or_container, prefix, endpoint_url) = if let Some(scheme) = compatible_scheme {
             let mut parts = path.splitn(2, '/');
             let bucket = parts
                 .next()
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| Error::InvalidRemote(raw.into()))?;
+            let authority = match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            };
             (
                 bucket.to_string(),
                 parts.next().unwrap_or_default().to_string(),
-                Some(format!("https://{host}")),
+                Some(format!("{scheme}://{authority}")),
             )
         } else {
             if path.is_empty() && parsed.scheme() != "s3" {

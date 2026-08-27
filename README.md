@@ -38,15 +38,16 @@ avc push               # send the bytes to your object store
   from a hostname.
 - 🧩 **Deduplicates by construction.** Identical bytes have one key, whether they
   appear in ten paths or ten branches.
-- 🦀 **Small dependency tree.** Seven direct dependencies. A tool guarding your
-  artifacts should not be a supply-chain liability.
+- 🦀 **Small dependency tree.** Nine direct dependencies, no async runtime. S3
+  is spoken over plain HTTP with a hand-written SigV4 signer rather than a
+  cloud SDK. A tool guarding your artifacts should not be a supply-chain
+  liability.
 
 > [!IMPORTANT]
-> AVC is a **`0.1.0` prototype**. The local workflow works end to end, but cloud
-> adapters are not implemented — `s3://`, `gs://`, and `az://` URLs configure
-> correctly and then return an explicit unsupported-adapter error on transfer.
-> Only `file://` remotes move bytes today. On-disk formats are provisional. See
-> the [roadmap](docs/roadmap.md).
+> AVC is a **`0.1.0` prototype**. The local workflow and S3 transport work end
+> to end; `gs://` and `az://` still configure correctly and then return an
+> explicit unsupported-adapter error on transfer. On-disk formats are
+> provisional. See the [roadmap](docs/roadmap.md).
 
 ## Installation
 
@@ -113,6 +114,15 @@ avc remote add origin file:///tmp/avc-remote
 avc push
 ```
 
+Or push to S3, or anything that speaks the S3 API:
+
+```bash
+avc remote add origin s3://my-bucket/artifacts               # Amazon S3
+avc remote add minio s3+http://localhost:9000/my-bucket      # MinIO, R2, Ceph…
+export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
+avc push
+```
+
 Then simulate a fresh clone:
 
 ```bash
@@ -165,6 +175,29 @@ objects and fails on any drift.
 scoped to specific paths. `avc pull` materializes files afterward, refusing to
 clobber local modifications. `avc checkout` restores from cache without touching
 the network.
+
+Transfers stream in bounded memory in both directions — pushing a 300 MB
+artifact peaks under 5 MB of RSS. A download is hashed as it is written, so a
+truncated or tampered object is rejected before it can enter the cache. `avc
+push` asks the remote what it already has, making a repeated push a no-op
+rather than a re-upload.
+
+### S3 and S3-compatible storage
+
+`s3://` reaches Amazon S3; `s3+https://` and `s3+http://` reach anything else
+that speaks the S3 API — MinIO, Cloudflare R2, Ceph, Backblaze B2 — with the
+host taken as the endpoint and the first path segment as the bucket. Requests
+are signed with SigV4 and sent over plain HTTP; there is no cloud SDK and no
+async runtime.
+
+Credentials resolve in this order, so AVC never becomes another place a secret
+leaks from:
+
+1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
+2. `.avc/config.local.toml`, which `avc init` gitignores
+3. `~/.aws/credentials` for `$AWS_PROFILE`, or `default`
+
+See [Configuration](docs/configuration.md#credentials) for the full table.
 
 ### Storage
 

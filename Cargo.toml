@@ -13,9 +13,11 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "1"
 toml = "0.8"
+ureq = { version = "~3.2", default-features = false, features = ["rustls"] }
 url = "2"
