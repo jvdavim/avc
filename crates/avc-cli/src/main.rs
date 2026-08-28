@@ -1,3 +1,6 @@
+mod ci;
+mod ui;
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -5,36 +8,90 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use ui::{Cell, Column, Style, Table};
+
+/// Where the commands built for a pipeline are documented, mentioned in
+/// `--help` because that is where somebody wiring up CI will look first.
+const CI_HELP: &str = "\
+Commands for CI/CD:
+  fetch   download artifacts straight from a remote - no clone, no cache
+  verify  check artifacts on disk against their pointers
+
+Both run without a repository. See docs/ci-cd.md.";
+
 #[derive(Debug, Parser)]
-#[command(name = "avc", version, about = "Artifact Version Control")]
+#[command(
+    name = "avc",
+    version,
+    about = "Artifact Version Control",
+    after_help = CI_HELP
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// When to colorize output.
+    #[arg(
+        long,
+        global = true,
+        value_name = "WHEN",
+        env = "AVC_COLOR",
+        default_value = "auto"
+    )]
+    color: ui::ColorChoice,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize AVC in the current Git worktree.
     Init,
+    /// Configure the object stores this repository pushes to and pulls from.
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Start tracking a file or directory as an artifact.
     Add(Paths),
-    /// List tracked artifact paths without downloading artifact bytes.
+    /// List tracked artifacts and their availability on a remote.
     List(ListArgs),
-    Status,
+    /// Report working-tree and cache state for every tracked artifact.
+    Status(StatusArgs),
+    /// Record a new version of an already-tracked artifact.
     Commit(CommitArgs),
+    /// Upload cached objects to a remote.
     Push(SyncArgs),
+    /// Download objects from a remote into the cache, then materialize them.
     Pull(SyncArgs),
+    /// Materialize artifacts from the local cache, without touching the network.
     Checkout(CheckoutArgs),
+    /// Stop tracking an artifact, keeping the file and its cached bytes.
     Remove(Paths),
+    /// Delete cache objects no pointer references.
     Gc(GcArgs),
+    /// Verify repository integrity: pointers, manifests, and cached objects.
     Doctor,
+
+    /// [CI/CD] Download artifacts straight from a remote: no clone, no cache.
+    ///
+    /// Reads pointer files, downloads exactly the objects they name, verifies
+    /// each one as it streams, and writes it where the pointer says. Needs no
+    /// Git repository, no `avc init`, and no local cache; a remote URL and
+    /// credentials in the environment are enough. See docs/ci-cd.md.
+    Fetch(ci::FetchArgs),
+
+    /// [CI/CD] Check artifacts on disk against their pointers.
+    ///
+    /// Re-hashes what is on disk and compares it with what the pointers claim,
+    /// using nothing but the two. Exits 1 if any artifact is missing or
+    /// differs, which makes it a gate a pipeline can fail on. See docs/ci-cd.md.
+    Verify(ci::VerifyArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum RemoteCommand {
+    /// Register a remote by URL, replacing any remote of the same name.
     Add(RemoteAddArgs),
+    /// Show the configured remotes, marking the default.
     List,
 }
 
@@ -84,6 +141,16 @@ struct GcArgs {
 struct ListArgs {
     #[arg(long)]
     remote: Option<String>,
+    /// Stable tab-separated output for scripts: PATH, SIZE, OBJECT, REMOTE.
+    #[arg(long)]
+    porcelain: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    /// Stable tab-separated output for scripts: STATE, CACHE, PATH.
+    #[arg(long)]
+    porcelain: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -112,7 +179,7 @@ struct LocalConfig {
     remotes: Vec<avc_core::LocalRemoteOverride>,
 }
 
-struct Repo {
+pub(crate) struct Repo {
     root: PathBuf,
     config: Config,
 }
@@ -123,7 +190,7 @@ const EXIT_USER_ERROR: i32 = 1;
 const EXIT_PROVIDER_ERROR: i32 = 3;
 
 /// A failure, carrying the exit code it should produce.
-struct Failure {
+pub(crate) struct Failure {
     message: String,
     code: i32,
 }
@@ -167,8 +234,14 @@ impl From<avc_core::Error> for Failure {
 }
 
 fn main() {
-    if let Err(failure) = run(Cli::parse().command) {
-        eprintln!("avc: {}", failure.message);
+    let cli = Cli::parse();
+    ui::init(cli.color);
+    if let Err(failure) = run(cli.command) {
+        eprintln!(
+            "{} {}",
+            ui::paint_err("avc:", Style::Error),
+            failure.message
+        );
         std::process::exit(failure.code);
     }
 }
@@ -178,8 +251,8 @@ fn run(command: Command) -> Result<(), Failure> {
         Command::Init => init(),
         Command::Remote { command } => remote(command),
         Command::Add(args) => add(&args.paths),
-        Command::List(args) => list(args.remote.as_deref()),
-        Command::Status => status(),
+        Command::List(args) => list(args.remote.as_deref(), args.porcelain),
+        Command::Status(args) => status(args.porcelain),
         Command::Commit(args) => commit(&args.paths.paths, args.force),
         Command::Push(args) => push(&args.paths, args.remote.as_deref()),
         Command::Pull(args) => pull(&args.paths, args.remote.as_deref()),
@@ -187,6 +260,8 @@ fn run(command: Command) -> Result<(), Failure> {
         Command::Remove(args) => remove(&args.paths),
         Command::Gc(args) => gc(args.remote.as_deref(), args.dry_run),
         Command::Doctor => doctor(),
+        Command::Fetch(args) => ci::fetch(&args),
+        Command::Verify(args) => ci::verify(&args),
     }
 }
 
@@ -202,7 +277,11 @@ fn init() -> Result<(), Failure> {
         write_atomic(&config, b"# AVC repository configuration\n")?;
     }
     append_ignore(&root)?;
-    println!("initialized AVC in {}", root.display());
+    ui::heading(&format!("initialized AVC in {}", root.display()));
+    ui::field("config", ".avc/config.toml");
+    ui::field("cache", ".avc/cache");
+    ui::field("ignored", ".avc/cache/, .avc/config.local.toml");
+    ui::summary("next: avc remote add origin <url>, then avc add <path>");
     Ok(())
 }
 
@@ -221,27 +300,69 @@ fn remote(command: RemoteCommand) -> Result<(), Failure> {
                 prefix: parsed.prefix,
                 endpoint_url: parsed.endpoint_url,
             });
-            if repo.config.default_remote.is_none() {
-                repo.config.default_remote = Some(args.name);
+            let default = repo.config.default_remote.is_none();
+            if default {
+                repo.config.default_remote = Some(args.name.clone());
             }
             save_config(&repo)?;
-            println!("remote configured");
+            let added = repo
+                .config
+                .remotes
+                .last()
+                .expect("the remote just pushed is present");
+            ui::heading(&format!("configured remote {}", args.name));
+            ui::field("provider", provider_name(&added.provider));
+            ui::field("location", &remote_location(added));
+            if let Some(endpoint) = &added.endpoint_url {
+                ui::field("endpoint", endpoint);
+            }
+            ui::field("default", if default { "yes" } else { "no" });
         }
         RemoteCommand::List => {
-            for remote in repo.config.remotes {
-                let marker = if repo.config.default_remote.as_deref() == Some(&remote.name) {
-                    "*"
-                } else {
-                    " "
-                };
-                println!(
-                    "{marker} {} {:?} {}",
-                    remote.name, remote.provider, remote.bucket_or_container
-                );
+            if repo.config.remotes.is_empty() {
+                ui::line("no remotes configured", Style::Warn);
+                ui::note("add one with `avc remote add origin <url>`");
+                return Ok(());
             }
+            let mut table = Table::new(vec![
+                Column::left(""),
+                Column::left("NAME"),
+                Column::left("PROVIDER"),
+                Column::left("LOCATION"),
+            ]);
+            for remote in &repo.config.remotes {
+                let default = repo.config.default_remote.as_deref() == Some(&remote.name);
+                table.row(vec![
+                    Cell::new(if default { "*" } else { " " }, Style::Ok),
+                    Cell::plain(remote.name.clone()),
+                    Cell::plain(provider_name(&remote.provider)),
+                    Cell::plain(remote_location(remote)),
+                ]);
+            }
+            table.print();
+            ui::summary("* marks the remote used when --remote is omitted");
         }
     }
     Ok(())
+}
+
+/// A provider as it is spelled in a URL scheme, which is how a user named it.
+fn provider_name(provider: &avc_core::Provider) -> &'static str {
+    match provider {
+        avc_core::Provider::File => "file",
+        avc_core::Provider::S3 => "s3",
+        avc_core::Provider::Gcs => "gcs",
+        avc_core::Provider::Azure => "azure",
+    }
+}
+
+/// Where a remote points, as `bucket/prefix` — never including credentials.
+fn remote_location(remote: &Remote) -> String {
+    if remote.prefix.is_empty() {
+        remote.bucket_or_container.clone()
+    } else {
+        format!("{}/{}", remote.bucket_or_container, remote.prefix)
+    }
 }
 
 fn add(paths: &[String]) -> Result<(), Failure> {
@@ -270,19 +391,17 @@ fn add_one(repo: &Repo, value: &str, require_pointer: bool) -> Result<(), Failur
     // A directory is checked first: `is_file` follows symlinks, and the two
     // tests are mutually exclusive, so the order only decides the message a
     // path that is neither gets.
-    let (pointer_value, summary) = if source.is_dir() {
+    let (pointer_value, detail) = if source.is_dir() {
         track_directory(repo, &relative)?
     } else if source.is_file() {
         track_file(repo, &relative)?
     } else {
         return Err(format!("artifact is not a regular file or directory: {value}").into());
     };
-    append_ignore_path(
-        &repo.root,
-        &ignore_line(&relative, pointer_value.is_directory()),
-    )?;
+    let display = ignore_line(&relative, pointer_value.is_directory());
+    append_ignore_path(&repo.root, &display)?;
     write_atomic(&pointer, pointer_value.serialize_canonical()?.as_bytes())?;
-    println!("tracked {summary}");
+    ui::action("tracked", Style::Ok, &display, Some(&detail));
     Ok(())
 }
 
@@ -292,7 +411,12 @@ fn track_file(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, String)
     let hash = avc_core::hash_file(&source)?;
     store_in_cache(repo, &source, &hash.object)?;
     let pointer = avc_core::Pointer::new(relative, hash.object.clone(), hash.size, None)?;
-    Ok((pointer, format!("{relative} ({})", hash.object)))
+    let detail = format!(
+        "{}, {}",
+        ui::size(hash.size),
+        ui::short_hash(hash.object.hash())
+    );
+    Ok((pointer, detail))
 }
 
 /// Hash every file beneath a directory, store them, and store the manifest
@@ -328,15 +452,13 @@ fn track_directory(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, St
     let manifest = write_manifest(repo, &tree)?;
     let pointer =
         avc_core::Pointer::new_directory(relative, manifest.object.clone(), manifest.size)?;
-    Ok((
-        pointer,
-        format!(
-            "{relative}/ ({} file(s), {}, {})",
-            tree.entries.len(),
-            human_size(tree.total_size()),
-            manifest.object
-        ),
-    ))
+    let detail = format!(
+        "{}, {}, {}",
+        ui::plural(tree.entries.len(), "file"),
+        ui::size(tree.total_size()),
+        ui::short_hash(manifest.object.hash())
+    );
+    Ok((pointer, detail))
 }
 
 /// Every regular file beneath `root`, paired with the manifest entry that
@@ -464,78 +586,149 @@ fn ignore_line(relative: &str, directory: bool) -> String {
     }
 }
 
-/// Byte counts for humans, so a directory summary is readable at a glance.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
+/// How an artifact on disk compares with the pointer that describes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum State {
+    Ok,
+    Modified,
+    Missing,
+}
+
+impl State {
+    /// The word printed for this state, in human and porcelain output alike.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            State::Ok => "ok",
+            State::Modified => "modified",
+            State::Missing => "missing",
+        }
     }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[0])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
+
+    pub(crate) fn style(self) -> Style {
+        match self {
+            State::Ok => Style::Ok,
+            State::Modified => Style::Warn,
+            State::Missing => Style::Bad,
+        }
     }
 }
 
-fn status() -> Result<(), Failure> {
+fn status(porcelain: bool) -> Result<(), Failure> {
     let repo = load_repo()?;
-    let mut count = 0;
+    let mut table = Table::new(vec![
+        Column::left("STATUS"),
+        Column::left("CACHE"),
+        Column::right("SIZE"),
+        Column::left("ARTIFACT"),
+    ]);
+    let mut counts = [0_usize; 3];
+    let mut invalid = Vec::new();
+
     for pointer_path in pointer_files(&repo.root)? {
         let pointer = match parse_pointer(&pointer_path) {
             Ok(value) => value,
+            // One unreadable pointer should not hide the state of every other
+            // artifact, so it is collected and reported after the table.
             Err(error) => {
-                println!("invalid {}: {error}", pointer_path.display());
+                invalid.push(format!("{}: {error}", pointer_path.display()));
                 continue;
             }
         };
-        count += 1;
-        let state = worktree_state(&repo, &pointer)?;
-        let cache = if cached_completely(&repo, &pointer)? {
-            "cached"
-        } else {
-            "cache-missing"
-        };
-        println!("{state}\t{cache}\t{}", display_path(&pointer));
+        let (state, bytes) = artifact_state(&repo.root, &pointer)?;
+        counts[state as usize] += 1;
+        let cached = cached_completely(&repo, &pointer)?;
+        let path = display_path(&pointer);
+        if porcelain {
+            let cache = if cached { "cached" } else { "cache-missing" };
+            println!("{}\t{cache}\t{path}", state.label());
+            continue;
+        }
+        table.row(vec![
+            Cell::new(state.label(), state.style()),
+            Cell::new(
+                if cached { "cached" } else { "cache-missing" },
+                if cached { Style::Dim } else { Style::Warn },
+            ),
+            Cell::plain(if state == State::Missing {
+                "-".to_owned()
+            } else {
+                ui::size(bytes)
+            }),
+            Cell::plain(path),
+        ]);
     }
-    if count == 0 {
-        println!("no AVC pointers found");
+
+    if porcelain {
+        for message in &invalid {
+            println!("invalid\t-\t{message}");
+        }
+        return Ok(());
+    }
+
+    let total: usize = counts.iter().sum();
+    if total == 0 && invalid.is_empty() {
+        ui::line("no AVC pointers found", Style::Warn);
+        ui::note("track something with `avc add <path>`");
+        return Ok(());
+    }
+    table.print();
+    if total > 0 {
+        ui::summary(&format!(
+            "{}: {} ok, {} modified, {} missing",
+            ui::plural(total, "artifact"),
+            counts[State::Ok as usize],
+            counts[State::Modified as usize],
+            counts[State::Missing as usize]
+        ));
+    }
+    if !invalid.is_empty() {
+        println!();
+        ui::line("invalid pointers:", Style::Bad);
+        for message in &invalid {
+            println!("  {message}");
+        }
     }
     Ok(())
 }
 
-/// Compare an artifact against its pointer.
+/// Compare an artifact beneath `root` against its pointer, reporting how it
+/// differs and how many of its bytes are on disk.
 ///
 /// A directory is re-scanned and re-hashed into a manifest: its identity is
 /// that manifest's hash, so a file added, removed, renamed, or edited anywhere
-/// beneath it reads as `modified` exactly as an edited file does.
-fn worktree_state(repo: &Repo, pointer: &avc_core::Pointer) -> Result<&'static str, Failure> {
-    let artifact = repo.root.join(&pointer.path);
+/// beneath it reads as `modified` exactly as an edited file does. `root` is a
+/// parameter rather than the repository, because `avc verify` runs against a
+/// pipeline's output directory with no repository anywhere near it.
+pub(crate) fn artifact_state(
+    root: &Path,
+    pointer: &avc_core::Pointer,
+) -> Result<(State, u64), Failure> {
+    let artifact = root.join(&pointer.path);
     if pointer.is_directory() {
         if !artifact.is_dir() {
-            return Ok("missing");
+            return Ok((State::Missing, 0));
         }
         let scanned = scan_directory(&artifact)?;
         let tree = avc_core::Tree::new(scanned.into_iter().map(|(_, entry)| entry).collect())?;
         let bytes = tree.serialize_canonical()?.into_bytes();
         let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
-        return Ok(if actual.object.hash() == pointer.object.hash {
-            "ok"
+        let state = if actual.object.hash() == pointer.object.hash {
+            State::Ok
         } else {
-            "modified"
-        });
+            State::Modified
+        };
+        return Ok((state, tree.total_size()));
     }
     if !artifact.exists() {
-        return Ok("missing");
+        return Ok((State::Missing, 0));
     }
     let actual = avc_core::hash_file(&artifact)?;
-    if actual.object != pointer.object_id()? || actual.size != pointer.object.size {
-        Ok("modified")
+    let state = if actual.object != pointer.object_id()? || actual.size != pointer.object.size {
+        State::Modified
     } else {
-        Ok("ok")
-    }
+        State::Ok
+    };
+    Ok((state, actual.size))
 }
 
 /// Whether every object the artifact needs is in the cache.
@@ -555,16 +748,19 @@ fn cached_completely(repo: &Repo, pointer: &avc_core::Pointer) -> Result<bool, F
 }
 
 /// How a pointer's path is shown, with a trailing slash for a directory.
-fn display_path(pointer: &avc_core::Pointer) -> String {
+pub(crate) fn display_path(pointer: &avc_core::Pointer) -> String {
     ignore_line(&pointer.path, pointer.is_directory())
 }
 
-fn list(remote_name: Option<&str>) -> Result<(), Failure> {
+fn list(remote_name: Option<&str>, porcelain: bool) -> Result<(), Failure> {
     let repo = load_repo()?;
     let store = open_store(&repo, remote_name)?;
     let pointers = pointer_files(&repo.root)?;
     if pointers.is_empty() {
-        println!("no AVC pointers found");
+        if !porcelain {
+            ui::line("no AVC pointers found", Style::Warn);
+            ui::note("track something with `avc add <path>`");
+        }
         return Ok(());
     }
     // One listing answers every pointer, so a repository with a thousand
@@ -574,13 +770,23 @@ fn list(remote_name: Option<&str>) -> Result<(), Failure> {
         .into_iter()
         .map(|found| found.object.hash().to_owned())
         .collect();
-    println!("PATH\tSIZE\tOBJECT\tREMOTE");
+
+    let mut table = Table::new(vec![
+        Column::left("ARTIFACT"),
+        Column::right("SIZE"),
+        Column::left("OBJECT"),
+        Column::left("REMOTE"),
+    ]);
+    let mut available = 0;
+    let mut total_bytes = 0;
+    let mut counted = 0;
+
     for pointer_path in pointers {
         let pointer = parse_pointer(&pointer_path)?;
         let object = pointer.object_id()?;
         // A directory is available only when its manifest *and* every file it
         // names are on the remote; a half-uploaded directory is not restorable.
-        let (size, remote_state) = if pointer.is_directory() {
+        let (size, on_remote) = if pointer.is_directory() {
             match remote_tree(&repo, store.as_ref(), &pointer, &present)? {
                 Some(tree) => {
                     let complete = present.contains(object.hash())
@@ -588,32 +794,48 @@ fn list(remote_name: Option<&str>) -> Result<(), Failure> {
                             .entries
                             .iter()
                             .all(|entry| present.contains(&entry.hash));
-                    (
-                        tree.total_size().to_string(),
-                        if complete { "available" } else { "missing" },
-                    )
+                    (Some(tree.total_size()), complete)
                 }
                 // Without the manifest the file list is unknowable, and the
                 // remote demonstrably cannot restore the directory.
-                None => ("-".to_string(), "missing"),
+                None => (None, false),
             }
         } else {
-            (
-                pointer.object.size.to_string(),
-                if present.contains(object.hash()) {
-                    "available"
-                } else {
-                    "missing"
-                },
-            )
+            (Some(pointer.object.size), present.contains(object.hash()))
         };
-        println!(
-            "{}\t{}\t{}\t{}",
-            display_path(&pointer),
-            size,
-            object,
-            remote_state
-        );
+        counted += 1;
+        available += usize::from(on_remote);
+        total_bytes += size.unwrap_or(0);
+
+        if porcelain {
+            println!(
+                "{}\t{}\t{object}\t{}",
+                display_path(&pointer),
+                size.map_or("-".to_owned(), |bytes| bytes.to_string()),
+                if on_remote { "available" } else { "missing" }
+            );
+            continue;
+        }
+        table.row(vec![
+            Cell::plain(display_path(&pointer)),
+            Cell::plain(size.map_or("-".to_owned(), ui::size)),
+            Cell::dim(ui::short_hash(object.hash())),
+            Cell::new(
+                if on_remote { "available" } else { "missing" },
+                if on_remote { Style::Ok } else { Style::Bad },
+            ),
+        ]);
+    }
+
+    if !porcelain {
+        table.print();
+        ui::summary(&format!(
+            "{}, {} on {}: {available} available, {} missing",
+            ui::plural(counted, "artifact"),
+            ui::size(total_bytes),
+            store.describe(),
+            counted - available
+        ));
     }
     Ok(())
 }
@@ -653,10 +875,25 @@ fn remote_tree(
 }
 
 fn checkout(paths: &[String], force: bool) -> Result<(), Failure> {
+    let count = checkout_selected(paths, force)?;
+    ui::summary(&format!(
+        "{} materialized from the cache",
+        ui::plural(count, "artifact")
+    ));
+    Ok(())
+}
+
+/// Materialize the selected artifacts, reporting each as it lands, and answer
+/// how many there were.
+///
+/// Split out so `pull` can materialize without printing a second summary of
+/// its own underneath the transfer it just reported.
+fn checkout_selected(paths: &[String], force: bool) -> Result<usize, Failure> {
     let repo = load_repo()?;
-    for pointer in selected_pointers(&repo, paths)? {
+    let selected = selected_pointers(&repo, paths)?;
+    for pointer in &selected {
         if pointer.is_directory() {
-            let tree = load_tree(&repo, &pointer)?;
+            let tree = load_tree(&repo, pointer)?;
             for entry in &tree.entries {
                 let label = format!("{}/{}", pointer.path, entry.path);
                 materialize(
@@ -668,10 +905,11 @@ fn checkout(paths: &[String], force: bool) -> Result<(), Failure> {
                     &label,
                 )?;
             }
-            println!(
-                "checked out {}/ ({} file(s))",
-                pointer.path,
-                tree.entries.len()
+            ui::action(
+                "checked out",
+                Style::Ok,
+                &display_path(pointer),
+                Some(&ui::plural(tree.entries.len(), "file")),
             );
             continue;
         }
@@ -683,9 +921,14 @@ fn checkout(paths: &[String], force: bool) -> Result<(), Failure> {
             force,
             &pointer.path,
         )?;
-        println!("checked out {}", pointer.path);
+        ui::action(
+            "checked out",
+            Style::Ok,
+            &pointer.path,
+            Some(&ui::size(pointer.object.size)),
+        );
     }
-    Ok(())
+    Ok(selected.len())
 }
 
 /// Write one cached object into the working tree.
@@ -717,14 +960,24 @@ fn materialize(
 fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     let repo = load_repo()?;
     let store = open_store(&repo, remote_name)?;
+    let selected = selected_pointers(&repo, paths)?;
+    ui::heading(&format!(
+        "pushing {} to {}",
+        ui::plural(selected.len(), "artifact"),
+        store.describe()
+    ));
+    println!();
+
     let mut uploaded = 0;
-    for pointer in selected_pointers(&repo, paths)? {
+    let mut bytes = 0;
+    for pointer in selected {
         // A directory expands into its manifest plus one object per file; the
         // manifest is uploaded last, so it never names bytes that are not
         // there yet.
         let mut required = required_objects(&repo, &pointer)?;
         required.reverse();
         let mut sent = 0;
+        let mut sent_bytes = 0;
         for (object_id, size) in required {
             let source = cache_path(&repo, &object_id);
             if !source.is_file() {
@@ -738,37 +991,61 @@ fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
             let mut file = File::open(&source).map_err(io_error)?;
             store.put(&object_id, size, &mut file)?;
             sent += 1;
+            sent_bytes += size;
         }
         uploaded += sent;
+        bytes += sent_bytes;
         if sent == 0 {
-            println!("up to date {}", display_path(&pointer));
-        } else if pointer.is_directory() {
-            println!("pushed {}/ ({sent} object(s))", pointer.path);
+            ui::action("up-to-date", Style::Dim, &display_path(&pointer), None);
         } else {
-            println!("pushed {} ({})", pointer.path, pointer.object_id()?);
+            ui::action(
+                "uploaded",
+                Style::Ok,
+                &display_path(&pointer),
+                Some(&format!(
+                    "{}, {}",
+                    ui::plural(sent, "object"),
+                    ui::size(sent_bytes)
+                )),
+            );
         }
     }
-    println!("pushed {uploaded} object(s) to {}", store.describe());
+    ui::summary(&format!(
+        "pushed {} ({}) to {}",
+        ui::plural(uploaded, "object"),
+        ui::size(bytes),
+        store.describe()
+    ));
     Ok(())
 }
 
 fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     let repo = load_repo()?;
     let store = open_store(&repo, remote_name)?;
-    for pointer in selected_pointers(&repo, paths)? {
+    let selected = selected_pointers(&repo, paths)?;
+    ui::heading(&format!(
+        "pulling {} from {}",
+        ui::plural(selected.len(), "artifact"),
+        store.describe()
+    ));
+    println!();
+
+    let mut downloaded = 0;
+    let mut bytes = 0;
+    for pointer in selected {
         // The manifest has to land first: until it is here and verified, the
         // rest of a directory's objects are unknown.
         let object_id = pointer.object_id()?;
-        let fetched = fetch_object(
+        let mut received = usize::from(fetch_object(
             &repo,
             store.as_ref(),
             &object_id,
             pointer.object.size,
             &pointer.path,
-        )?;
+        )?);
+        let mut received_bytes = if received > 0 { pointer.object.size } else { 0 };
         if pointer.is_directory() {
             let tree = load_tree(&repo, &pointer)?;
-            let mut files = 0;
             for entry in &tree.entries {
                 let label = format!("{}/{}", pointer.path, entry.path);
                 if fetch_object(
@@ -778,18 +1055,37 @@ fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
                     entry.size,
                     &label,
                 )? {
-                    files += 1;
+                    received += 1;
+                    received_bytes += entry.size;
                 }
             }
-            let total = files + usize::from(fetched);
-            if total > 0 {
-                println!("pulled {}/ ({total} object(s))", pointer.path);
-            }
-        } else if fetched {
-            println!("pulled {}", pointer.path);
+        }
+        downloaded += received;
+        bytes += received_bytes;
+        if received == 0 {
+            ui::action("up-to-date", Style::Dim, &display_path(&pointer), None);
+        } else {
+            ui::action(
+                "downloaded",
+                Style::Ok,
+                &display_path(&pointer),
+                Some(&format!(
+                    "{}, {}",
+                    ui::plural(received, "object"),
+                    ui::size(received_bytes)
+                )),
+            );
         }
     }
-    checkout(paths, false)
+    println!();
+    checkout_selected(paths, false)?;
+    ui::summary(&format!(
+        "pulled {} ({}) from {}",
+        ui::plural(downloaded, "object"),
+        ui::size(bytes),
+        store.describe()
+    ));
+    Ok(())
 }
 
 /// Ensure one object is in the cache, downloading it if it is not.
@@ -820,7 +1116,7 @@ fn fetch_object(
 /// cache under a name that claims it is intact. `label` names the artifact the
 /// object belongs to, which for a file inside a tracked directory is not the
 /// pointer's own path.
-fn download_verified(
+pub(crate) fn download_verified(
     body: &mut dyn std::io::Read,
     destination: &Path,
     expected: &avc_core::ObjectId,
@@ -875,8 +1171,9 @@ fn remove(paths: &[String]) -> Result<(), Failure> {
             return Err(format!("no pointer exists for {value}").into());
         }
         fs::remove_file(pointer).map_err(io_error)?;
-        println!("untracked {relative}; artifact retained");
+        ui::action("untracked", Style::Warn, &relative, None);
     }
+    ui::note("the artifact and its cached bytes are kept; reclaim them with `avc gc`");
     Ok(())
 }
 
@@ -895,16 +1192,36 @@ fn gc(_remote: Option<&str>, dry_run: bool) -> Result<(), Failure> {
             reachable.insert(object.hash().to_owned());
         }
     }
-    let objects = cache_objects(&repo)?;
-    for object in objects {
-        if !reachable.contains(&object.0) {
-            if dry_run {
-                println!("would remove {}", object.1.display());
-            } else {
-                fs::remove_file(object.1).map_err(io_error)?;
-                println!("removed {}", object.0);
-            }
+    let mut removed = 0;
+    let mut bytes = 0;
+    for (hash, path) in cache_objects(&repo)? {
+        if reachable.contains(&hash) {
+            continue;
         }
+        bytes += fs::metadata(&path).map(|data| data.len()).unwrap_or(0);
+        removed += 1;
+        if dry_run {
+            ui::action("removable", Style::Warn, &ui::short_hash(&hash), None);
+        } else {
+            fs::remove_file(&path).map_err(io_error)?;
+            ui::action("removed", Style::Warn, &ui::short_hash(&hash), None);
+        }
+    }
+    if removed == 0 {
+        ui::line(
+            "nothing to reclaim: every cache object is still referenced",
+            Style::Ok,
+        );
+        return Ok(());
+    }
+    ui::summary(&format!(
+        "{} {} ({})",
+        if dry_run { "reclaimable:" } else { "reclaimed" },
+        ui::plural(removed, "object"),
+        ui::size(bytes)
+    ));
+    if dry_run {
+        ui::note("re-run without --dry-run to delete them");
     }
     Ok(())
 }
@@ -914,45 +1231,61 @@ fn doctor() -> Result<(), Failure> {
     if !repo.root.join(".git").exists() {
         return Err("Git worktree not found".into());
     }
+    let mut pointers = 0;
+    let mut objects = 0;
     for path in pointer_files(&repo.root)? {
         let pointer = parse_pointer(&path)?;
-        verify_cached(
+        pointers += 1;
+        objects += usize::from(verify_cached(
             &repo,
             &pointer.object_id()?,
             pointer.object.size,
             &pointer.path,
-        )?;
+        )?);
         if pointer.is_directory() && cache_path(&repo, &pointer.object_id()?).exists() {
             // `load_tree` re-verifies and parses the manifest, so a manifest
             // that is intact but unreadable is caught here too.
             for entry in load_tree(&repo, &pointer)?.entries {
                 let label = format!("{}/{}", pointer.path, entry.path);
-                verify_cached(&repo, &entry.object_id()?, entry.size, &label)?;
+                objects += usize::from(verify_cached(
+                    &repo,
+                    &entry.object_id()?,
+                    entry.size,
+                    &label,
+                )?);
             }
         }
     }
-    println!("doctor: repository, pointers, and available cache objects are valid");
+    ui::line(
+        "doctor: repository, pointers, and available cache objects are valid",
+        Style::Ok,
+    );
+    ui::summary(&format!(
+        "re-hashed {} named by {}",
+        ui::plural(objects, "cache object"),
+        ui::plural(pointers, "pointer")
+    ));
     Ok(())
 }
 
 /// Re-hash one cache object, if it is present, against what a pointer or
-/// manifest entry claims it is. Absent objects are not an error; `status`
-/// reports those.
+/// manifest entry claims it is, and report whether there was one to check.
+/// Absent objects are not an error; `status` reports those.
 fn verify_cached(
     repo: &Repo,
     object: &avc_core::ObjectId,
     size: u64,
     label: &str,
-) -> Result<(), Failure> {
+) -> Result<bool, Failure> {
     let path = cache_path(repo, object);
     if !path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let actual = avc_core::hash_file(&path)?;
     if actual.size != size || actual.object != *object {
         return Err(format!("corrupt cache object for {label}").into());
     }
-    Ok(())
+    Ok(true)
 }
 
 fn find_root() -> Result<PathBuf, Failure> {
@@ -966,7 +1299,7 @@ fn find_root() -> Result<PathBuf, Failure> {
         }
     }
 }
-fn load_repo() -> Result<Repo, Failure> {
+pub(crate) fn load_repo() -> Result<Repo, Failure> {
     let root = find_root()?;
     let path = root.join(".avc/config.toml");
     if !path.exists() {
@@ -1013,9 +1346,15 @@ fn append_ignore_path(root: &Path, entry: &str) -> Result<(), Failure> {
     };
     write_atomic(&path, format!("{old}{suffix}{entry}\n").as_bytes())
 }
+/// Every pointer in the worktree, in a stable order.
+///
+/// Directory iteration order is whatever the filesystem feels like, which
+/// would make two runs of `avc status` on the same repository — or the same
+/// pipeline on two runners — print the same artifacts in different orders.
 fn pointer_files(root: &Path) -> Result<Vec<PathBuf>, Failure> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
+    files.sort();
     Ok(files)
 }
 fn collect_files(root: &Path, directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), Failure> {
@@ -1046,7 +1385,10 @@ fn cache_path(repo: &Repo, object: &avc_core::ObjectId) -> PathBuf {
 ///
 /// Provider dispatch lives in `avc-core`; this only assembles the tracked
 /// configuration with any machine-local overrides before handing both over.
-fn open_store(repo: &Repo, name: Option<&str>) -> Result<Box<dyn avc_core::ObjectStore>, Failure> {
+pub(crate) fn open_store(
+    repo: &Repo,
+    name: Option<&str>,
+) -> Result<Box<dyn avc_core::ObjectStore>, Failure> {
     let remote = choose_remote(repo, name)?;
     let local = load_local_override(repo, &remote.name)?;
     let config = avc_core::RemoteConfig {
@@ -1130,7 +1472,7 @@ fn cache_objects(repo: &Repo) -> Result<Vec<(String, PathBuf)>, Failure> {
     }
     Ok(result)
 }
-fn copy_atomic(source: &Path, destination: &Path) -> Result<(), Failure> {
+pub(crate) fn copy_atomic(source: &Path, destination: &Path) -> Result<(), Failure> {
     let mut input = File::open(source).map_err(io_error)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(io_error)?;
@@ -1142,7 +1484,7 @@ fn copy_atomic(source: &Path, destination: &Path) -> Result<(), Failure> {
     fs::rename(&temporary, destination).map_err(io_error)?;
     Ok(())
 }
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_error)?;
     }
@@ -1153,6 +1495,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
     fs::rename(&temporary, path).map_err(io_error)?;
     Ok(())
 }
-fn io_error(error: impl std::fmt::Display) -> String {
+pub(crate) fn io_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }

@@ -125,8 +125,18 @@ against a `file://` remote — using `env!("CARGO_BIN_EXE_avc")` and a
 self-cleaning temp directory. It needs no Git binary: AVC only looks for a
 `.git` entry, so the fixture creates one.
 
-The file workflows still have no equivalent coverage. Extending that harness is
-a high-value, low-prerequisite contribution.
+`crates/avc-cli/tests/ci.rs` covers `fetch` and `verify` the same way. Its
+fixture builds a repository, pushes to a `file://` remote, then **deletes the
+repository** and keeps only the pointer files — so every assertion runs in a
+directory with no `.git`, no `.avc`, and no configuration, which is the thing
+those commands promise. One case deletes the remote too, to prove a warm
+`--cache` served the fetch without touching it.
+
+Assert against `--porcelain` rather than the human output. The tables and
+summaries are expected to change; the tab-separated records are the contract.
+
+The single-file repository workflows still have no equivalent coverage.
+Extending that harness is a high-value, low-prerequisite contribution.
 
 ## Testing against MinIO
 

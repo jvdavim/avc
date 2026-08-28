@@ -90,8 +90,11 @@ Unit tests live at the bottom of `crates/avc-core/src/lib.rs`. When adding one:
   fail.
 
 CLI-level behaviour is tested by driving the binary itself, in
-`crates/avc-cli/tests/directory.rs`. Only the directory workflow is covered
-there today; extending it to the file workflows would be a welcome
+`crates/avc-cli/tests/directory.rs` (directory artifacts) and
+`crates/avc-cli/tests/ci.rs` (`fetch` and `verify`). Assert against
+`--porcelain` output, not the human-facing tables — the former is a stable
+interface and the latter is deliberately not. The single-file workflows are
+still uncovered; extending the harness to them would be a welcome
 contribution.
 
 ### Code style

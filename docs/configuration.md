@@ -210,6 +210,22 @@ implemented. On an EC2 or ECS runner, export static credentials or inject
 temporary ones (including `AWS_SESSION_TOKEN`) through the environment. See
 [Roadmap](roadmap.md).
 
+## Configuring AVC from the environment
+
+A build agent has nowhere to put a config file, so the two commands built for
+one — `avc fetch` and `avc verify` — read theirs from the environment:
+
+| Variable | Equivalent flag | Applies to |
+| --- | --- | --- |
+| `AVC_REMOTE_URL` | `--remote-url <url>` | `avc fetch` |
+| `AVC_CACHE_DIR` | `--cache <dir>` | `avc fetch` |
+| `AVC_COLOR` | `--color <auto\|always\|never>` | every command |
+
+Setting `AVC_REMOTE_URL` once at the top of a pipeline reduces every job to
+`avc fetch`. A flag on the command line always wins over the variable. The
+credential and endpoint variables in the table above apply as usual; nothing
+else needs to exist on disk. See [CI/CD](ci-cd.md).
+
 ## `.avc/config.local.toml`
 
 Gitignored by `avc init`. Holds machine-local overrides such as an alternate

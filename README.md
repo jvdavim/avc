@@ -21,6 +21,12 @@ git add model.bin.avc  # commit the pointer, not the 4 GB
 avc push               # send the bytes to your object store
 ```
 
+In CI, skip the repository entirely:
+
+```bash
+avc fetch --remote-url s3://my-bucket/artifacts --output .
+```
+
 ## Highlights
 
 - 📦 **Keeps Git repositories small.** A 4 GB checkpoint committed ten times is a
@@ -42,6 +48,9 @@ avc push               # send the bytes to your object store
 - 📁 **Directories are one artifact.** `avc add data/` tracks a whole tree behind
   a single pointer; editing one file in a thousand re-versions the directory
   without re-storing the other 999.
+- 🏗️ **Built for pipelines too.** `avc fetch` pulls artifacts straight from the
+  remote — no clone, no `avc init`, no cache, `GetObject` and nothing else — and
+  `avc verify` fails a build whose artifacts drifted from their pointers.
 - 🦀 **Small dependency tree.** Nine direct dependencies, no async runtime. S3
   is spoken over plain HTTP with a hand-written SigV4 signer rather than a
   cloud SDK. A tool guarding your artifacts should not be a supply-chain
@@ -79,6 +88,7 @@ Full documentation lives in [`docs/`](docs/README.md).
 - [Getting Started](docs/getting-started.md) — install to first push, end to end
 - [Concepts](docs/concepts.md) — pointers, objects, cache, remotes
 - [CLI Reference](docs/cli.md) — every command, flag, and exit code
+- [CI/CD](docs/ci-cd.md) — fetching artifacts in a pipeline
 - [Configuration](docs/configuration.md) — remote URLs and credentials
 - [Architecture](docs/architecture.md) — how the crates fit together
 - [Roadmap](docs/roadmap.md) — what is built, what is not, what is next
@@ -98,7 +108,10 @@ avc status
 ```
 
 ```text
-ok      cached  model.bin
+STATUS  CACHE   SIZE  ARTIFACT
+ok      cached  17 B  model.bin
+
+1 artifact: 1 ok, 0 modified, 0 missing
 ```
 
 `add` hashes the file, stores the bytes under `.avc/cache`, writes a pointer at
@@ -153,7 +166,7 @@ avc add data/
 ```
 
 ```text
-tracked data/ (3 file(s), 17 B, sha256:bb292f…)
+tracked      data/ (3 files, 17 B, bb292fab8a18)
 ```
 
 Every file beneath it is hashed and cached, and a **manifest** naming them is
@@ -194,6 +207,10 @@ a manifest and reported the same way. `avc list --remote origin` shows
 what a remote holds **without downloading bytes**. `avc doctor` re-hashes cached
 objects and fails on any drift.
 
+Output is aligned ASCII, colored when the terminal wants it and plain when it
+does not — a pipe, `NO_COLOR`, or `--color never`. Anything a script parses
+should use `--porcelain` instead, which is tab-separated and stable.
+
 ### Transfers
 
 `avc push` and `avc pull` move objects between the cache and a remote, optionally
@@ -206,6 +223,27 @@ artifact peaks under 5 MB of RSS. A download is hashed as it is written, so a
 truncated or tampered object is rejected before it can enter the cache. `avc
 push` asks the remote what it already has, making a repeated push a no-op
 rather than a re-upload.
+
+### CI/CD
+
+A build agent has no clone of the artifact history and no cache worth warming.
+`avc fetch` is built for that: it reads pointer files, downloads exactly the
+objects they name, verifies each one as it streams, and writes it where the
+pointer says — with no Git repository, no `avc init`, and no local cache.
+
+```bash
+avc fetch --remote-url s3://my-bucket/artifacts --output .
+avc verify --output .        # exits 1 if anything drifted; a gate for a build
+```
+
+Both run in a directory holding nothing but `.avc` pointer files, take
+credentials from the environment, and select artifacts from arguments, a
+directory scan, or stdin. Because `fetch` only ever issues `GetObject`, a
+consuming job can be given a read-only policy. Re-running one is cheap: a file
+already hashing to what its pointer claims is left alone.
+
+See [CI/CD](docs/ci-cd.md) for GitHub Actions, GitLab CI, Docker, and Kubernetes
+workflows, caching between jobs, and least-privilege policies.
 
 ### S3 and S3-compatible storage
 

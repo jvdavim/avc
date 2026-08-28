@@ -27,7 +27,9 @@ avc/
     │           ├── credentials.rs  # credential, region, endpoint resolution
     │           └── xml.rs          # minimal reader for S3 responses
     └── avc-cli/                # binary: the `avc` command
-        └── src/main.rs         # clap definitions and all command workflows
+        ├── src/main.rs         # clap definitions and the repository workflows
+        ├── src/ci.rs           # fetch and verify: the CI/CD commands
+        └── src/ui.rs           # ASCII tables, color detection, message vocabulary
 ```
 
 The split is deliberate: **`avc-core` knows nothing about the filesystem layout
@@ -146,22 +148,53 @@ included.
 
 ## `avc-cli`
 
-One file, `main.rs`, in three layers.
+Three modules: `main.rs` for the repository workflows, `ci.rs` for the two
+commands that run without a repository, and `ui.rs` for presentation.
 
 ### 1. Clap definitions
 
 `Cli`, `Command`, and per-command `Args` structs. `Paths` is a shared flattened
-struct for the commands that take a required path list.
+struct for the commands that take a required path list. `--color` is a global
+argument, resolved once by `ui::init` before any command runs.
 
 ### 2. Command functions
 
 One function per subcommand: `init`, `remote`, `add`, `commit`, `status`, `list`,
 `checkout`, `push`, `pull`, `remove`, `gc`, `doctor`. Each returns
-`Result<(), String>`; `main` prints `avc: {error}` to stderr and exits `1`.
+`Result<(), Failure>`, where `Failure` carries the exit code the error should
+produce; `main` prints `avc: {error}` to stderr and exits with it.
 
 `add` and `commit` both delegate to `add_one`, differing only in the
-`require_pointer` flag. `pull` ends by calling `checkout(paths, false)`, which is
-why a `pull` will not clobber a locally modified file.
+`require_pointer` flag. `pull` ends by calling `checkout_selected(paths, false)`,
+which is why a `pull` will not clobber a locally modified file.
+
+### 2a. `ci.rs` — commands without a repository
+
+`fetch` and `verify` live apart because they invert the module's central
+assumption: there is no `Repo`, no `.avc/config.toml`, and no cache. They take a
+remote from a URL, discover pointers by scanning or from stdin, and resolve
+artifact paths against an `--output` root rather than a repository root.
+
+`Fetcher` holds the store, the arguments, and a map of which objects have
+already been written this run. `Fetcher::locate` decides where an object's bytes
+come from — a path this run already wrote, a `--cache` entry that verifies, or
+the remote — and `Fetcher::place` acts on that decision. Separating the two is
+what lets `--dry-run` report exactly the numbers a real run produces.
+
+`verify` shares `artifact_state` with `status`; the function takes the root as a
+parameter precisely so both can use it.
+
+### 2b. `ui.rs` — presentation
+
+Nothing in `ui.rs` knows what an artifact is. It offers a `Table` that computes
+column widths in characters, `action` for a per-artifact line with a fixed verb
+column, and `paint` for style application. Text and style are kept apart until
+printing, because a cell padded after being wrapped in escape codes is padded to
+the wrong width.
+
+Color is resolved once into two atomics — stdout and stderr are decided
+separately, since one can be a terminal while the other is a file. Every
+command's `--porcelain` path bypasses `ui.rs` entirely.
 
 ### 3. Filesystem helpers
 
@@ -268,13 +301,15 @@ Changes that break any of these need a SPEC change first, discussed in an issue:
 Honest accounting of where the current shape will need to change — several are
 good first contributions, see [Roadmap](roadmap.md):
 
-- **`main.rs` is ~700 lines** and holds every workflow. It wants splitting into a
-  module per command group once it grows further.
+- **`main.rs` holds every repository workflow** in one file. `ci.rs` and `ui.rs`
+  split off the pieces with the clearest boundaries; the remaining commands
+  still want a module per group once they grow further.
 - **`parse_pointer` calls `find_root()` on every invocation**, so scanning N
   pointers walks the directory tree N times. Harmless at current scale, wasteful
   at large ones.
 - **Thin CLI integration tests.** `crates/avc-cli/tests/directory.rs` drives the
-  binary end to end for directory artifacts; the file workflows still have no
+  binary end to end for directory artifacts and `tests/ci.rs` does the same for
+  `fetch` and `verify`; the single-file repository workflows still have no
   equivalent.
 - **`gc` reachability ignores Git history**, considering only worktree pointers.
 - **Retries and timeouts are absent** in the S3 transport: one attempt, no deadline.
@@ -288,5 +323,7 @@ good first contributions, see [Roadmap](roadmap.md):
 | Hash algorithm or chunking | `crates/avc-core/src/hashing.rs`, `object.rs` |
 | Path safety rules | `crates/avc-core/src/path.rs` |
 | A new remote scheme | `crates/avc-core/src/config.rs` |
-| Command behavior or output | `crates/avc-cli/src/main.rs` |
+| Command behavior | `crates/avc-cli/src/main.rs` |
+| `fetch` or `verify` | `crates/avc-cli/src/ci.rs` **and** `docs/ci-cd.md` |
+| Output formatting or color | `crates/avc-cli/src/ui.rs` |
 | Cache or remote layout | `ObjectId::cache_key()` — one function, both users |

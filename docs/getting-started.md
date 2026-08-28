@@ -63,6 +63,11 @@ This creates `.avc/cache/`, `.avc/state/`, and `.avc/config.toml`, then appends
 
 ```text
 initialized AVC in /path/to/artifacts
+  config     .avc/config.toml
+  cache      .avc/cache
+  ignored    .avc/cache/, .avc/config.local.toml
+
+next: avc remote add origin <url>, then avc add <path>
 ```
 
 ## 3. Track an artifact
@@ -110,7 +115,7 @@ avc add data/
 ```
 
 ```text
-tracked data/ (2 file(s), 13 B, sha256:…)
+tracked      data/ (2 files, 13 B, 0e80f9d32ad0)
 ```
 
 Every file beneath `data/` is hashed and cached; a manifest naming them becomes
@@ -143,13 +148,18 @@ avc status
 ```
 
 ```text
-ok      cached  model.bin
-ok      cached  data/
+STATUS  CACHE   SIZE  ARTIFACT
+ok      cached  13 B  data/
+ok      cached  17 B  model.bin
+
+2 artifacts: 2 ok, 0 modified, 0 missing
 ```
 
-The first column is the working-tree state (`ok`, `modified`, or `missing`); the
-second is cache state (`cached` or `cache-missing`). A directory is `cached`
-only when its manifest and every file it names are in the cache.
+`STATUS` is the working-tree state (`ok`, `modified`, or `missing`); `CACHE` is
+whether the bytes are in `.avc/cache`. A directory is `cached` only when its
+manifest and every file it names are in the cache.
+
+Add `--porcelain` for tab-separated output a script can parse.
 
 ## 6. Commit to Git
 
@@ -189,7 +199,10 @@ avc remote list
 ```
 
 ```text
-* origin File /tmp/avc-remote
+   NAME    PROVIDER  LOCATION
+*  origin  file      /tmp/avc-remote
+
+* marks the remote used when --remote is omitted
 ```
 
 ## 8. Push and pull
@@ -201,9 +214,11 @@ avc list --remote origin
 ```
 
 ```text
-PATH    SIZE    OBJECT  REMOTE
-model.bin       17      sha256:1dfc4d…       missing
-data/   13      sha256:0e80f9…       missing
+ARTIFACT    SIZE  OBJECT        REMOTE
+data/       13 B  0e80f9d32ad0  missing
+model.bin   17 B  1dfc4d103921  missing
+
+2 artifacts, 30 B on file:///tmp/avc-remote: 0 available, 2 missing
 ```
 
 For a directory, `SIZE` is the total bytes of the files it holds, and `REMOTE`
@@ -219,9 +234,9 @@ Now simulate a fresh clone by deleting the artifact and restoring it:
 
 ```bash
 rm -rf model.bin data
-avc status          # missing  cached  model.bin
+avc status          # missing  cached  ...  model.bin
 avc pull            # downloads to cache, then materializes the artifacts
-avc status          # ok       cached  model.bin
+avc status          # ok       cached  ...  model.bin
 find data -type f   # the whole directory is back
 ```
 
@@ -274,6 +289,8 @@ avc doctor
 
 ```text
 doctor: repository, pointers, and available cache objects are valid
+
+re-hashed 4 cache objects named by 2 pointers
 ```
 
 `doctor` re-hashes every cached object and fails if any byte drifted from what
@@ -291,8 +308,24 @@ avc pull
 `.avc/config.toml` is committed, so remotes are usually already configured and
 only credentials are local.
 
+## Using AVC from a build pipeline
+
+A build agent has no reason to clone artifact history or warm a cache it will
+throw away. `avc fetch` downloads straight from the remote to the paths the
+pointers name, with no repository and no cache:
+
+```bash
+avc fetch --remote-url file:///tmp/avc-remote --output .
+avc verify --output .
+```
+
+Both commands work in a directory holding nothing but pointer files. See
+[CI/CD](ci-cd.md) for credentials, caching between jobs, and complete workflows
+for GitHub Actions, GitLab CI, Docker, and Kubernetes.
+
 ## Next steps
 
 - [Concepts](concepts.md) — what pointers, objects, and the cache actually are
 - [CLI Reference](cli.md) — every command and flag
+- [CI/CD](ci-cd.md) — fetching artifacts in a pipeline
 - [Configuration](configuration.md) — remote URLs and credential handling

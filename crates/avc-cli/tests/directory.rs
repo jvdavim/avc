@@ -91,7 +91,7 @@ fn tracks_a_directory_as_one_artifact() {
 
     // The trailing slash a shell completes must name the same artifact.
     let output = run(&worktree, &["add", "data/"]);
-    assert!(output.contains("3 file(s)"), "{output}");
+    assert!(output.contains("3 files"), "{output}");
 
     let pointer = fs::read_to_string(worktree.join("data.avc")).unwrap();
     assert!(pointer.contains("path: data\n"), "{pointer}");
@@ -109,7 +109,10 @@ fn tracks_a_directory_as_one_artifact() {
         .lines()
         .any(|line| line == "data/"));
 
-    assert_eq!(run(&worktree, &["status"]), "ok\tcached\tdata/\n");
+    assert_eq!(
+        run(&worktree, &["status", "--porcelain"]),
+        "ok\tcached\tdata/\n"
+    );
 }
 
 /// A change anywhere beneath the directory changes the directory's identity.
@@ -121,21 +124,21 @@ fn reports_any_change_beneath_the_directory() {
     run(&worktree, &["add", "data"]);
 
     write(&worktree.join("data/nested/b.bin"), "changed\n");
-    assert!(run(&worktree, &["status"]).starts_with("modified"));
+    assert!(run(&worktree, &["status", "--porcelain"]).starts_with("modified"));
 
     run(&worktree, &["commit", "data"]);
-    assert!(run(&worktree, &["status"]).starts_with("ok"));
+    assert!(run(&worktree, &["status", "--porcelain"]).starts_with("ok"));
 
     // A new file is a change too, not just an edited one.
     write(&worktree.join("data/c.bin"), "gamma\n");
-    assert!(run(&worktree, &["status"]).starts_with("modified"));
+    assert!(run(&worktree, &["status", "--porcelain"]).starts_with("modified"));
 
     // So is a removed one.
     fs::remove_file(worktree.join("data/c.bin")).unwrap();
-    assert!(run(&worktree, &["status"]).starts_with("ok"));
+    assert!(run(&worktree, &["status", "--porcelain"]).starts_with("ok"));
 
     fs::remove_dir_all(worktree.join("data")).unwrap();
-    assert!(run(&worktree, &["status"]).starts_with("missing"));
+    assert!(run(&worktree, &["status", "--porcelain"]).starts_with("missing"));
 }
 
 /// The workflow that matters: push, clone, pull, and get the exact tree back.
@@ -150,7 +153,7 @@ fn survives_a_round_trip_through_a_remote() {
     run(&worktree, &["remote", "add", "origin", &file_url(&remote)]);
     run(&worktree, &["push"]);
     // Content-addressed objects are immutable, so a second push moves nothing.
-    assert!(run(&worktree, &["push"]).contains("pushed 0 object(s)"));
+    assert!(run(&worktree, &["push"]).contains("pushed 0 objects"));
 
     // A fresh clone has the pointer and the config, and nothing else.
     let clone = directory.0.join("clone");
@@ -165,7 +168,7 @@ fn survives_a_round_trip_through_a_remote() {
 
     // `list` learns the directory's size and availability from the manifest on
     // the remote, without downloading any artifact bytes.
-    let listed = run(&clone, &["list"]);
+    let listed = run(&clone, &["list", "--porcelain"]);
     assert!(listed.contains("data/\t17\t"), "{listed}");
     assert!(listed.trim_end().ends_with("available"), "{listed}");
 
@@ -177,7 +180,10 @@ fn survives_a_round_trip_through_a_remote() {
     ] {
         assert_eq!(fs::read_to_string(clone.join(path)).unwrap(), contents);
     }
-    assert_eq!(run(&clone, &["status"]), "ok\tcached\tdata/\n");
+    assert_eq!(
+        run(&clone, &["status", "--porcelain"]),
+        "ok\tcached\tdata/\n"
+    );
     run(&clone, &["doctor"]);
 }
 
@@ -219,9 +225,16 @@ fn gc_keeps_objects_a_manifest_still_names() {
     // Only the superseded manifest and the replaced file are unreachable; the
     // two files that survived the edit are still named by the new manifest.
     let planned = run(&worktree, &["gc", "--dry-run"]);
-    assert_eq!(planned.lines().count(), 2, "{planned}");
+    let removable = planned
+        .lines()
+        .filter(|line| line.starts_with("removable"))
+        .count();
+    assert_eq!(removable, 2, "{planned}");
     run(&worktree, &["gc"]);
-    assert_eq!(run(&worktree, &["status"]), "ok\tcached\tdata/\n");
+    assert_eq!(
+        run(&worktree, &["status", "--porcelain"]),
+        "ok\tcached\tdata/\n"
+    );
     run(&worktree, &["doctor"]);
 
     // With the manifest gone, reachability is unknowable and deleting is not

@@ -72,13 +72,13 @@ Tracked `.avc/config.toml` contains provider, bucket/container, prefix, endpoint
 
 ## Object Transport
 
-All remotes are reached through one provider-neutral interface over object keys: `put`, `get`, `exists`, and `list`. Backends receive object identities only and never a repository path. Transfers stream in bounded memory. A download is verified against its pointer's size and digest before it becomes visible in the cache; a mismatch leaves no partial object behind.
+All remotes are reached through one provider-neutral interface over object keys: `put`, `get`, `exists`, and `list`. Reading artifacts requires `get` alone, so a consumer may hold credentials permitting nothing else. Backends receive object identities only and never a repository path. Transfers stream in bounded memory. A download is verified against its pointer's size and digest before it becomes visible in the cache; a mismatch leaves no partial object behind.
 
 S3 requests are signed with AWS Signature Version 4. Because object keys are content-addressed, the `x-amz-content-sha256` of an upload is the object's own digest, so payload bytes are never read twice. Amazon S3 is addressed virtual-hosted-style; a remote with an explicit endpoint is addressed path-style unless overridden.
 
 ## Safety
 
-All cache and worktree writes use temporary files followed by verification and atomic replacement where supported. Dirty user files are never replaced without `--force`, and that check applies per file inside a directory. Cache reads verify both size and SHA-256, including a manifest read before it is parsed. No remote deletion occurs in MVP. Materializing a directory never deletes a file the manifest does not name.
+All cache and worktree writes use temporary files followed by verification and atomic replacement where supported. A download is verified against its pointer before it becomes visible at whatever destination it was written to, cache or worktree alike; the cache is a convenience, not the only path bytes may take. Dirty user files are never replaced without `--force`, and that check applies per file inside a directory. Cache reads verify both size and SHA-256, including a manifest read before it is parsed. No remote deletion occurs in MVP. Materializing a directory never deletes a file the manifest does not name.
 
 ## Exit Codes
 

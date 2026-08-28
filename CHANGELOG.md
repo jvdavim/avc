@@ -13,6 +13,23 @@ include a breaking format change. See
 
 ### Added
 
+- **CI/CD commands.** `avc fetch` downloads artifacts straight from a remote to
+  the paths their pointers name — no Git repository, no `avc init`, no local
+  cache, and `s3:GetObject` as its only S3 permission. `avc verify` re-hashes
+  artifacts on disk against their pointers and exits `1` on any drift, using
+  nothing but the two, so a pipeline can gate on it. Both select artifacts from
+  arguments, a directory scan, or stdin, take their remote from `--remote-url`
+  or `$AVC_REMOTE_URL`, and offer `--porcelain`. `fetch` also has `--cache` for
+  a runner that caches a directory between jobs, `--dry-run`, and `--force`.
+  See the new [CI/CD guide](docs/ci-cd.md).
+- `--porcelain` on `status`, `list`, `fetch`, and `verify`: tab-separated
+  records with no header, summary, or color. This is now the stable interface
+  for scripts; the human-facing output is explicitly not.
+- Terminal-aware color, honoring `--color <auto|always|never>`, `AVC_COLOR`,
+  `NO_COLOR`, `CLICOLOR_FORCE`, and `TERM=dumb`. Color is decoration only:
+  every line reads identically without it.
+- `AVC_REMOTE_URL` and `AVC_CACHE_DIR` environment variables, so a pipeline can
+  configure `avc fetch` once rather than on every command line.
 - **Directory artifacts.** `avc add data/` tracks a whole directory as one
   artifact with one pointer, the way `dvc add data/` does. Every file beneath it
   is hashed and cached, and a manifest naming them is stored as an object of its
@@ -65,6 +82,20 @@ include a breaking format change. See
 
 ### Changed
 
+- **Command output is reformatted.** Aligned ASCII tables for `status`, `list`,
+  `verify`, and `remote list`; a fixed verb column for the per-artifact lines of
+  `add`, `push`, `pull`, `checkout`, `fetch`, `gc`, and `remove`; a summary line
+  counting what happened; human-readable sizes and twelve-character digests.
+  `status` and `list` gained a `SIZE` column, `status` reports a per-state
+  count, and `push`/`pull` name the remote they are talking to. Scripts reading
+  the old tab-separated `status` and `list` output should add `--porcelain`,
+  which prints it unchanged apart from `list` no longer emitting a header.
+- Artifacts are processed in sorted path order everywhere, so repeated runs and
+  runs on different machines produce identical output.
+- `avc status` collects unparseable pointers and reports them after the table
+  instead of interleaving them with valid rows.
+- `avc doctor` reports how many cache objects it re-hashed, and `avc gc` reports
+  how many bytes it reclaimed.
 - `avc gc` now fails instead of collecting when it cannot read a directory's
   manifest, because reachability would otherwise be a guess and the objects it
   deleted might still be needed. It also no longer silently skips pointers it

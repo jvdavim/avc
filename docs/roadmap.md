@@ -36,6 +36,12 @@ release.
 - Remote artifact listing without downloading bytes
 - Automatic `.gitignore` management
 - Directory artifacts — `avc add data/` tracks a whole tree as one artifact
+- CI/CD commands — `avc fetch` downloads artifacts straight from a remote with
+  no repository and no cache, `avc verify` gates a build on artifacts matching
+  their pointers
+- `--porcelain` output for `status`, `list`, `fetch`, and `verify`
+- Aligned ASCII output with terminal-aware color (`--color`, `AVC_COLOR`,
+  `NO_COLOR`, `CLICOLOR_FORCE`)
 
 ### Not implemented
 
@@ -43,7 +49,8 @@ release.
 - IAM instance roles, ECS task roles, SSO, and `assume-role`
 - Git revision selection (`--rev`, checkout of an artifact as of an old commit)
 - Concurrent or resumable transfers (no multipart upload; a push restarts on failure)
-- Machine-readable output
+- JSON output (`--porcelain` covers tab-separated records; there is no
+  `--format json` yet)
 - Remote garbage collection
 
 ## Near term
@@ -71,6 +78,11 @@ IAM instance roles, ECS task roles, and SSO. Each is an HTTP call to a metadata
 endpoint that yields temporary credentials; the `x-amz-security-token` path they
 need is already implemented and tested.
 
+This is the sharpest remaining edge for CI: federated credentials work today
+only because something else — `aws-actions/configure-aws-credentials`, an
+`assume-role` wrapper — exchanges them for environment variables first. See
+[CI/CD](ci-cd.md#credentials).
+
 ## Medium term
 
 ### Integration test suite
@@ -92,19 +104,22 @@ hundreds of gigabytes tracked, that is minutes of I/O. Add an mtime-and-size fas
 path in `.avc/state/` — the directory already exists for exactly this — with a
 `--rehash` escape hatch for when you do not trust it.
 
-### Machine-readable output
+### JSON output
 
-`--format json` for `status`, `list`, and `remote list`, so CI can consume AVC
-without parsing tab-separated text. Would let the human-facing output evolve
-freely.
+`--porcelain` gives `status`, `list`, `fetch`, and `verify` a stable
+tab-separated format, which covers most of what a pipeline needs. `--format
+json` would carry structure the tab format cannot — per-file detail inside a
+directory artifact, and error records alongside successful ones — and would
+extend to `remote list` and `doctor`, which have no porcelain form today.
 
 **Good first issue** for `remote list`.
 
 ### Partial directory materialization
 
 A directory is checked out whole. Fetching or materializing a subset — `avc pull
-data/train` — needs a way to name a path inside a manifest, and a definition of
-what `status` should report for a directory only partly on disk.
+data/train`, or `avc fetch data/train` in a job that needs one shard — needs a
+way to name a path inside a manifest, and a definition of what `status` and
+`verify` should report for a directory only partly on disk.
 
 Related: `checkout` never deletes, so a file the manifest does not name is left
 in place and keeps the directory reading as `modified`. Removing extras needs an

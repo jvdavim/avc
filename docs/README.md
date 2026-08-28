@@ -15,6 +15,7 @@ local content-addressed cache and synchronizes them with an object store.
 | Install AVC and track your first artifact | [Getting Started](getting-started.md) |
 | Understand pointers, objects, and the cache | [Concepts](concepts.md) |
 | Look up a command, flag, or exit code | [CLI Reference](cli.md) |
+| Use AVC in a build pipeline | [CI/CD](ci-cd.md) |
 | Configure remotes and credentials | [Configuration](configuration.md) |
 | Learn how the crates fit together | [Architecture](architecture.md) |
 | Contribute code, docs, or bug reports | [Contributing](contributing.md) |
@@ -39,6 +40,10 @@ AVC keeps those bytes out of Git. Running `avc add model.bin`:
 hashed and cached, and a manifest naming them becomes one more object, so the
 directory is a single artifact behind a single `data.avc` pointer — see
 [Concepts](concepts.md#directories).
+
+In a pipeline, `avc fetch` skips all of that: it downloads artifacts straight
+from the remote to the paths their pointers name, with no clone, no `avc init`,
+and no cache — see [CI/CD](ci-cd.md).
 
 `avc push` uploads the cached bytes to a remote — a local directory, Amazon S3,
 or any S3-compatible service such as MinIO, Cloudflare R2, Ceph, or Backblaze B2.
@@ -88,6 +93,8 @@ avc/
     ├── avc-core/           # domain types: pointers, hashing, paths, remotes
     │                       #   remote/: file and S3 transport, SigV4 signing
     └── avc-cli/            # the `avc` binary and MVP workflows
+                            #   ci.rs: fetch and verify, built for pipelines
+                            #   ui.rs: ASCII tables and color detection
 ```
 
 ## License
