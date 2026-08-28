@@ -29,6 +29,8 @@ avc/
     └── avc-cli/                # binary: the `avc` command
         ├── src/main.rs         # clap definitions and the repository workflows
         ├── src/ci.rs           # fetch and verify: the CI/CD commands
+        ├── src/registry.rs     # pointers and config, from Git or from disk
+        ├── src/git.rs          # shallow reads of a repository reference
         └── src/ui.rs           # ASCII tables, color detection, message vocabulary
 ```
 
@@ -148,8 +150,9 @@ included.
 
 ## `avc-cli`
 
-Three modules: `main.rs` for the repository workflows, `ci.rs` for the two
-commands that run without a repository, and `ui.rs` for presentation.
+Five modules: `main.rs` for the repository workflows, `registry.rs` and `git.rs`
+for reading a repository however it is addressed, `ci.rs` for the commands built
+for a pipeline, and `ui.rs` for presentation.
 
 ### 1. Clap definitions
 
@@ -168,12 +171,31 @@ produce; `main` prints `avc: {error}` to stderr and exits with it.
 `require_pointer` flag. `pull` ends by calling `checkout_selected(paths, false)`,
 which is why a `pull` will not clobber a locally modified file.
 
-### 2a. `ci.rs` — commands without a repository
+### 2a. `registry.rs` and `git.rs` — where pointers come from
+
+`Registry` is the answer to "which repository, and how do I read it". It wraps a
+`Repo` — a root directory plus its `.avc/config.toml` — and hides whether that
+root is the user's worktree or a temporary checkout that `git.rs` produced from
+a URL. Everything downstream sees one type, so `fetch`, `verify`, and `list` are
+written once rather than twice.
+
+`git::Checkout` does a `git init` / `fetch --depth 1` / `checkout` into a
+temporary directory and deletes it on `Drop`. Artifacts are gitignored, so what
+lands there is pointer files and configuration: text. That is the whole reason a
+consumer can name a Git URL instead of a bucket — the two halves of a repository
+travel in the same commit, and reading one is cheap.
+
+`registry::select` resolves path selectors against a set of pointers, matching a
+path exactly or as a directory prefix. It is shared with `main.rs`, so
+`avc push models/bert` and `avc fetch models/bert` mean the same thing, and there
+is one place where "an exact match beats a prefix" is decided.
+
+### 2b. `ci.rs` — commands built for a pipeline
 
 `fetch` and `verify` live apart because they invert the module's central
-assumption: there is no `Repo`, no `.avc/config.toml`, and no cache. They take a
-remote from a URL, discover pointers by scanning or from stdin, and resolve
-artifact paths against an `--output` root rather than a repository root.
+assumption: there may be no worktree, no cache, and no local configuration. They
+take a `Registry`, resolve artifact paths against an `--output` root rather than
+a repository root, and write nothing but artifacts.
 
 `Fetcher` holds the store, the arguments, and a map of which objects have
 already been written this run. `Fetcher::locate` decides where an object's bytes
@@ -184,7 +206,7 @@ what lets `--dry-run` report exactly the numbers a real run produces.
 `verify` shares `artifact_state` with `status`; the function takes the root as a
 parameter precisely so both can use it.
 
-### 2b. `ui.rs` — presentation
+### 2c. `ui.rs` — presentation
 
 Nothing in `ui.rs` knows what an artifact is. It offers a `Table` that computes
 column widths in characters, `action` for a per-artifact line with a fixed verb
@@ -313,6 +335,10 @@ good first contributions, see [Roadmap](roadmap.md):
   equivalent.
 - **`gc` reachability ignores Git history**, considering only worktree pointers.
 - **Retries and timeouts are absent** in the S3 transport: one attempt, no deadline.
+- **`--repo` shells out to `git`** and checks out a whole shallow commit to read
+  pointer files. A sparse checkout, or reading blobs with `cat-file --batch`,
+  would avoid writing the repository's non-pointer files to a temporary
+  directory. Correct today, wasteful on a registry that also carries code.
 
 ## Where to make a change
 
@@ -325,5 +351,7 @@ good first contributions, see [Roadmap](roadmap.md):
 | A new remote scheme | `crates/avc-core/src/config.rs` |
 | Command behavior | `crates/avc-cli/src/main.rs` |
 | `fetch` or `verify` | `crates/avc-cli/src/ci.rs` **and** `docs/ci-cd.md` |
+| How a repository is located or read | `crates/avc-cli/src/registry.rs`, `git.rs` |
+| Path selection rules | `registry::select` — one function, every command |
 | Output formatting or color | `crates/avc-cli/src/ui.rs` |
 | Cache or remote layout | `ObjectId::cache_key()` — one function, both users |

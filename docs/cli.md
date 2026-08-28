@@ -9,7 +9,7 @@ avc init
 avc remote add <name> <provider-url>
 avc remote list
 avc add <path> [<path>...]
-avc list [--remote <name>] [--porcelain]
+avc list [<path>...] [--repo <git-url>] [--ref <ref>] [--remote <name>] [--porcelain]
 avc status [--porcelain]
 avc commit <path> [<path>...] [--force]
 avc push [<path>...] [--remote <name>]
@@ -20,9 +20,11 @@ avc gc [--remote <name>] [--dry-run]
 avc doctor
 
 # built for CI/CD -- see docs/ci-cd.md
-avc fetch [<pointer>...] [--remote-url <url> | --remote <name>]
+avc fetch [<path>...] [--repo <git-url>] [--ref <ref>]
+          [--remote <name>] [--remote-url <url>]
           [--output <dir>] [--cache <dir>] [--force] [--dry-run] [--porcelain]
-avc verify [<pointer>...] [--output <dir>] [--porcelain]
+avc verify [<path>...] [--repo <git-url>] [--ref <ref>]
+           [--output <dir>] [--porcelain]
 ```
 
 Every command also accepts `--color <auto|always|never>`.
@@ -38,9 +40,11 @@ found, the command fails with `not inside a Git worktree`.
 requires `.avc/config.toml` to exist, otherwise:
 `AVC is not initialized; run 'avc init'`.
 
-**Repository-free commands.** `avc fetch` and `avc verify` need neither, because
-they are meant for a build agent that has pointer files and nothing else. See
-[CI/CD](ci-cd.md).
+**Repository-free commands.** `avc fetch`, `avc verify`, and `avc list` need
+neither when given `--repo <git-url>`: they read the pointers, and the object
+store the pointers belong to, out of a shallow read of that Git reference. That
+is what lets a build agent name a repository and a path inside it without
+cloning anything. See [CI/CD](ci-cd.md).
 
 **Pointer discovery.** Commands that operate on "all artifacts" find them by
 recursively scanning the worktree for files ending in `.avc`, skipping the `.git`
@@ -49,6 +53,14 @@ index, so a pointer you have not committed still counts.
 
 **Path validation.** Every path is normalized and validated: it must be
 repository-relative, with no `..`, no `.`, no absolute prefix, and no backslash.
+
+**Path selection.** Every command that takes artifact paths — `commit`, `push`,
+`pull`, `checkout`, `remove`, `fetch`, `verify`, `list` — uses one rule. A path
+matches an artifact exactly, or acts as a directory prefix naming every artifact
+beneath it; naming nothing selects everything. An exact match always wins over a
+prefix, a trailing `/` is optional, and a trailing `.avc` is stripped, so a
+pointer path from `git diff --name-only` names its artifact unchanged. A path
+that matches nothing is an error rather than an empty selection.
 
 **Ordering.** Commands that operate on all artifacts process them in sorted path
 order, so repeated runs — and runs on different machines — print the same
@@ -274,37 +286,72 @@ mtime/size fast path yet — see [Roadmap](roadmap.md).
 
 ## `avc list`
 
-Show tracked artifacts and their availability on a remote, **without downloading
-bytes**.
+Browse what a repository stores, **without downloading artifact bytes**.
 
 ```bash
-avc list [--remote <name>] [--porcelain]
+avc list [<path>...] [--repo <git-url>] [--ref <ref>]
+         [--remote <name>] [--remote-url <url>] [--porcelain]
 ```
 
 ```text
-ARTIFACT                 SIZE  OBJECT        REMOTE
-data/train.parquet    4.0 MiB  9a3b1c77e004  missing
+everything in /home/me/artifacts
+  objects    https://s3.eu-west-1.amazonaws.com/my-bucket
+
+PATH                     SIZE  OBJECT        REMOTE
+data/                 4.0 MiB  9a3b1c77e004  missing
 model.bin                17 B  1dfc4d103921  available
 
-2 artifacts, 4.0 MiB on https://s3.eu-west-1.amazonaws.com/my-bucket: 1 available, 1 missing
+2 artifacts, 4.0 MiB: 1 available, 1 missing
 ```
 
-Uses the default remote when `--remote` is omitted.
+Uses the repository on disk unless `--repo <git-url>` names one, and the object
+store the repository configures unless `--remote-url` overrides it.
 
-`--porcelain` prints `<path>\t<bytes>\t<algorithm:full-hash>\t<remote-state>`
-with no header, which is the format earlier versions printed by default.
+### Listing a path
+
+A path argument scopes the listing, which is what makes a repository holding a
+hundred artifacts browsable rather than a wall of rows.
+
+| Argument | Lists |
+| --- | --- |
+| *(none)* | every artifact in the repository |
+| `models/bert` | the artifacts beneath that prefix |
+| `models/bert/weights.bin` | that one artifact |
+| `data` — a **tracked directory** | the files stored inside it |
+
+The last case is the interesting one. A directory artifact is one row in the
+full listing, because it is one artifact; naming it exactly asks to look inside:
+
+```bash
+avc list data
+```
+
+```text
+PATH                      SIZE  OBJECT        REMOTE
+data/raw/2024-01.csv   1.1 GiB  87428fc52280  available
+data/raw/2024-02.csv   1.2 GiB  0263829989b6  available
+
+2 files, 2.3 GiB: 2 available, 0 missing
+```
+
+Those rows come from the directory's manifest, which `list` fetches from the
+remote when it is not already cached. A manifest is metadata of a few bytes per
+file; artifact bytes are still never downloaded. If the manifest is on neither
+side, the contents are unknowable and the command says so rather than guessing.
+
+### Availability
 
 Availability is resolved with a single prefixed listing of the remote, not one
 request per artifact, so a repository with a thousand pointers costs one round
 trip. Objects in the bucket that AVC did not write are ignored.
 
-For a directory, `SIZE` is the total bytes of the files it contains, not the size
-of its manifest, and `REMOTE` reads `available` only when the manifest *and*
+For a directory row, `SIZE` is the total bytes of the files it contains, not the
+size of its manifest, and `REMOTE` reads `available` only when the manifest *and*
 every file it names are on the remote — a half-uploaded directory cannot be
-restored. Reading those numbers needs the manifest, so `list` fetches it from
-the remote when it is not cached. A manifest is metadata of a few bytes per
-file; artifact bytes are still never downloaded. When the manifest is on neither
-side, the file list is unknowable and the row reads `-` and `missing`.
+restored. When the manifest is on neither side, the row reads `-` and `missing`.
+
+`--porcelain` prints `<path>\t<bytes>\t<algorithm:full-hash>\t<remote-state>`
+with no heading, table, or summary.
 
 > **Limitation:** `gs://` and `az://` remotes fail with
 > `provider adapter not implemented`.
@@ -319,9 +366,10 @@ Upload cached objects to a remote.
 avc push [<path>...] [--remote <name>]
 ```
 
-With no paths, pushes every tracked artifact; otherwise only the paths given
-(matched against the `path` field inside each pointer, so pass repository-relative
-paths exactly as they appear in `avc status`).
+With no paths, pushes every tracked artifact; otherwise the paths given, using
+the shared [path selection](#global-behavior) rule — so `avc push models/bert`
+pushes everything beneath that prefix, and `avc push data` pushes the one
+directory artifact named `data`.
 
 Fails with `cache object missing for <path>` if the object is not in the local
 cache — run `add`/`commit` or `pull` first. Naming a path that has no pointer is
@@ -518,111 +566,134 @@ Fails on the first corrupt object with `corrupt cache object for <path>`.
 ## CI/CD commands
 
 `avc fetch` and `avc verify` are built for a build agent rather than a
-workstation: neither needs a Git worktree, an `avc init`, or a local cache. The
-[CI/CD guide](ci-cd.md) covers credentials, caching between jobs, least-privilege
-policies, and worked pipelines; this section is the flag reference.
+workstation. Given `--repo <git-url>`, they read the pointers — and the object
+store those pointers belong to — out of a shallow read of one Git reference, so a
+job names a repository and a path inside it and never a bucket. `avc list`,
+documented [above](#avc-list), takes the same two arguments.
+
+The [CI/CD guide](ci-cd.md) covers credentials, caching between jobs,
+least-privilege policies, and worked pipelines; this section is the flag
+reference.
 
 ### `avc fetch`
 
-Download artifacts straight from a remote to the paths their pointers name.
+Download the artifacts at a path in a repository, straight to where they belong.
 
 ```bash
-avc fetch [<pointer>...] [--remote-url <url> | --remote <name>]
+avc fetch [<path>...] [--repo <git-url>] [--ref <ref>]
+          [--remote <name>] [--remote-url <url>]
           [--output <dir>] [--cache <dir>]
           [--force] [--dry-run] [--porcelain]
 ```
 
 ```text
-fetching 2 artifacts from https://s3.eu-west-1.amazonaws.com/my-bucket
+fetching 2 artifacts from https://github.com/acme/artifacts@a4f21c0be931 (HEAD)
+  objects    https://s3.eu-west-1.amazonaws.com/acme-artifacts
   into       .
 
-downloaded   models/final.safetensors (4.0 GiB)
-up-to-date   config.bin (2.1 KiB)
+downloaded   models/bert/tokenizer.json (3 B)
+downloaded   models/bert/weights.bin (878.9 MiB)
 
-fetched 1 object (4.0 GiB) for 2 artifacts from https://s3.eu-west-1.amazonaws.com/my-bucket
+fetched 2 objects (878.9 MiB) for 2 artifacts
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `<pointer>...` | scan the current directory | Pointer files, directories to scan, or `-` for newline-separated paths on stdin |
-| `--remote-url <url>` | `$AVC_REMOTE_URL` | Remote as a URL; needs no repository |
-| `--remote <name>` | the default remote | Named remote from `.avc/config.toml`; needs a repository |
-| `-o`, `--output <dir>` | `.` | Root the pointers' paths are resolved against |
+| `<path>...` | every artifact | Paths inside the repository — an artifact, a prefix, or `-` for stdin |
+| `--repo <url>` | `$AVC_REPO`, else the checkout on disk | Git URL to read pointers from |
+| `--ref <ref>` | `$AVC_REF`, else `HEAD` | Branch, tag, or commit |
+| `--remote <name>` | the repository's default | Named object store, when it configures several |
+| `--remote-url <url>` | the repository's own | Object store URL, overriding what the repository says |
+| `-o`, `--output <dir>` | repository root, or `.` with `--repo` | Root the pointers' paths are resolved against |
 | `--cache <dir>` | `$AVC_CACHE_DIR`, else none | Read from and populate a cache directory |
 | `--force` | off | Overwrite files whose contents differ from their pointer |
 | `--dry-run` | off | Report the transfer without making it |
-| `--porcelain` | off | `<state>\t<objects>\t<bytes>\t<path>`, no header or summary |
+| `--porcelain` | off | `<state>\t<objects>\t<bytes>\t<path>`, no heading or summary |
 
-`--remote-url` and `--remote` are mutually exclusive.
+**Where the object store comes from.** The repository's tracked
+`.avc/config.toml`, read at the same reference as the pointers. A consumer does
+not name a bucket, a prefix, or an endpoint, and a repository that moves its
+storage does not break them. `--remote-url` overrides it for one run — a mirror,
+or an air-gapped copy — and `--remote` picks between several the repository
+already configures.
 
-**What it writes.** Only artifacts. No cache unless `--cache` is given, no
-`.avc/` directory, no `.gitignore` edits, and a directory artifact's manifest is
-never written into the output tree.
+**Reading from a Git URL** shells out to `git`, which must be on `PATH`. The
+checkout is one commit deep, holds only text — artifacts are gitignored — and
+lives in a temporary directory deleted when the command ends. The commit a
+reference resolved to is printed, so a log records what a moving branch was.
+
+**What it writes.** Only artifacts. No clone in your workspace, no cache unless
+`--cache` is given, no `.avc/` directory, no `.gitignore` edits, and a directory
+artifact's manifest is never written into the output tree.
 
 **Object states.** `downloaded` (bytes came over the network), `from-cache`
 (served from `--cache`, or from an identical object already fetched this run),
 `up-to-date` (already on disk and already correct), `would-fetch` (a dry run).
 
 **Verification.** Each object is hashed as it is written and checked against its
-pointer's size and digest before it becomes visible; a mismatch leaves no
-partial file behind. A directory's manifest is verified before it is parsed,
-because it decides where `fetch` writes.
+pointer's size and digest before it becomes visible; a mismatch leaves no partial
+file behind. A directory's manifest is verified before it is parsed, because it
+decides where `fetch` writes.
 
-**Idempotence.** A file already hashing to what its pointer claims is left
-alone. A file that differs is a refusal — `refusing to replace <path>: it
-differs from its pointer; use --force` — not an overwrite.
+**Idempotence.** A file already hashing to what its pointer claims is left alone.
+A file that differs is a refusal — `refusing to replace <path>: it differs from
+its pointer; use --force` — not an overwrite.
 
 **Deduplication.** Identical objects transfer once per run even with no cache:
-the second one is copied from wherever the first landed. The reported object and
-byte counts are artifact content only; reading a directory's manifest is
-metadata and is not counted.
+the second is copied from wherever the first landed. The reported object and byte
+counts are artifact content only; reading a directory's manifest is metadata and
+is not counted.
 
-**Selection errors.** Naming a pointer that does not exist fails rather than
-selecting nothing, and two pointer files claiming the same artifact path is an
-error rather than a race.
-
-> **Limitation:** no resumable download. A dropped connection restarts that
-> object, though objects already written are not re-fetched, so re-running
-> resumes at object granularity. `gs://` and `az://` fail with
-> `provider adapter not implemented`.
+> **Limitations:** a path *inside* a tracked directory cannot be named — a
+> directory artifact is fetched whole. No resumable download: a dropped
+> connection restarts that object, though objects already written are not
+> re-fetched, so re-running resumes at object granularity. `gs://` and `az://`
+> fail with `provider adapter not implemented`.
 
 ### `avc verify`
 
 Check artifacts on disk against their pointers, using nothing but the two.
 
 ```bash
-avc verify [<pointer>...] [--output <dir>] [--porcelain]
+avc verify [<path>...] [--repo <git-url>] [--ref <ref>]
+           [--output <dir>] [--porcelain]
 ```
 
 ```text
-STATUS         SIZE  ARTIFACT
-ok        195.3 KiB  models/final.safetensors
-modified       20 B  data/
-missing           -  config.bin
+verifying 3 artifacts against https://github.com/acme/artifacts@a4f21c0be931 (HEAD)
+  in         .
 
-3 artifacts checked: 1 ok, 2 not matching
+STATUS        SIZE  ARTIFACT
+ok             3 B  models/bert/tokenizer.json
+ok       878.9 MiB  models/bert/weights.bin
+missing          -  models/gpt/weights.bin
+
+3 artifacts checked: 2 ok, 1 not matching
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `<pointer>...` | scan the current directory | Same selection as `avc fetch` |
-| `-o`, `--output <dir>` | `.` | Root the artifacts were written into |
-| `--porcelain` | off | `<status>\t<bytes on disk>\t<path>`, no header or summary |
+| `<path>...` | every artifact | Same path selection as `avc fetch` |
+| `--repo <url>` | `$AVC_REPO`, else the checkout on disk | Git URL to read pointers from |
+| `--ref <ref>` | `$AVC_REF`, else `HEAD` | Branch, tag, or commit |
+| `-o`, `--output <dir>` | repository root, or `.` with `--repo` | Root the artifacts were written into |
+| `--porcelain` | off | `<status>\t<bytes on disk>\t<path>`, no heading or summary |
 
-No remote is contacted and no credentials are read. Exits `1` if any artifact is
-`modified` or `missing`, which is what makes it usable as a pipeline gate.
+No object store is contacted and no credentials are read. Exits `1` if any
+artifact is `modified` or `missing`, which is what makes it usable as a pipeline
+gate — including against a released tag, which answers whether a deployed
+directory still matches a particular commit.
 
-Finding no pointers at all is **not** a failure — it prints `no AVC pointers
-found` and exits `0`, matching `avc status`. A gate that must not pass on an
-empty selection should name the pointers explicitly rather than relying on the
-directory scan.
+Finding no artifacts is **not** a failure: it prints `no AVC pointers found` and
+exits `0`, matching `avc status`. A gate that must not pass on an empty selection
+should name its paths explicitly.
 
 For a directory, `modified` covers a file edited, added, removed, or renamed
-anywhere beneath it, because the directory's identity is the hash of the
-manifest of its contents.
+anywhere beneath it, because the directory's identity is the hash of the manifest
+of its contents.
 
 This is `avc status` minus the repository and minus the cache column. Use
-`status` in a checkout; use `verify` in a job that has only pointers and bytes.
+`status` in a checkout; use `verify` in a job, or against a Git reference.
 
 ---
 
@@ -639,9 +710,11 @@ This is `avc status` minus the repository and minus the cache column. Use
 
 **Current implementation:** all four are emitted. `2` comes from argument
 parsing. `3` covers provider and operational failures — an unreachable endpoint,
-a rejected signature, missing credentials, or a provider with no adapter. `1`
-covers everything else, including a remote object that fails to match its
-pointer, which is a data error rather than an infrastructure one.
+a rejected signature, missing credentials, a provider with no adapter, and (for
+`--repo`) a Git reference that does not exist or a missing `git` command. `1`
+covers everything else, including a path that names no artifact and a remote
+object that fails to match its pointer, which are data errors rather than
+infrastructure ones.
 
 ```bash
 avc push; case $? in

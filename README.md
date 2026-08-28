@@ -21,10 +21,10 @@ git add model.bin.avc  # commit the pointer, not the 4 GB
 avc push               # send the bytes to your object store
 ```
 
-In CI, skip the repository entirely:
+In CI, name the repository and the path you need — never a bucket:
 
 ```bash
-avc fetch --remote-url s3://my-bucket/artifacts --output .
+avc fetch --repo https://github.com/acme/artifacts models/bert -o .
 ```
 
 ## Highlights
@@ -48,9 +48,10 @@ avc fetch --remote-url s3://my-bucket/artifacts --output .
 - 📁 **Directories are one artifact.** `avc add data/` tracks a whole tree behind
   a single pointer; editing one file in a thousand re-versions the directory
   without re-storing the other 999.
-- 🏗️ **Built for pipelines too.** `avc fetch` pulls artifacts straight from the
-  remote — no clone, no `avc init`, no cache, `GetObject` and nothing else — and
-  `avc verify` fails a build whose artifacts drifted from their pointers.
+- 🏗️ **An artifact registry, not just a repository.** One repository holds many
+  projects' artifacts; `avc fetch --repo <git-url> models/bert` takes just that
+  path, with no clone, no `avc init`, and no cache. The object store is read
+  from the repository's own config, so consumers never name a bucket.
 - 🦀 **Small dependency tree.** Nine direct dependencies, no async runtime. S3
   is spoken over plain HTTP with a hand-written SigV4 signer rather than a
   cloud SDK. A tool guarding your artifacts should not be a supply-chain
@@ -203,8 +204,9 @@ untrusted input.
 
 `avc status` reports working-tree state (`ok`, `modified`, `missing`) and cache
 state (`cached`, `cache-missing`) per artifact — a directory is re-scanned into
-a manifest and reported the same way. `avc list --remote origin` shows
-what a remote holds **without downloading bytes**. `avc doctor` re-hashes cached
+a manifest and reported the same way. `avc list` shows what a repository holds
+and whether the remote can supply it, **without downloading bytes**; give it a
+path to scope the listing, or a tracked directory to see the files inside it. `avc doctor` re-hashes cached
 objects and fails on any drift.
 
 Output is aligned ASCII, colored when the terminal wants it and plain when it
@@ -226,21 +228,27 @@ rather than a re-upload.
 
 ### CI/CD
 
-A build agent has no clone of the artifact history and no cache worth warming.
-`avc fetch` is built for that: it reads pointer files, downloads exactly the
-objects they name, verifies each one as it streams, and writes it where the
-pointer says — with no Git repository, no `avc init`, and no local cache.
+An AVC repository is an artifact registry: one Git repository can hold the
+models, datasets, and archives of a dozen projects. A build that needs one of
+them names the repository and the path, and gets only that:
 
 ```bash
-avc fetch --remote-url s3://my-bucket/artifacts --output .
-avc verify --output .        # exits 1 if anything drifted; a gate for a build
+avc fetch  --repo https://github.com/acme/artifacts models/bert -o .
+avc verify --repo https://github.com/acme/artifacts models/bert -o .
+avc list   --repo https://github.com/acme/artifacts models/       # just look
 ```
 
-Both run in a directory holding nothing but `.avc` pointer files, take
-credentials from the environment, and select artifacts from arguments, a
-directory scan, or stdin. Because `fetch` only ever issues `GetObject`, a
-consuming job can be given a read-only policy. Re-running one is cheap: a file
-already hashing to what its pointer claims is left alone.
+There is no bucket in those commands. AVC reads the pointers at that Git
+reference — a shallow, text-only read; artifacts are gitignored — and learns the
+object store from the repository's own `.avc/config.toml`. Move the bucket and
+consumers do not change, because they never named it.
+
+Nothing is written but the artifacts: no clone in the workspace, no `.avc/`
+directory, no cache. Objects are streamed and verified straight to the paths
+their pointers name, `fetch` only ever issues `GetObject` so a consuming job can
+hold a read-only policy, and a re-run is cheap because a file already hashing to
+what its pointer claims is left alone. `avc verify` re-checks a directory
+against a tag without contacting the store at all, which makes it a gate.
 
 See [CI/CD](docs/ci-cd.md) for GitHub Actions, GitLab CI, Docker, and Kubernetes
 workflows, caching between jobs, and least-privilege policies.

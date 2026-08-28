@@ -36,9 +36,13 @@ release.
 - Remote artifact listing without downloading bytes
 - Automatic `.gitignore` management
 - Directory artifacts — `avc add data/` tracks a whole tree as one artifact
-- CI/CD commands — `avc fetch` downloads artifacts straight from a remote with
-  no repository and no cache, `avc verify` gates a build on artifacts matching
-  their pointers
+- CI/CD commands — `avc fetch` downloads the artifacts at a path in a
+  repository, reading pointers from a Git reference and the object store from
+  the repository's own configuration, with no clone and no cache; `avc verify`
+  gates a build on artifacts matching their pointers
+- Path selection shared by every command: an exact artifact path, or a prefix
+  naming everything beneath it. `avc list <path>` scopes a listing, and naming a
+  tracked directory lists the files inside it
 - `--porcelain` output for `status`, `list`, `fetch`, and `verify`
 - Aligned ASCII output with terminal-aware color (`--color`, `AVC_COLOR`,
   `NO_COLOR`, `CLICOLOR_FORCE`)
@@ -116,10 +120,14 @@ extend to `remote list` and `doctor`, which have no porcelain form today.
 
 ### Partial directory materialization
 
-A directory is checked out whole. Fetching or materializing a subset — `avc pull
-data/train`, or `avc fetch data/train` in a job that needs one shard — needs a
-way to name a path inside a manifest, and a definition of what `status` and
-`verify` should report for a directory only partly on disk.
+Prefix selection reaches artifacts, not inside them: `avc fetch models/bert`
+takes every artifact beneath that prefix, but `avc fetch data/raw` works only if
+`data/raw` is itself tracked. A directory artifact is still fetched whole.
+
+Fetching a subset — one shard of a dataset — needs a way to name a path inside a
+manifest, and a definition of what `status` and `verify` should report for a
+directory only partly on disk. This is the most-requested shape for a large
+shared registry.
 
 Related: `checkout` never deletes, so a file the manifest does not name is left
 in place and keeps the directory reading as `modified`. Removing extras needs an
@@ -146,7 +154,11 @@ This is the sharpest edge in `0.1.0` and worth fixing early.
   connection does not restart a 40 GB push.
 - **Remote `gc`**, gated behind explicit confirmation. `SPEC.md` currently
   forbids remote deletion entirely; lifting that needs care.
-- **Shallow and partial fetch** — pull only artifacts matching a path pattern.
+- **Glob selection** — `avc fetch 'models/*/weights.bin'`, on top of the exact
+  and prefix matching that exists now.
+- **Cheaper pointer reads.** `--repo` checks out a whole shallow commit to read
+  text files. Sparse checkout, or `git cat-file --batch` against a bare fetch,
+  would avoid materializing a registry's non-pointer files at all.
 - **A stable `avc-core` library API**, so other tools can read and write pointers
   without shelling out.
 - **Shell completions** for bash, zsh, and fish. `clap` generates them; the work

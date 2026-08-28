@@ -1,21 +1,21 @@
 //! Commands built for a pipeline rather than a workstation.
 //!
 //! A build agent is not a developer's machine. It has no clone of the artifact
-//! history, no `.avc/cache` to warm, often no Git repository at all — a deploy
-//! job may hold nothing but a pointer file and a set of credentials — and it is
-//! thrown away when the job ends. `avc pull` is the wrong shape for that: it
-//! assumes a repository, populates a cache the runner will delete, and writes
-//! every artifact twice.
+//! history, no `.avc/cache` to warm, and it is thrown away when the job ends.
+//! It also rarely wants everything: an AVC repository is an artifact registry,
+//! and a job that needs one model out of a hundred should pay for one model.
 //!
-//! [`fetch`] downloads straight from the remote to the path the pointer names,
-//! streaming and verifying as it goes, with no repository and no cache in the
-//! middle. [`verify`] re-checks a directory against its pointers using nothing
-//! but what is already on disk, so a job can assert it built against the exact
-//! bytes the commit claims.
+//! [`fetch`] is built around that. It is given a *repository* and a *path
+//! inside it* — never a bucket. The pointers come from Git, shallow and
+//! text-only; the object store comes from the `.avc/config.toml` that came with
+//! them, so a consumer never has to know or repeat where the bytes live; and
+//! only the objects the selected paths name are downloaded, streamed and
+//! verified straight to their destination with no repository and no cache in
+//! the middle.
 //!
-//! Both take their remote from a URL or an environment variable, both accept
-//! pointer files on the command line or on stdin, and both offer `--porcelain`
-//! for a script that has to read the result rather than a human.
+//! [`verify`] re-checks artifacts against their pointers using nothing but what
+//! is on disk, so a job can assert it built against the exact bytes a commit
+//! named.
 
 use std::fs;
 use std::io::BufRead;
@@ -23,27 +23,43 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use crate::registry::Registry;
 use crate::ui::{self, Cell, Column, Style, Table};
 use crate::{Failure, State};
 
 #[derive(Debug, Args)]
 pub struct FetchArgs {
-    /// Pointer files, or directories to scan for them. Defaults to the current
-    /// directory; `-` reads newline-separated paths from stdin.
-    #[arg(value_name = "POINTER")]
+    /// Paths inside the repository to fetch: one artifact, or a prefix naming
+    /// every artifact beneath it. Defaults to all of them; `-` reads
+    /// newline-separated paths from stdin.
+    #[arg(value_name = "PATH")]
     pub paths: Vec<String>,
 
-    /// Remote to download from, as a URL. Needs no repository and no `avc init`.
-    #[arg(long, value_name = "URL", env = "AVC_REMOTE_URL")]
-    pub remote_url: Option<String>,
+    /// Git URL of the repository to fetch from. Needs no clone and no checkout.
+    #[arg(long, value_name = "URL", env = "AVC_REPO")]
+    pub repo: Option<String>,
 
-    /// Named remote from `.avc/config.toml`, for a job that did clone the repository.
-    #[arg(long, value_name = "NAME", conflicts_with = "remote_url")]
+    /// Branch, tag, or commit to read pointers at.
+    #[arg(
+        long = "ref",
+        value_name = "REF",
+        env = "AVC_REF",
+        default_value = "HEAD"
+    )]
+    pub reference: String,
+
+    /// Named object store, when the repository configures more than one.
+    #[arg(long, value_name = "NAME")]
     pub remote: Option<String>,
 
+    /// Object store URL, overriding the one the repository configures. Rarely
+    /// needed: the repository already knows where its bytes are.
+    #[arg(long, value_name = "URL")]
+    pub remote_url: Option<String>,
+
     /// Directory to write artifacts into, at the paths their pointers name.
-    #[arg(long, short, value_name = "DIR", default_value = ".")]
-    pub output: PathBuf,
+    #[arg(long, short, value_name = "DIR")]
+    pub output: Option<PathBuf>,
 
     /// Reuse and populate a cache directory, for a runner that caches it between jobs.
     #[arg(long, value_name = "DIR", env = "AVC_CACHE_DIR")]
@@ -64,25 +80,31 @@ pub struct FetchArgs {
 
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
-    /// Pointer files, or directories to scan for them. Defaults to the current
-    /// directory; `-` reads newline-separated paths from stdin.
-    #[arg(value_name = "POINTER")]
+    /// Paths inside the repository to check. Defaults to all of them; `-` reads
+    /// newline-separated paths from stdin.
+    #[arg(value_name = "PATH")]
     pub paths: Vec<String>,
 
+    /// Git URL of the repository whose pointers to check against.
+    #[arg(long, value_name = "URL", env = "AVC_REPO")]
+    pub repo: Option<String>,
+
+    /// Branch, tag, or commit to read pointers at.
+    #[arg(
+        long = "ref",
+        value_name = "REF",
+        env = "AVC_REF",
+        default_value = "HEAD"
+    )]
+    pub reference: String,
+
     /// Directory the artifacts were written into.
-    #[arg(long, short, value_name = "DIR", default_value = ".")]
-    pub output: PathBuf,
+    #[arg(long, short, value_name = "DIR")]
+    pub output: Option<PathBuf>,
 
     /// Stable tab-separated output for scripts: STATE, BYTES, PATH.
     #[arg(long)]
     pub porcelain: bool,
-}
-
-/// A pointer and the file it was read from, so an error can name the file a
-/// pipeline actually has on disk.
-struct Located {
-    source: PathBuf,
-    pointer: avc_core::Pointer,
 }
 
 /// What happened to one artifact.
@@ -133,6 +155,8 @@ impl Transfer {
 struct Fetcher<'a> {
     store: Box<dyn avc_core::ObjectStore>,
     args: &'a FetchArgs,
+    /// Root the pointers' paths are resolved against.
+    output: PathBuf,
     /// Where each object has already landed during this run.
     ///
     /// A directory holding the same bytes at two paths names one object twice,
@@ -143,25 +167,32 @@ struct Fetcher<'a> {
     placed: std::collections::HashMap<String, PathBuf>,
 }
 
-/// Download artifacts straight from a remote into `--output`.
+/// Fetch the artifacts a repository path names, straight to where they belong.
 pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
-    let mut fetcher = Fetcher {
-        store: open_remote(args.remote_url.as_deref(), args.remote.as_deref())?,
-        args,
-        placed: std::collections::HashMap::new(),
-    };
-    let located = collect_pointers(&args.paths)?;
-    if located.is_empty() {
+    let registry = Registry::open(args.repo.as_deref(), &args.reference)?;
+    let selected = select(&registry, &args.paths)?;
+    if selected.is_empty() {
         return report_nothing_found(args.porcelain);
     }
+    // The object store is the repository's own, read from the configuration
+    // that arrived with the pointers. A consumer names the repository and the
+    // path; where the bytes live was decided once, by whoever set it up.
+    let store = registry.store(args.remote_url.as_deref(), args.remote.as_deref())?;
+    let mut fetcher = Fetcher {
+        store,
+        args,
+        output: output_root(args.output.as_ref(), &registry),
+        placed: std::collections::HashMap::new(),
+    };
 
     if !args.porcelain {
         ui::heading(&format!(
             "fetching {} from {}",
-            ui::plural(located.len(), "artifact"),
-            fetcher.store.describe()
+            ui::plural(selected.len(), "artifact"),
+            registry.describe()
         ));
-        ui::field("into", &args.output.display().to_string());
+        ui::field("objects", &fetcher.store.describe());
+        ui::field("into", &fetcher.output.display().to_string());
         if let Some(cache) = &args.cache {
             ui::field("cache", &cache.display().to_string());
         }
@@ -170,17 +201,17 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
 
     let mut objects = 0;
     let mut bytes = 0;
-    for entry in &located {
-        let transfer = fetcher.artifact(&entry.pointer)?;
+    for pointer in &selected {
+        let transfer = fetcher.artifact(pointer)?;
         objects += transfer.objects;
         bytes += transfer.bytes;
         let (state, style) = transfer.state(args.dry_run);
-        let path = crate::display_path(&entry.pointer);
+        let path = crate::display_path(pointer);
         if args.porcelain {
             println!("{state}\t{}\t{}\t{path}", transfer.objects, transfer.bytes);
             continue;
         }
-        let detail = if entry.pointer.is_directory() {
+        let detail = if pointer.is_directory() {
             format!(
                 "{}, {}",
                 ui::plural(transfer.files, "file"),
@@ -194,7 +225,7 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
 
     if !args.porcelain {
         ui::summary(&format!(
-            "{} {} ({}) for {} from {}",
+            "{} {} ({}) for {}",
             if args.dry_run {
                 "would fetch"
             } else {
@@ -202,8 +233,7 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
             },
             ui::plural(objects, "object"),
             ui::size(bytes),
-            ui::plural(located.len(), "artifact"),
-            fetcher.store.describe()
+            ui::plural(selected.len(), "artifact"),
         ));
     }
     Ok(())
@@ -217,7 +247,7 @@ impl Fetcher<'_> {
         if !pointer.is_directory() {
             transfer.files = 1;
             transfer.total_bytes = pointer.object.size;
-            let target = self.args.output.join(&pointer.path);
+            let target = self.output.join(&pointer.path);
             self.place(
                 &pointer.object_id()?,
                 pointer.object.size,
@@ -236,7 +266,7 @@ impl Fetcher<'_> {
         transfer.total_bytes = tree.total_size();
         for entry in &tree.entries {
             let label = format!("{}/{}", pointer.path, entry.path);
-            let target = self.args.output.join(&pointer.path).join(&entry.path);
+            let target = self.output.join(&pointer.path).join(&entry.path);
             self.place(
                 &entry.object_id()?,
                 entry.size,
@@ -397,15 +427,28 @@ enum Source {
     Remote,
 }
 
-/// Check artifacts on disk against their pointers, using nothing else.
+/// Check artifacts on disk against their pointers.
 ///
-/// No remote, no cache, no repository: everything needed is the pointer and the
-/// bytes. That makes it usable as the last step of a job that fetched, or the
-/// first step of one that received a workspace from another.
+/// Everything needed is the pointers and the bytes: no object store is
+/// contacted and no credentials are read. That makes it usable as the last step
+/// of a job that fetched, or the first step of one that inherited a workspace
+/// from another — and, with `--repo`, as a check that a deployed directory
+/// still matches a particular commit of the registry.
 pub fn verify(args: &VerifyArgs) -> Result<(), Failure> {
-    let located = collect_pointers(&args.paths)?;
-    if located.is_empty() {
+    let registry = Registry::open(args.repo.as_deref(), &args.reference)?;
+    let selected = select(&registry, &args.paths)?;
+    if selected.is_empty() {
         return report_nothing_found(args.porcelain);
+    }
+    let output = output_root(args.output.as_ref(), &registry);
+    if !args.porcelain {
+        ui::heading(&format!(
+            "verifying {} against {}",
+            ui::plural(selected.len(), "artifact"),
+            registry.describe()
+        ));
+        ui::field("in", &output.display().to_string());
+        println!();
     }
 
     let mut table = Table::new(vec![
@@ -414,12 +457,12 @@ pub fn verify(args: &VerifyArgs) -> Result<(), Failure> {
         Column::left("ARTIFACT"),
     ]);
     let mut failed = 0;
-    for entry in &located {
-        let (state, bytes) = crate::artifact_state(&args.output, &entry.pointer)?;
+    for pointer in &selected {
+        let (state, bytes) = crate::artifact_state(&output, pointer)?;
         if state != State::Ok {
             failed += 1;
         }
-        let path = crate::display_path(&entry.pointer);
+        let path = crate::display_path(pointer);
         if args.porcelain {
             println!("{}\t{bytes}\t{path}", state.label());
             continue;
@@ -440,88 +483,49 @@ pub fn verify(args: &VerifyArgs) -> Result<(), Failure> {
         table.print();
         ui::summary(&format!(
             "{} checked: {} ok, {failed} not matching",
-            ui::plural(located.len(), "artifact"),
-            located.len() - failed
+            ui::plural(selected.len(), "artifact"),
+            selected.len() - failed
         ));
     }
     if failed > 0 {
         return Err(format!(
             "{failed} of {} do not match their pointers",
-            ui::plural(located.len(), "artifact")
+            ui::plural(selected.len(), "artifact")
         )
         .into());
     }
     Ok(())
 }
 
-/// Build the store to download from.
+/// The artifacts a run should act on.
 ///
-/// A URL is the pipeline-shaped answer and needs nothing on disk; a name falls
-/// back to repository configuration for a job that did clone. Credentials come
-/// from the environment either way, which is where a CI system puts them.
-fn open_remote(
-    url: Option<&str>,
-    name: Option<&str>,
-) -> Result<Box<dyn avc_core::ObjectStore>, Failure> {
-    if let Some(url) = url {
-        let config = avc_core::RemoteConfig::from_url("--remote-url", url)?;
-        return Ok(avc_core::remote::open(&config, None)?);
-    }
-    let repo = crate::load_repo().map_err(|error| {
-        Failure::from(format!(
-            "{error}; outside a repository, name the remote with --remote-url <url> \
-             or set AVC_REMOTE_URL"
-        ))
-    })?;
-    crate::open_store(&repo, name)
+/// Path selection is the registry's, so `avc fetch models/bert` means the same
+/// thing here as `avc pull models/bert` does in a checkout. `-` is expanded
+/// first, which lets a pipeline choose with the tools it already has:
+/// `git diff --name-only -- '*.avc' | avc fetch -`.
+fn select(registry: &Registry, paths: &[String]) -> Result<Vec<avc_core::Pointer>, Failure> {
+    registry.select(&expand_stdin(paths)?)
 }
 
-/// Gather the pointers a run should act on.
+/// Where artifacts are written, or looked for.
 ///
-/// Results are sorted by artifact path, so two runs of the same job produce the
-/// same log regardless of the order a filesystem happened to enumerate.
-fn collect_pointers(paths: &[String]) -> Result<Vec<Located>, Failure> {
-    let mut sources = Vec::new();
-    if paths.is_empty() {
-        collect_from(Path::new("."), &mut sources)?;
+/// Defaulting to the repository root rather than the current directory is what
+/// makes a pointer's path mean the same thing in a pipeline as it does in a
+/// checkout. A registry read from a Git URL has no meaningful root of its own —
+/// its checkout is a temporary directory — so that case falls back to here.
+fn output_root(explicit: Option<&PathBuf>, registry: &Registry) -> PathBuf {
+    match explicit {
+        Some(path) => path.clone(),
+        None if registry.is_local() => registry.root().to_path_buf(),
+        None => PathBuf::from("."),
     }
-    for value in expand_stdin(paths)? {
-        collect_from(Path::new(&value), &mut sources)?;
-    }
-    sources.sort();
-    sources.dedup();
-
-    let mut located = Vec::with_capacity(sources.len());
-    for source in sources {
-        let text = fs::read_to_string(&source)
-            .map_err(|error| format!("{}: {error}", source.display()))?;
-        let pointer = avc_core::Pointer::parse(&text)
-            .map_err(|error| format!("{}: {error}", source.display()))?;
-        located.push(Located { source, pointer });
-    }
-    located.sort_by(|left, right| left.pointer.path.cmp(&right.pointer.path));
-
-    // Two pointer files claiming one path would race to write the same bytes,
-    // and the loser would be silently discarded.
-    if let Some(window) = located
-        .windows(2)
-        .find(|pair| pair[0].pointer.path == pair[1].pointer.path)
-    {
-        return Err(format!(
-            "{} and {} both track {}",
-            window[0].source.display(),
-            window[1].source.display(),
-            window[0].pointer.path
-        )
-        .into());
-    }
-    Ok(located)
 }
 
-/// Replace a `-` argument with the newline-separated paths on stdin, so a
-/// pipeline can select artifacts with the tools it already has:
-/// `git ls-files '*.avc' | avc fetch -`.
+/// Replace a `-` argument with the newline-separated paths on stdin.
 fn expand_stdin(paths: &[String]) -> Result<Vec<String>, Failure> {
+    if !paths.iter().any(|value| value == "-") {
+        return Ok(paths.to_vec());
+    }
     let mut expanded = Vec::with_capacity(paths.len());
     for value in paths {
         if value != "-" {
@@ -539,54 +543,10 @@ fn expand_stdin(paths: &[String]) -> Result<Vec<String>, Failure> {
     Ok(expanded)
 }
 
-/// Add the pointer files named by one argument: a pointer file, or every
-/// pointer beneath a directory.
-fn collect_from(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), Failure> {
-    if path.is_file() {
-        output.push(path.to_path_buf());
-        return Ok(());
-    }
-    if path.is_dir() {
-        return walk(path, output);
-    }
-    Err(format!("no such pointer file or directory: {}", path.display()).into())
-}
-
-/// Every `.avc` file beneath `directory`, as paths that can be opened directly.
-///
-/// Symlinks are skipped rather than followed: a link back into the tree would
-/// loop, and a link out of it would pull in pointers the job never asked for.
-fn walk(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), Failure> {
-    for entry in fs::read_dir(directory).map_err(crate::io_error)? {
-        let path = entry.map_err(crate::io_error)?.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        // None of these hold a pointer worth finding, and all three can hold
-        // an enormous number of files.
-        if matches!(name, ".git" | ".avc" | "target") {
-            continue;
-        }
-        let kind = fs::symlink_metadata(&path)
-            .map_err(crate::io_error)?
-            .file_type();
-        if kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            walk(&path, output)?;
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("avc") {
-            output.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn report_nothing_found(porcelain: bool) -> Result<(), Failure> {
     if !porcelain {
         ui::line("no AVC pointers found", Style::Warn);
-        ui::note("pass pointer files or a directory to scan, or run inside a checkout");
+        ui::note("name the repository with --repo <git-url>, or run inside a checkout");
     }
     Ok(())
 }

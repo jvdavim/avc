@@ -214,12 +214,18 @@ avc list --remote origin
 ```
 
 ```text
-ARTIFACT    SIZE  OBJECT        REMOTE
+everything in /path/to/artifacts
+  objects    file:///tmp/avc-remote
+
+PATH        SIZE  OBJECT        REMOTE
 data/       13 B  0e80f9d32ad0  missing
 model.bin   17 B  1dfc4d103921  missing
 
-2 artifacts, 30 B on file:///tmp/avc-remote: 0 available, 2 missing
+2 artifacts, 30 B: 0 available, 2 missing
 ```
+
+Give `list` a path to scope it — `avc list data` lists the files stored inside
+the `data` artifact rather than the one row it collapses to.
 
 For a directory, `SIZE` is the total bytes of the files it holds, and `REMOTE`
 reads `available` only once the manifest *and* every file it names are there.
@@ -308,18 +314,23 @@ avc pull
 `.avc/config.toml` is committed, so remotes are usually already configured and
 only credentials are local.
 
-## Using AVC from a build pipeline
+## Consuming artifacts from a build pipeline
 
 A build agent has no reason to clone artifact history or warm a cache it will
-throw away. `avc fetch` downloads straight from the remote to the paths the
-pointers name, with no repository and no cache:
+throw away, and usually wants one artifact rather than all of them. `avc fetch`
+takes a repository URL and a path inside it:
 
 ```bash
-avc fetch --remote-url file:///tmp/avc-remote --output .
-avc verify --output .
+avc fetch  --repo https://github.com/acme/artifacts models/bert -o .
+avc verify --repo https://github.com/acme/artifacts models/bert -o .
 ```
 
-Both commands work in a directory holding nothing but pointer files. See
+There is no bucket in either command. AVC reads the pointers at that Git
+reference — pointer files are text, and artifacts are gitignored, so the read is
+kilobytes — and learns the object store from the `.avc/config.toml` that came
+with them. Nothing is written but the artifacts themselves.
+
+`avc list --repo <url> models/` shows what is there before you fetch it. See
 [CI/CD](ci-cd.md) for credentials, caching between jobs, and complete workflows
 for GitHub Actions, GitLab CI, Docker, and Kubernetes.
 

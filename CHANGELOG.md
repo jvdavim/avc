@@ -13,23 +13,43 @@ include a breaking format change. See
 
 ### Added
 
-- **CI/CD commands.** `avc fetch` downloads artifacts straight from a remote to
-  the paths their pointers name — no Git repository, no `avc init`, no local
-  cache, and `s3:GetObject` as its only S3 permission. `avc verify` re-hashes
-  artifacts on disk against their pointers and exits `1` on any drift, using
-  nothing but the two, so a pipeline can gate on it. Both select artifacts from
-  arguments, a directory scan, or stdin, take their remote from `--remote-url`
-  or `$AVC_REMOTE_URL`, and offer `--porcelain`. `fetch` also has `--cache` for
-  a runner that caches a directory between jobs, `--dry-run`, and `--force`.
-  See the new [CI/CD guide](docs/ci-cd.md).
+- **CI/CD commands.** `avc fetch` downloads the artifacts at a path inside a
+  repository, to the paths their pointers name — no clone, no `avc init`, no
+  local cache, and `s3:GetObject` as its only S3 permission. `avc verify`
+  re-hashes artifacts on disk against their pointers and exits `1` on any drift,
+  using nothing but the two, so a pipeline can gate on it. `fetch` also has
+  `--cache` for a runner that caches a directory between jobs, `--dry-run`, and
+  `--force`. See the new [CI/CD guide](docs/ci-cd.md).
+- **A repository is addressed by its Git URL, not by its object store.**
+  `--repo <git-url>` and `--ref <ref>` (or `$AVC_REPO` and `$AVC_REF`) make
+  `fetch`, `verify`, and `list` read pointers from a shallow, text-only read of
+  one Git reference, and read the object store out of the `.avc/config.toml`
+  that came with them. A consumer never names a bucket, a prefix, or an
+  endpoint, so moving storage does not break them; `--remote-url` overrides it
+  for a single run. Reading from a Git URL requires the `git` command.
+- **Path selection inside a repository**, shared by `commit`, `push`, `pull`,
+  `checkout`, `remove`, `fetch`, `verify`, and `list`. A path matches an
+  artifact exactly or acts as a directory prefix naming everything beneath it,
+  so `avc fetch models/bert` takes one project out of a registry holding a
+  hundred. An exact match beats a prefix, a trailing `/` is optional, and a
+  trailing `.avc` is stripped so a pointer path from `git diff --name-only`
+  names its artifact unchanged. A path matching nothing is an error rather than
+  an empty selection — previously only `push`, `pull`, and `checkout` accepted
+  paths, and only exact ones.
+- **`avc list` takes a path.** With a prefix it lists the artifacts beneath it;
+  with a tracked directory named exactly it lists the files stored inside that
+  directory rather than the single row they collapse to. With `--repo` it
+  browses a repository without cloning it.
 - `--porcelain` on `status`, `list`, `fetch`, and `verify`: tab-separated
   records with no header, summary, or color. This is now the stable interface
   for scripts; the human-facing output is explicitly not.
 - Terminal-aware color, honoring `--color <auto|always|never>`, `AVC_COLOR`,
   `NO_COLOR`, `CLICOLOR_FORCE`, and `TERM=dumb`. Color is decoration only:
   every line reads identically without it.
-- `AVC_REMOTE_URL` and `AVC_CACHE_DIR` environment variables, so a pipeline can
-  configure `avc fetch` once rather than on every command line.
+- `AVC_REPO`, `AVC_REF`, and `AVC_CACHE_DIR` environment variables, so a
+  pipeline can configure the CI/CD commands once rather than on every command
+  line. A `--repo` URL containing `user:password@` is redacted everywhere AVC
+  prints it, including inside Git's own error messages.
 - **Directory artifacts.** `avc add data/` tracks a whole directory as one
   artifact with one pointer, the way `dvc add data/` does. Every file beneath it
   is hashed and cached, and a manifest naming them is stored as an object of its

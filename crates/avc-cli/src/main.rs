@@ -1,4 +1,6 @@
 mod ci;
+mod git;
+mod registry;
 mod ui;
 
 use std::fs::{self, File};
@@ -13,11 +15,13 @@ use ui::{Cell, Column, Style, Table};
 /// Where the commands built for a pipeline are documented, mentioned in
 /// `--help` because that is where somebody wiring up CI will look first.
 const CI_HELP: &str = "\
-Commands for CI/CD:
-  fetch   download artifacts straight from a remote - no clone, no cache
-  verify  check artifacts on disk against their pointers
+Commands for CI/CD, which take a repository URL and a path inside it:
+  avc fetch  --repo <git-url> models/bert -o .   download just that path
+  avc list   --repo <git-url> models/            see what is stored there
+  avc verify --repo <git-url> models/bert -o .   check it against the pointers
 
-Both run without a repository. See docs/ci-cd.md.";
+The object store is read from the repository's own .avc/config.toml, so a
+consumer never names a bucket. See docs/ci-cd.md.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -52,7 +56,7 @@ enum Command {
     },
     /// Start tracking a file or directory as an artifact.
     Add(Paths),
-    /// List tracked artifacts and their availability on a remote.
+    /// List what a repository stores, at a path or in full.
     List(ListArgs),
     /// Report working-tree and cache state for every tracked artifact.
     Status(StatusArgs),
@@ -71,19 +75,21 @@ enum Command {
     /// Verify repository integrity: pointers, manifests, and cached objects.
     Doctor,
 
-    /// [CI/CD] Download artifacts straight from a remote: no clone, no cache.
+    /// [CI/CD] Download one path out of a repository: no clone, no cache.
     ///
-    /// Reads pointer files, downloads exactly the objects they name, verifies
-    /// each one as it streams, and writes it where the pointer says. Needs no
-    /// Git repository, no `avc init`, and no local cache; a remote URL and
-    /// credentials in the environment are enough. See docs/ci-cd.md.
+    /// Reads the pointers at a Git reference, downloads exactly the objects the
+    /// selected paths name, verifies each as it streams, and writes it where
+    /// the pointer says. The object store comes from the repository's own
+    /// `.avc/config.toml`, so only a repository URL, a path, and credentials
+    /// are needed - never a bucket. See docs/ci-cd.md.
     Fetch(ci::FetchArgs),
 
     /// [CI/CD] Check artifacts on disk against their pointers.
     ///
     /// Re-hashes what is on disk and compares it with what the pointers claim,
-    /// using nothing but the two. Exits 1 if any artifact is missing or
-    /// differs, which makes it a gate a pipeline can fail on. See docs/ci-cd.md.
+    /// using nothing but the two - no object store, no credentials. Exits 1 if
+    /// any artifact is missing or differs, which makes it a gate a pipeline can
+    /// fail on. See docs/ci-cd.md.
     Verify(ci::VerifyArgs),
 }
 
@@ -139,8 +145,26 @@ struct GcArgs {
 
 #[derive(Debug, Args)]
 struct ListArgs {
+    /// Paths inside the repository. A path naming a tracked directory lists the
+    /// files inside it; a prefix lists the artifacts beneath it.
+    #[arg(value_name = "PATH")]
+    paths: Vec<String>,
+    /// Git URL of the repository to list. Needs no clone and no local checkout.
+    #[arg(long, value_name = "URL", env = "AVC_REPO")]
+    repo: Option<String>,
+    /// Branch, tag, or commit to read pointers at.
+    #[arg(
+        long = "ref",
+        value_name = "REF",
+        env = "AVC_REF",
+        default_value = "HEAD"
+    )]
+    reference: String,
     #[arg(long)]
     remote: Option<String>,
+    /// Object store URL, overriding the one the repository configures.
+    #[arg(long, value_name = "URL")]
+    remote_url: Option<String>,
     /// Stable tab-separated output for scripts: PATH, SIZE, OBJECT, REMOTE.
     #[arg(long)]
     porcelain: bool,
@@ -154,15 +178,15 @@ struct StatusArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-struct Config {
+pub(crate) struct Config {
     #[serde(default)]
     default_remote: Option<String>,
     #[serde(default)]
-    remotes: Vec<Remote>,
+    pub(crate) remotes: Vec<Remote>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Remote {
+pub(crate) struct Remote {
     name: String,
     provider: avc_core::Provider,
     bucket_or_container: String,
@@ -180,8 +204,28 @@ struct LocalConfig {
 }
 
 pub(crate) struct Repo {
-    root: PathBuf,
-    config: Config,
+    pub(crate) root: PathBuf,
+    pub(crate) config: Config,
+}
+
+impl Repo {
+    /// Read the repository rooted at `root`.
+    ///
+    /// A missing `.avc/config.toml` is not an error here, only an empty
+    /// configuration: `avc verify` needs no object store at all, and a caller
+    /// that does need one reports its absence with more context than this
+    /// function has. A malformed one is still an error — silently treating it
+    /// as empty would send a transfer to the wrong place, or nowhere.
+    pub(crate) fn at(root: PathBuf) -> Result<Self, Failure> {
+        let path = root.join(".avc/config.toml");
+        let config = match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => {
+                toml::from_str(&text).map_err(|error| format!(".avc/config.toml: {error}"))?
+            }
+            _ => Config::default(),
+        };
+        Ok(Self { root, config })
+    }
 }
 
 /// Exit code for expected user, data, or state errors. See `SPEC.md`.
@@ -190,6 +234,7 @@ const EXIT_USER_ERROR: i32 = 1;
 const EXIT_PROVIDER_ERROR: i32 = 3;
 
 /// A failure, carrying the exit code it should produce.
+#[derive(Debug)]
 pub(crate) struct Failure {
     message: String,
     code: i32,
@@ -207,6 +252,18 @@ impl From<String> for Failure {
 impl From<&str> for Failure {
     fn from(message: &str) -> Self {
         Self::from(message.to_string())
+    }
+}
+
+impl Failure {
+    /// A provider or operational failure: unreachable, unauthorized, or a tool
+    /// that is not installed. `SPEC.md` reserves exit code 3 for these, and a
+    /// pipeline may reasonably retry one.
+    pub(crate) fn provider(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EXIT_PROVIDER_ERROR,
+        }
     }
 }
 
@@ -251,7 +308,7 @@ fn run(command: Command) -> Result<(), Failure> {
         Command::Init => init(),
         Command::Remote { command } => remote(command),
         Command::Add(args) => add(&args.paths),
-        Command::List(args) => list(args.remote.as_deref(), args.porcelain),
+        Command::List(args) => list(&args),
         Command::Status(args) => status(args.porcelain),
         Command::Commit(args) => commit(&args.paths.paths, args.force),
         Command::Push(args) => push(&args.paths, args.remote.as_deref()),
@@ -752,16 +809,35 @@ pub(crate) fn display_path(pointer: &avc_core::Pointer) -> String {
     ignore_line(&pointer.path, pointer.is_directory())
 }
 
-fn list(remote_name: Option<&str>, porcelain: bool) -> Result<(), Failure> {
-    let repo = load_repo()?;
-    let store = open_store(&repo, remote_name)?;
-    let pointers = pointer_files(&repo.root)?;
-    if pointers.is_empty() {
-        if !porcelain {
+/// Show what a repository tracks, and whether the remote can supply it.
+///
+/// With no path this lists every artifact. With a path it lists what is stored
+/// *at* that path, which is the difference between browsing a registry and
+/// dumping it: a prefix shows the artifacts beneath it, and a tracked directory
+/// shows the files inside it.
+fn list(args: &ListArgs) -> Result<(), Failure> {
+    let registry = registry::Registry::open(args.repo.as_deref(), &args.reference)?;
+    let selected = registry.select(&args.paths)?;
+    if selected.is_empty() {
+        if !args.porcelain {
             ui::line("no AVC pointers found", Style::Warn);
             ui::note("track something with `avc add <path>`");
         }
         return Ok(());
+    }
+    let store = registry.store(args.remote_url.as_deref(), args.remote.as_deref())?;
+    if !args.porcelain {
+        ui::heading(&format!(
+            "{} in {}",
+            if args.paths.is_empty() {
+                "everything".to_owned()
+            } else {
+                args.paths.join(", ")
+            },
+            registry.describe()
+        ));
+        ui::field("objects", &store.describe());
+        println!();
     }
     // One listing answers every pointer, so a repository with a thousand
     // artifacts costs one round trip rather than a thousand HEAD requests.
@@ -772,22 +848,62 @@ fn list(remote_name: Option<&str>, porcelain: bool) -> Result<(), Failure> {
         .collect();
 
     let mut table = Table::new(vec![
-        Column::left("ARTIFACT"),
+        Column::left("PATH"),
         Column::right("SIZE"),
         Column::left("OBJECT"),
         Column::left("REMOTE"),
     ]);
+    let mut rows = 0;
     let mut available = 0;
     let mut total_bytes = 0;
-    let mut counted = 0;
+    let mut listed_files = false;
 
-    for pointer_path in pointers {
-        let pointer = parse_pointer(&pointer_path)?;
+    for pointer in &selected {
+        // A path that names a tracked directory exactly is a request to look
+        // inside it, so the rows become its files rather than the one artifact
+        // they add up to. Reaching that list needs the manifest, which is
+        // metadata; artifact bytes are still never downloaded.
+        let inside = pointer.is_directory()
+            && args
+                .paths
+                .iter()
+                .map(|value| registry::normalize_selector(value))
+                .collect::<Result<Vec<String>, Failure>>()?
+                .iter()
+                .any(|value| value == &pointer.path);
+        if inside {
+            let Some(tree) = remote_tree(registry.repo(), store.as_ref(), pointer, &present)?
+            else {
+                return Err(format!(
+                    "the manifest for {} is on neither the remote nor this machine, \
+                     so its contents are unknown",
+                    pointer.path
+                )
+                .into());
+            };
+            listed_files = true;
+            for entry in &tree.entries {
+                let on_remote = present.contains(&entry.hash);
+                rows += 1;
+                available += usize::from(on_remote);
+                total_bytes += entry.size;
+                emit_row(
+                    &mut table,
+                    args.porcelain,
+                    &format!("{}/{}", pointer.path, entry.path),
+                    Some(entry.size),
+                    &entry.object_id()?,
+                    on_remote,
+                );
+            }
+            continue;
+        }
+
         let object = pointer.object_id()?;
         // A directory is available only when its manifest *and* every file it
         // names are on the remote; a half-uploaded directory is not restorable.
         let (size, on_remote) = if pointer.is_directory() {
-            match remote_tree(&repo, store.as_ref(), &pointer, &present)? {
+            match remote_tree(registry.repo(), store.as_ref(), pointer, &present)? {
                 Some(tree) => {
                     let complete = present.contains(object.hash())
                         && tree
@@ -803,41 +919,54 @@ fn list(remote_name: Option<&str>, porcelain: bool) -> Result<(), Failure> {
         } else {
             (Some(pointer.object.size), present.contains(object.hash()))
         };
-        counted += 1;
+        rows += 1;
         available += usize::from(on_remote);
         total_bytes += size.unwrap_or(0);
-
-        if porcelain {
-            println!(
-                "{}\t{}\t{object}\t{}",
-                display_path(&pointer),
-                size.map_or("-".to_owned(), |bytes| bytes.to_string()),
-                if on_remote { "available" } else { "missing" }
-            );
-            continue;
-        }
-        table.row(vec![
-            Cell::plain(display_path(&pointer)),
-            Cell::plain(size.map_or("-".to_owned(), ui::size)),
-            Cell::dim(ui::short_hash(object.hash())),
-            Cell::new(
-                if on_remote { "available" } else { "missing" },
-                if on_remote { Style::Ok } else { Style::Bad },
-            ),
-        ]);
+        emit_row(
+            &mut table,
+            args.porcelain,
+            &display_path(pointer),
+            size,
+            &object,
+            on_remote,
+        );
     }
 
-    if !porcelain {
+    if !args.porcelain {
         table.print();
         ui::summary(&format!(
-            "{}, {} on {}: {available} available, {} missing",
-            ui::plural(counted, "artifact"),
+            "{}, {}: {available} available, {} missing",
+            ui::plural(rows, if listed_files { "file" } else { "artifact" }),
             ui::size(total_bytes),
-            store.describe(),
-            counted - available
+            rows - available
         ));
     }
     Ok(())
+}
+
+/// One `list` row, in whichever form was asked for.
+fn emit_row(
+    table: &mut Table,
+    porcelain: bool,
+    path: &str,
+    size: Option<u64>,
+    object: &avc_core::ObjectId,
+    on_remote: bool,
+) {
+    let state = if on_remote { "available" } else { "missing" };
+    if porcelain {
+        println!(
+            "{path}\t{}\t{object}\t{state}",
+            size.map_or("-".to_owned(), |bytes| bytes.to_string())
+        );
+        return;
+    }
+    table.row(vec![
+        Cell::plain(path.to_owned()),
+        Cell::plain(size.map_or("-".to_owned(), ui::size)),
+        Cell::dim(ui::short_hash(object.hash())),
+        Cell::new(state, if on_remote { Style::Ok } else { Style::Bad }),
+    ]);
 }
 
 /// The manifest for a directory pointer, from the cache or, failing that, from
@@ -1288,7 +1417,7 @@ fn verify_cached(
     Ok(true)
 }
 
-fn find_root() -> Result<PathBuf, Failure> {
+pub(crate) fn find_root() -> Result<PathBuf, Failure> {
     let mut current = std::env::current_dir().map_err(io_error)?;
     loop {
         if current.join(".git").exists() {
@@ -1351,7 +1480,7 @@ fn append_ignore_path(root: &Path, entry: &str) -> Result<(), Failure> {
 /// Directory iteration order is whatever the filesystem feels like, which
 /// would make two runs of `avc status` on the same repository — or the same
 /// pipeline on two runners — print the same artifacts in different orders.
-fn pointer_files(root: &Path) -> Result<Vec<PathBuf>, Failure> {
+pub(crate) fn pointer_files(root: &Path) -> Result<Vec<PathBuf>, Failure> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
     files.sort();
@@ -1420,27 +1549,18 @@ fn load_local_override(
 }
 
 /// The pointers a command should act on: all of them, or just the paths named.
+/// The artifacts a repository command should act on.
+///
+/// Selection is the registry's, so one path language serves every command: an
+/// exact artifact path, a prefix naming everything beneath it, or nothing at
+/// all for the lot. `avc push models/bert` and `avc fetch models/bert` therefore
+/// mean the same thing, in a checkout and in a pipeline alike.
 fn selected_pointers(repo: &Repo, paths: &[String]) -> Result<Vec<avc_core::Pointer>, Failure> {
-    // Normalizing first is what lets `avc push data/` reach the pointer whose
-    // path is `data`, the way a shell completes a directory name.
-    let wanted = paths
-        .iter()
-        .map(|value| avc_core::normalize_repo_path(Path::new(value)).map_err(Failure::from))
-        .collect::<Result<Vec<String>, Failure>>()?;
-    let mut selected = Vec::new();
+    let mut artifacts = Vec::new();
     for pointer_path in pointer_files(&repo.root)? {
-        let pointer = parse_pointer(&pointer_path)?;
-        if wanted.is_empty() || wanted.iter().any(|value| value == &pointer.path) {
-            selected.push(pointer);
-        }
+        artifacts.push(parse_pointer(&pointer_path)?);
     }
-    // A typo in a path should not be reported as "nothing to do".
-    for value in &wanted {
-        if !selected.iter().any(|pointer| &pointer.path == value) {
-            return Err(format!("no pointer exists for {value}").into());
-        }
-    }
-    Ok(selected)
+    registry::select(artifacts, paths)
 }
 
 fn choose_remote<'a>(repo: &'a Repo, name: Option<&str>) -> Result<&'a Remote, Failure> {

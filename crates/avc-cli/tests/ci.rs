@@ -1,9 +1,11 @@
 //! End-to-end coverage of the commands built for CI/CD.
 //!
-//! What makes `fetch` and `verify` worth having is what they *do not* need, so
-//! that is what these tests assert: every case below runs in a directory with
-//! no `.git`, no `.avc`, and no configuration — nothing but pointer files, the
-//! same way a deploy job has nothing but what it was handed.
+//! The fixture below is an *artifact registry*: one Git repository holding
+//! artifacts for two unrelated projects plus a shared dataset, with its object
+//! store configured once in the tracked `.avc/config.toml`. That is the shape
+//! these commands exist for, and what the tests assert is that a consumer can
+//! name a repository and a path inside it — never a bucket, never everything —
+//! from a directory that is not a checkout of anything.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,7 +43,8 @@ fn avc(directory: &Path, arguments: &[&str]) -> Output {
         // these; pinning them keeps the assertions about text, not escapes.
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
-        .env_remove("AVC_REMOTE_URL")
+        .env_remove("AVC_REPO")
+        .env_remove("AVC_REF")
         .env_remove("AVC_CACHE_DIR")
         .current_dir(directory)
         .output()
@@ -56,6 +59,38 @@ fn run(directory: &Path, arguments: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn git(directory: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(directory)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("these tests need the git command");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Commit everything, with an identity that does not depend on the machine.
+fn commit(directory: &Path, message: &str) {
+    git(directory, &["add", "--all"]);
+    git(
+        directory,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
 }
 
 fn write(path: &Path, contents: &str) {
@@ -73,118 +108,263 @@ fn file_url(path: &Path) -> String {
     }
 }
 
-/// The three things a pipeline is given: a remote holding the bytes, the
-/// pointer files that name them, and an empty directory to work in.
-struct Fixture {
+/// A published artifact registry: a real Git repository whose commits hold the
+/// pointers and the configuration, and an object store holding the bytes.
+struct Registry {
     directory: TempDir,
 }
 
-impl Fixture {
-    /// Track a file and a directory in a throwaway repository, push both to a
-    /// `file://` remote, then throw the repository away and keep the pointers.
+impl Registry {
     fn new(label: &str) -> Self {
         let directory = TempDir::new(label);
-        let worktree = directory.0.join("author");
-        fs::create_dir_all(worktree.join(".git")).unwrap();
-        fs::create_dir_all(directory.0.join("remote")).unwrap();
-        write(&worktree.join("model.bin"), "a model\n");
-        write(&worktree.join("data/a.bin"), "alpha\n");
-        write(&worktree.join("data/nested/b.bin"), "beta\n");
+        let source = directory.0.join("registry");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(directory.0.join("store")).unwrap();
+
+        git(&source, &["init", "--quiet", "-b", "main"]);
+        write(&source.join("models/bert/weights.bin"), "bert weights\n");
+        write(&source.join("models/bert/tokenizer.json"), "{}\n");
+        write(&source.join("models/gpt/weights.bin"), "gpt weights\n");
+        write(&source.join("data/a.bin"), "alpha\n");
+        write(&source.join("data/nested/b.bin"), "beta\n");
         // Identical content twice: one object must serve both paths, even with
         // no cache to deduplicate against.
-        write(&worktree.join("data/nested/dup.bin"), "alpha\n");
+        write(&source.join("data/nested/dup.bin"), "alpha\n");
 
-        run(&worktree, &["init"]);
-        run(&worktree, &["add", "model.bin", "data"]);
+        run(&source, &["init"]);
         run(
-            &worktree,
+            &source,
+            &[
+                "add",
+                "models/bert/weights.bin",
+                "models/bert/tokenizer.json",
+                "models/gpt/weights.bin",
+                "data",
+            ],
+        );
+        // The object store is set up once, here, and committed. No consumer in
+        // any test below ever names it.
+        run(
+            &source,
             &[
                 "remote",
                 "add",
                 "origin",
-                &file_url(&directory.0.join("remote")),
+                &file_url(&directory.0.join("store")),
             ],
         );
-        run(&worktree, &["push"]);
-
-        // The job: pointer files and nothing else.
-        let job = directory.0.join("job");
-        fs::create_dir_all(&job).unwrap();
-        for pointer in ["model.bin.avc", "data.avc"] {
-            fs::copy(worktree.join(pointer), job.join(pointer)).unwrap();
-        }
-        fs::remove_dir_all(&worktree).unwrap();
+        run(&source, &["push"]);
+        commit(&source, "Publish artifacts");
         Self { directory }
     }
 
-    fn job(&self) -> PathBuf {
-        self.directory.0.join("job")
+    fn source(&self) -> PathBuf {
+        self.directory.0.join("registry")
     }
 
-    fn remote_url(&self) -> String {
-        file_url(&self.directory.0.join("remote"))
+    /// The Git URL a consumer is given. This is the only address anyone needs.
+    fn url(&self) -> String {
+        file_url(&self.source())
+    }
+
+    /// A consumer's working directory: empty, not a checkout of anything.
+    fn job(&self, name: &str) -> PathBuf {
+        let path = self.directory.0.join(name);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn store(&self) -> PathBuf {
+        self.directory.0.join("store")
     }
 }
 
-/// The whole point: artifacts land, verified, with no repository and nothing
-/// written except the artifacts themselves.
+/// The headline case: name a repository and one path inside it, from a
+/// directory that is not a checkout, and get exactly that path's bytes.
 #[test]
-fn fetches_into_a_directory_that_is_not_a_repository() {
-    let fixture = Fixture::new("fetch");
-    let job = fixture.job();
+fn fetches_one_path_out_of_a_shared_registry() {
+    let registry = Registry::new("path");
+    let job = registry.job("job");
 
     let output = run(
         &job,
-        &["fetch", "--remote-url", &fixture.remote_url(), "-o", "out"],
+        &[
+            "fetch",
+            "--repo",
+            &registry.url(),
+            "models/bert",
+            "-o",
+            "out",
+        ],
     );
     assert!(output.contains("downloaded"), "{output}");
 
-    for (path, contents) in [
-        ("out/model.bin", "a model\n"),
-        ("out/data/a.bin", "alpha\n"),
-        ("out/data/nested/b.bin", "beta\n"),
-        ("out/data/nested/dup.bin", "alpha\n"),
-    ] {
-        assert_eq!(fs::read_to_string(job.join(path)).unwrap(), contents);
-    }
-
-    // No cache, and no manifest left lying in the output tree: a directory
-    // artifact materializes as its files and nothing else.
-    assert!(!job.join(".avc").exists(), "fetch must not create a cache");
     assert_eq!(
-        walk_files(&job.join("out")).len(),
-        4,
-        "the output tree must hold the artifact files and nothing else"
+        fs::read_to_string(job.join("out/models/bert/weights.bin")).unwrap(),
+        "bert weights\n"
+    );
+    assert_eq!(
+        fs::read_to_string(job.join("out/models/bert/tokenizer.json")).unwrap(),
+        "{}\n"
+    );
+    // The rest of the registry was not fetched, which is the point.
+    assert!(
+        !job.join("out/models/gpt").exists(),
+        "another project's model"
+    );
+    assert!(!job.join("out/data").exists(), "an unrelated dataset");
+    assert_eq!(walk_files(&job.join("out")).len(), 2);
+
+    // Nothing but the artifacts: no checkout of the repository, no cache.
+    assert!(!job.join(".git").exists());
+    assert!(!job.join(".avc").exists());
+    assert!(!job.join("out/.avc").exists());
+}
+
+/// A consumer never names the bucket. The repository does, once.
+#[test]
+fn takes_the_object_store_from_the_repository() {
+    let registry = Registry::new("store");
+    let job = registry.job("job");
+    run(
+        &job,
+        &["fetch", "--repo", &registry.url(), "data", "-o", "out"],
+    );
+    assert_eq!(
+        fs::read_to_string(job.join("out/data/nested/b.bin")).unwrap(),
+        "beta\n"
     );
 
-    // Three files, two distinct objects, plus the manifest — but the manifest
-    // is metadata, so only the two file objects and `model.bin` are counted.
-    let porcelain = run(
+    // A repository with no `avc remote add` cannot serve a fetch, and says so
+    // rather than asking the caller to guess a URL.
+    let bare = registry.directory.0.join("bare");
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "--quiet", "-b", "main"]);
+    let pointer = fs::read_to_string(registry.source().join("models/gpt/weights.bin.avc")).unwrap();
+    write(&bare.join("model.bin.avc"), &pointer);
+    commit(&bare, "No AVC configuration");
+
+    let unconfigured = avc(&job, &["fetch", "--repo", &file_url(&bare), "-o", "out2"]);
+    assert_eq!(unconfigured.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&unconfigured.stderr);
+    assert!(message.contains("configures no object store"), "{message}");
+    assert!(message.contains("avc remote add"), "{message}");
+}
+
+/// Listing is browsing: a prefix shows the artifacts under it, and a tracked
+/// directory shows the files inside it.
+#[test]
+fn lists_what_is_stored_at_a_path() {
+    let registry = Registry::new("list");
+    let job = registry.job("job");
+    let url = registry.url();
+    let names = |output: &str| -> Vec<String> {
+        output
+            .lines()
+            .map(|line| line.split('\t').next().unwrap().to_owned())
+            .collect()
+    };
+
+    // The whole registry: four artifacts, the directory collapsed to one row.
+    let all = run(&job, &["list", "--repo", &url, "--porcelain"]);
+    assert_eq!(
+        names(&all),
+        [
+            "data/",
+            "models/bert/tokenizer.json",
+            "models/bert/weights.bin",
+            "models/gpt/weights.bin"
+        ]
+    );
+
+    // One project's corner of it.
+    let scoped = run(
+        &job,
+        &["list", "--repo", &url, "models/bert", "--porcelain"],
+    );
+    assert_eq!(
+        names(&scoped),
+        ["models/bert/tokenizer.json", "models/bert/weights.bin"]
+    );
+
+    // Naming the directory artifact exactly looks inside it, listing the files
+    // stored there rather than the one artifact they add up to.
+    let inside = run(&job, &["list", "--repo", &url, "data", "--porcelain"]);
+    assert_eq!(
+        names(&inside),
+        ["data/a.bin", "data/nested/b.bin", "data/nested/dup.bin"]
+    );
+    assert!(inside.contains("data/a.bin\t6\t"), "{inside}");
+    assert!(
+        inside.lines().all(|line| line.ends_with("available")),
+        "{inside}"
+    );
+
+    // And the human output counts files rather than artifacts.
+    let human = run(&job, &["list", "--repo", &url, "data"]);
+    assert!(human.contains("3 files, 17 B"), "{human}");
+}
+
+/// `verify` checks a directory against a particular commit of the registry,
+/// contacting no object store at all.
+#[test]
+fn verifies_a_directory_against_a_repository_reference() {
+    let registry = Registry::new("verify");
+    let job = registry.job("job");
+    let url = registry.url();
+    run(&job, &["fetch", "--repo", &url, "models", "-o", "out"]);
+
+    assert_eq!(
+        run(
+            &job,
+            &[
+                "verify",
+                "--repo",
+                &url,
+                "models",
+                "-o",
+                "out",
+                "--porcelain"
+            ]
+        ),
+        "ok\t3\tmodels/bert/tokenizer.json\n\
+         ok\t13\tmodels/bert/weights.bin\n\
+         ok\t12\tmodels/gpt/weights.bin\n"
+    );
+
+    // Deleting the object store proves no transfer is involved.
+    fs::remove_dir_all(registry.store()).unwrap();
+    write(&job.join("out/models/gpt/weights.bin"), "tampered\n");
+    let failed = avc(
         &job,
         &[
-            "fetch",
-            "--remote-url",
-            &fixture.remote_url(),
+            "verify",
+            "--repo",
+            &url,
+            "models",
             "-o",
             "out",
             "--porcelain",
         ],
     );
-    assert_eq!(
-        porcelain, "up-to-date\t0\t0\tdata/\nup-to-date\t0\t0\tmodel.bin\n",
-        "a second fetch into a populated workspace must transfer nothing"
+    assert_eq!(failed.status.code(), Some(1));
+    let report = String::from_utf8_lossy(&failed.stdout);
+    assert!(
+        report.contains("modified\t9\tmodels/gpt/weights.bin"),
+        "{report}"
     );
 }
 
 /// A dry run reports the same plan the real run executes, and writes nothing.
 #[test]
 fn dry_run_reports_the_transfer_without_making_it() {
-    let fixture = Fixture::new("dry");
-    let job = fixture.job();
+    let registry = Registry::new("dry");
+    let job = registry.job("job");
     let arguments = [
         "fetch",
-        "--remote-url",
-        &fixture.remote_url(),
+        "--repo",
+        &registry.url(),
+        "data",
         "-o",
         "out",
         "--porcelain",
@@ -194,7 +374,7 @@ fn dry_run_reports_the_transfer_without_making_it() {
     dry.push("--dry-run");
     let planned = run(&job, &dry);
     assert_eq!(
-        planned, "would-fetch\t2\t11\tdata/\nwould-fetch\t1\t8\tmodel.bin\n",
+        planned, "would-fetch\t2\t11\tdata/\n",
         "duplicate files inside a directory must be counted once"
     );
     assert!(!job.join("out").exists(), "a dry run must write nothing");
@@ -211,9 +391,9 @@ fn dry_run_reports_the_transfer_without_making_it() {
 /// the way a reused runner workspace opts out of it.
 #[test]
 fn refuses_to_overwrite_a_file_that_differs() {
-    let fixture = Fixture::new("force");
-    let job = fixture.job();
-    let fetch = ["fetch", "--remote-url", &fixture.remote_url(), "-o", "out"];
+    let registry = Registry::new("force");
+    let job = registry.job("job");
+    let fetch = ["fetch", "--repo", &registry.url(), "data", "-o", "out"];
     run(&job, &fetch);
 
     write(&job.join("out/data/a.bin"), "a local edit\n");
@@ -237,15 +417,15 @@ fn refuses_to_overwrite_a_file_that_differs() {
 }
 
 /// A cache is worth having only if the second job can be served entirely from
-/// it. Deleting the remote in between proves nothing went over the wire.
+/// it. Deleting the object store in between proves nothing went over the wire.
 #[test]
-fn a_warm_cache_serves_a_fetch_with_the_remote_gone() {
-    let fixture = Fixture::new("cache");
-    let job = fixture.job();
+fn a_warm_cache_serves_a_fetch_with_the_store_gone() {
+    let registry = Registry::new("cache");
+    let job = registry.job("job");
     let arguments = [
         "fetch",
-        "--remote-url",
-        &fixture.remote_url(),
+        "--repo",
+        &registry.url(),
         "-o",
         "out",
         "--cache",
@@ -253,7 +433,7 @@ fn a_warm_cache_serves_a_fetch_with_the_remote_gone() {
     ];
     run(&job, &arguments);
 
-    fs::remove_dir_all(fixture.directory.0.join("remote")).unwrap();
+    fs::remove_dir_all(registry.store()).unwrap();
     fs::remove_dir_all(job.join("out")).unwrap();
 
     let output = run(&job, &arguments);
@@ -262,70 +442,76 @@ fn a_warm_cache_serves_a_fetch_with_the_remote_gone() {
         fs::read_to_string(job.join("out/data/nested/b.bin")).unwrap(),
         "beta\n"
     );
-    run(&job, &["verify", "-o", "out"]);
+    run(&job, &["verify", "--repo", &registry.url(), "-o", "out"]);
 }
 
-/// `verify` is a gate, so what matters is the exit code and that it needs
-/// nothing but the pointers and the bytes.
+/// Path selection, and the errors that keep a typo from passing as an empty
+/// selection.
 #[test]
-fn verify_fails_on_anything_that_does_not_match_its_pointer() {
-    let fixture = Fixture::new("verify");
-    let job = fixture.job();
-    run(
-        &job,
-        &["fetch", "--remote-url", &fixture.remote_url(), "-o", "out"],
-    );
+fn selects_the_paths_a_pipeline_names() {
+    let registry = Registry::new("select");
+    let job = registry.job("job");
+    let url = registry.url();
 
-    assert_eq!(
-        run(&job, &["verify", "-o", "out", "--porcelain"]),
-        "ok\t17\tdata/\nok\t8\tmodel.bin\n"
-    );
-
-    // A file added inside a tracked directory changes the directory's identity
-    // just as an edited one does.
-    write(&job.join("out/data/extra.bin"), "gamma\n");
-    fs::remove_file(job.join("out/model.bin")).unwrap();
-
-    let failed = avc(&job, &["verify", "-o", "out", "--porcelain"]);
-    assert_eq!(failed.status.code(), Some(1));
-    let report = String::from_utf8_lossy(&failed.stdout);
-    assert!(report.contains("modified\t23\tdata/"), "{report}");
-    assert!(report.contains("missing\t0\tmodel.bin"), "{report}");
-}
-
-/// Pointer selection: named files, a directory to scan, and stdin.
-#[test]
-fn selects_the_pointers_a_pipeline_names() {
-    let fixture = Fixture::new("select");
-    let job = fixture.job();
-    let url = fixture.remote_url();
-
+    // A pointer path names its artifact, so `git diff --name-only` output can
+    // be piped in unchanged.
     let one = run(
         &job,
         &[
             "fetch",
-            "model.bin.avc",
-            "--remote-url",
+            "--repo",
             &url,
+            "models/gpt/weights.bin.avc",
             "-o",
             "out",
             "--porcelain",
         ],
     );
-    assert_eq!(one, "downloaded\t1\t8\tmodel.bin\n");
-    assert!(!job.join("out/data").exists(), "only the named pointer");
+    assert_eq!(one, "downloaded\t1\t12\tmodels/gpt/weights.bin\n");
+    assert!(!job.join("out/models/bert").exists());
 
     // A path that names nothing is a typo, not an empty selection.
-    let missing = avc(&job, &["fetch", "absent.avc", "--remote-url", &url]);
+    let missing = avc(
+        &job,
+        &["fetch", "--repo", &url, "models/absent", "-o", "out"],
+    );
     assert_eq!(missing.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("absent.avc"));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("models/absent"));
 
-    // Outside a repository and with no remote named, the error has to say how
-    // to name one rather than complain about Git.
-    let unconfigured = avc(&job, &["fetch"]);
-    assert_eq!(unconfigured.status.code(), Some(1));
-    let message = String::from_utf8_lossy(&unconfigured.stderr);
-    assert!(message.contains("--remote-url"), "{message}");
+    // A reference that does not exist is an operational failure, not a data
+    // one, so a pipeline can tell "retry this" from "fix your commit".
+    let bad_ref = avc(&job, &["fetch", "--repo", &url, "--ref", "no-such-branch"]);
+    assert_eq!(bad_ref.status.code(), Some(3));
+}
+
+/// The same commands still work in a checkout, where the pointers are already
+/// on disk and paths mean what they do everywhere else in AVC.
+#[test]
+fn works_inside_a_checkout_without_a_repo_url() {
+    let registry = Registry::new("local");
+    let source = registry.source();
+
+    // The artifacts are still present from publishing, so ask for the state of
+    // one project rather than a transfer.
+    assert_eq!(
+        run(&source, &["verify", "models/bert", "--porcelain"]),
+        "ok\t3\tmodels/bert/tokenizer.json\nok\t13\tmodels/bert/weights.bin\n"
+    );
+
+    // Prefix selection reaches the repository commands too.
+    let listed = run(&source, &["list", "models", "--porcelain"]);
+    assert_eq!(listed.lines().count(), 3, "{listed}");
+    assert!(run(&source, &["push", "models/bert"]).contains("up-to-date"));
+
+    // Run from a subdirectory, paths still resolve against the repository root
+    // rather than the current directory.
+    assert_eq!(
+        run(
+            &source.join("models"),
+            &["verify", "models/gpt", "--porcelain"]
+        ),
+        "ok\t12\tmodels/gpt/weights.bin\n"
+    );
 }
 
 /// Every regular file beneath `root`.

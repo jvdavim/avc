@@ -41,9 +41,11 @@ hashed and cached, and a manifest naming them becomes one more object, so the
 directory is a single artifact behind a single `data.avc` pointer — see
 [Concepts](concepts.md#directories).
 
-In a pipeline, `avc fetch` skips all of that: it downloads artifacts straight
-from the remote to the paths their pointers name, with no clone, no `avc init`,
-and no cache — see [CI/CD](ci-cd.md).
+In a pipeline, `avc fetch` skips all of that. Given a Git URL and a path inside
+the repository, it downloads just that path's artifacts to where their pointers
+say, with no clone, no `avc init`, and no cache — and no bucket to name, since
+the object store comes from the repository's own configuration. See
+[CI/CD](ci-cd.md).
 
 `avc push` uploads the cached bytes to a remote — a local directory, Amazon S3,
 or any S3-compatible service such as MinIO, Cloudflare R2, Ceph, or Backblaze B2.
@@ -94,6 +96,8 @@ avc/
     │                       #   remote/: file and S3 transport, SigV4 signing
     └── avc-cli/            # the `avc` binary and MVP workflows
                             #   ci.rs: fetch and verify, built for pipelines
+                            #   registry.rs: pointers, from Git or from disk
+                            #   git.rs: shallow reads of a repository reference
                             #   ui.rs: ASCII tables and color detection
 ```
 

@@ -2,28 +2,78 @@
 
 How to get artifacts into a build, and how to prove you got the right ones.
 
-Two commands exist for this and nothing else:
+An AVC repository is an **artifact registry**. One Git repository can hold the
+models, datasets, and archives of a dozen projects, and a job that needs one of
+them should pay for one of them. So the commands below are given a *repository*
+and a *path inside it* — never a bucket, and never the whole thing unless that
+is what you asked for.
 
-| Command | What it does | What it needs |
-| --- | --- | --- |
-| [`avc fetch`](#avc-fetch) | Downloads artifacts straight from the remote | A remote URL, credentials, and pointer files |
-| [`avc verify`](#avc-verify) | Checks artifacts on disk against their pointers | Pointer files and the artifacts |
+| Command | What it does |
+| --- | --- |
+| [`avc fetch`](#avc-fetch) | Downloads the artifacts at a path |
+| [`avc list`](#avc-list) | Shows what is stored at a path |
+| [`avc verify`](#avc-verify) | Checks artifacts on disk against their pointers |
 
-Neither needs a Git repository, an `avc init`, or a local cache.
+None of them needs a clone, an `avc init`, or a local cache.
 
 ## The 30-second version
 
 ```yaml
-- run: avc fetch --remote-url s3://my-bucket/artifacts --output .
+- run: avc fetch --repo https://github.com/acme/artifacts models/bert --output .
   env:
     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 ```
 
-That scans the checkout for `.avc` pointer files, downloads exactly the objects
-they name, verifies each one as it streams, and writes it to the path its
-pointer says. Nothing else is written — no cache, no state directory, no
-`.gitignore` edits.
+```text
+fetching 2 artifacts from https://github.com/acme/artifacts@a4f21c0be931 (HEAD)
+  objects    https://s3.eu-west-1.amazonaws.com/acme-artifacts
+  into       .
+
+downloaded   models/bert/tokenizer.json (3 B)
+downloaded   models/bert/weights.bin (878.9 MiB)
+
+fetched 2 objects (878.9 MiB) for 2 artifacts
+```
+
+Notice what is *not* in that command: a bucket, a prefix, an endpoint, or a list
+of files. AVC reads the pointers at that Git reference, learns the object store
+from the repository's own `.avc/config.toml`, and downloads exactly the objects
+the pointers under `models/bert` name — verifying each as it streams, straight to
+the path the pointer says.
+
+---
+
+## The two halves of a repository
+
+An AVC repository lives in two places:
+
+| Half | Holds | Who sets it up |
+| --- | --- | --- |
+| **Git** | Pointer files, and `.avc/config.toml` | Committed like any other file |
+| **Object store** | The artifact bytes | Once, with `avc remote add` |
+
+A pointer says *which object*; the configuration says *which store*. Both travel
+together in the same commit, so a consumer only ever needs the first address:
+
+```bash
+avc fetch --repo https://github.com/acme/artifacts models/bert -o .
+```
+
+This is why credentials, not coordinates, are the only thing a pipeline
+configures. Move the bucket, change the endpoint, migrate provider — consumers do
+not change, because they never named it. If you do need to override it for one
+run (a mirror, an air-gapped copy), `--remote-url` still takes an object-store
+URL directly.
+
+The Git half is cheap to read. Artifacts are gitignored, so a shallow one-commit
+checkout of an artifact registry is its pointer files and its configuration —
+kilobytes of text — read into a temporary directory that is deleted when the
+command ends. Nothing is written to your workspace but the artifacts you asked
+for.
+
+> Reading from `--repo` shells out to `git`, so the `git` command must be on
+> `PATH`. Everything else in AVC works without it.
 
 ---
 
@@ -33,102 +83,119 @@ pointer says. Nothing else is written — no cache, no state directory, no
 
 | | `avc pull` | `avc fetch` |
 | --- | --- | --- |
-| Git worktree | required | not used |
-| `avc init` / `.avc/config.toml` | required | not used |
-| Remote | from tracked config | from a URL or `$AVC_REMOTE_URL` |
+| Needs a clone | yes, the whole repository | no, one shallow ref |
+| Needs `avc init` | yes | no |
+| Object store | from the checkout's config | from the repository's config |
+| Selecting artifacts | paths in *your* checkout | paths in the registry |
 | Local cache | always populated | none by default, `--cache` optional |
 | Disk used | 2x the artifact size | 1x |
-| S3 permissions | `GetObject`, and `ListBucket` for `list` | `GetObject` only |
-| Selecting artifacts | repository-relative paths | pointer files, a directory, or stdin |
+| S3 permissions | `GetObject`, plus `ListBucket` for `list` | `GetObject` only |
 
 The disk difference is not academic. `pull` writes every object into
 `.avc/cache` and then copies it into the worktree, so a job pulling 40 GB of
 checkpoints needs 80 GB of runner disk — and then throws the cache away when the
-job ends. `fetch` streams from the remote to the destination path, hashing as it
+job ends. `fetch` streams from the store to the destination path, hashing as it
 writes, so a 40 GB artifact costs 40 GB and a few megabytes of RSS.
 
-Use `pull` when the job really is a checkout of a developer's repository and you
-want the cache. Use `fetch` everywhere else.
+Use `pull` when the job really is a developer's checkout and you want the cache.
+Use `fetch` everywhere else.
 
 ---
 
 ## `avc fetch`
 
 ```text
-avc fetch [<pointer>...] [--remote-url <url> | --remote <name>]
+avc fetch [<path>...] [--repo <git-url>] [--ref <ref>]
+          [--remote <name>] [--remote-url <url>]
           [--output <dir>] [--cache <dir>]
           [--force] [--dry-run] [--porcelain]
 ```
 
-### Choosing the remote
+### Naming the repository
 
-One of these, in order of precedence:
-
-| Source | Example | Repository needed |
+| Source | Example | Needs a checkout |
 | --- | --- | --- |
-| `--remote-url` | `--remote-url s3://my-bucket/artifacts` | no |
-| `$AVC_REMOTE_URL` | `AVC_REMOTE_URL=s3://my-bucket/artifacts` | no |
-| `--remote <name>` | `--remote origin` | yes — reads `.avc/config.toml` |
-| the default remote | *(nothing)* | yes — reads `.avc/config.toml` |
+| `--repo` | `--repo https://github.com/acme/artifacts` | no |
+| `$AVC_REPO` | `AVC_REPO=https://github.com/acme/artifacts` | no |
+| *(neither)* | reads the pointers already on disk | yes |
 
-`--remote-url` takes any URL `avc remote add` takes: `s3://`, `s3+https://`,
-`s3+http://`, and `file://`. Setting `AVC_REMOTE_URL` once at the top of a
-pipeline keeps every job's command line to `avc fetch`.
+`--ref` (or `$AVC_REF`, default `HEAD`) selects a branch, a tag, or a commit.
+`HEAD` means the repository's default branch. Pin a tag or a commit for anything
+reproducible:
 
-If neither a URL nor a repository is available, the error says so:
-
-```text
-avc: not inside a Git worktree; outside a repository, name the remote with
---remote-url <url> or set AVC_REMOTE_URL
+```bash
+avc fetch --repo https://github.com/acme/artifacts --ref v2.1.0 models/bert -o .
 ```
 
-### Choosing the artifacts
+The commit a reference resolved to is printed in the heading — `@a4f21c0be931`
+above — so a log records exactly which version of a moving branch a build used.
+
+Any URL `git` understands works, including `git@host:org/repo.git` and
+`file:///path/to/repo`. A commit SHA needs a server that allows fetching one
+directly, which the major hosts do.
+
+### Naming the path
+
+Positional arguments are paths **inside the repository**:
 
 | Argument | Selects |
 | --- | --- |
-| *(none)* | every `.avc` pointer beneath the current directory |
-| `model.bin.avc` | that one artifact |
-| `models/` | every `.avc` pointer beneath `models/` |
-| `-` | newline-separated pointer paths read from stdin |
+| *(none)* | every artifact in the repository |
+| `models/bert/weights.bin` | that one artifact |
+| `models/bert` | every artifact beneath it |
+| `models/bert/weights.bin.avc` | the same artifact; the `.avc` is stripped |
+| `data` (a tracked directory) | that directory artifact, whole |
+| `-` | newline-separated paths read from stdin |
 
-`.git`, `.avc`, and `target` are skipped when scanning, and symlinks are never
-followed. Results are sorted by artifact path, so two runs of the same job
-produce the same log.
+A trailing `/` is optional everywhere. An exact match always wins over a prefix,
+so a directory artifact named `data` is one artifact rather than a prefix over
+anything that happens to start with those letters.
 
-Stdin is there so a pipeline can select with the tools it already has:
+This is the same path language `avc push`, `avc pull`, and `avc checkout` use in
+a checkout, so `avc push models/bert` and `avc fetch models/bert` mean the same
+thing on either side of the pipeline.
+
+Stdin lets a job select with the tools it already has:
 
 ```bash
 # only the artifacts this commit changed
 git diff --name-only HEAD~1 -- '*.avc' | avc fetch -
 ```
 
-Naming a pointer that does not exist is an error, not an empty selection — a
-typo in a pipeline should fail the job rather than silently fetch nothing.
+Naming a path that matches nothing is an error, not an empty selection — a typo
+in a pipeline should fail the job rather than silently fetch nothing.
+
+> **Not yet supported:** naming a path *inside* a tracked directory. `avc fetch
+> data/raw` works only if `data/raw` is itself a tracked artifact; a directory
+> artifact is fetched whole. See the [roadmap](roadmap.md).
 
 ### Where files land
 
-`--output` (`-o`) is the root the pointers' paths are resolved against; it
-defaults to the current directory. A pointer for `models/final.safetensors`
-fetched with `-o /srv/app` lands at `/srv/app/models/final.safetensors`. Parent
-directories are created as needed.
+`--output` (`-o`) is the root the pointers' paths are resolved against. A pointer
+for `models/bert/weights.bin` fetched with `-o /srv/app` lands at
+`/srv/app/models/bert/weights.bin`; parent directories are created as needed. The
+layout inside the repository is preserved, which is what makes a fetch into a
+checkout land exactly where `avc pull` would have put it.
 
-A directory artifact materializes as its files and nothing else — the manifest
-that names them stays in AVC's bookkeeping and is never written into the output
-tree.
+With `--repo`, `--output` defaults to the current directory. Without it — when
+pointers come from a checkout — it defaults to that repository's root, so a
+command run from a subdirectory still puts artifacts where their paths say.
+
+A directory artifact materializes as its files and nothing else; the manifest
+naming them stays in AVC's bookkeeping and is never written into the output.
 
 ### Re-running a job
 
-`fetch` is idempotent and cheap to repeat. Before transferring anything it
-checks what is already on disk:
+`fetch` is idempotent and cheap to repeat. Before transferring anything it checks
+what is already on disk:
 
 ```text
-up-to-date   model.bin (4.0 GiB)
+up-to-date   models/bert/weights.bin (878.9 MiB)
 ```
 
 A file whose contents already hash to what the pointer claims is left alone and
-costs one local read instead of a download. That makes `fetch` safe to put in a
-step that reruns, and makes a retried job skip everything the first attempt
-finished.
+costs one local read instead of a download. That makes `fetch` safe in a step
+that reruns, and makes a retried job skip everything the first attempt finished.
 
 A file that exists but **differs** is a refusal, not an overwrite:
 
@@ -136,14 +203,14 @@ A file that exists but **differs** is a refusal, not an overwrite:
 avc: refusing to replace data/a.bin: it differs from its pointer; use --force
 ```
 
-A fresh workspace never hits this. A reused runner workspace might, and
-`--force` is the answer there — it is the same rule, and the same escape hatch,
-that `avc checkout` uses.
+A fresh workspace never hits this. A reused runner workspace might, and `--force`
+is the answer there — the same rule, and the same escape hatch, that `avc
+checkout` uses.
 
 ### Caching between jobs
 
 `--cache <dir>` (or `$AVC_CACHE_DIR`) makes `fetch` read from and write to a
-content-addressed cache directory, which a runner can persist between jobs:
+content-addressed cache directory a runner can persist between jobs:
 
 ```yaml
 - uses: actions/cache@v4
@@ -153,26 +220,15 @@ content-addressed cache directory, which a runner can persist between jobs:
 - run: avc fetch --cache .avc-cache --output .
 ```
 
-Cache entries are verified by re-hashing before they are used, and an entry that
-fails is deleted and re-downloaded. The key above is content-addressed by
-construction: when no pointer changed, nothing was fetched.
+Cache entries are verified by re-hashing before use, and one that fails is
+deleted and re-downloaded. The key above is content-addressed by construction:
+when no pointer changed, nothing was fetched.
 
 This costs disk — the cache holds a second copy of every object — so it is worth
 it when the artifacts are large *and* the runner's cache is faster than your
 object store. Without `--cache`, nothing is duplicated.
 
 ### Output
-
-```text
-fetching 3 artifacts from https://s3.eu-west-1.amazonaws.com/my-bucket
-  into       .
-
-downloaded   models/final.safetensors (4.0 GiB)
-from-cache   data/ (1204 files, 812.5 MiB)
-up-to-date   config.bin (2.1 KiB)
-
-fetched 1 object (4.0 GiB) for 3 artifacts from https://s3.eu-west-1.amazonaws.com/my-bucket
-```
 
 | Word | Meaning |
 | --- | --- |
@@ -183,8 +239,8 @@ fetched 1 object (4.0 GiB) for 3 artifacts from https://s3.eu-west-1.amazonaws.c
 
 The object and byte counts are artifact content only. Reading a directory's
 manifest is not counted: it is a few bytes of metadata `fetch` must read to know
-what else to ask for, and counting it would make a directory that is entirely
-up to date report a download on every run.
+what else to ask for, and counting it would make a directory that is entirely up
+to date report a download on every run.
 
 Identical files are transferred once even with no cache, whether they are two
 paths inside one directory artifact or two separate artifacts.
@@ -194,8 +250,8 @@ paths inside one directory artifact or two separate artifacts.
 `--porcelain` prints one tab-separated line per artifact and nothing else:
 
 ```text
-downloaded	1	4294967296	models/final.safetensors
-up-to-date	0	0	config.bin
+downloaded	1	921174016	models/bert/weights.bin
+up-to-date	0	0	models/bert/tokenizer.json
 ```
 
 | Column | Value |
@@ -213,31 +269,100 @@ than against the table.
 `--dry-run` reports exactly what a real run would transfer and writes nothing:
 
 ```bash
-avc fetch --dry-run --porcelain | awk -F'\t' '{ bytes += $3 } END { print bytes }'
+avc fetch --repo "$AVC_REPO" models --dry-run --porcelain \
+  | awk -F'\t' '{ bytes += $3 } END { print bytes }'
 ```
 
 It still reads directory manifests, because that is the only way to know what a
-directory contains. It never reads or writes artifact bytes.
+directory contains. It never reads or writes artifact bytes, and never touches
+the cache.
+
+---
+
+## `avc list`
+
+```text
+avc list [<path>...] [--repo <git-url>] [--ref <ref>]
+         [--remote <name>] [--remote-url <url>] [--porcelain]
+```
+
+Browsing a registry, without downloading anything. Availability is resolved with
+a single listing of the object store, so a repository with a thousand artifacts
+costs one round trip.
+
+**With no path**, every artifact in the repository. A tracked directory is one
+row, because it is one artifact:
+
+```text
+everything in https://github.com/acme/artifacts@a4f21c0be931 (HEAD)
+  objects    https://s3.eu-west-1.amazonaws.com/acme-artifacts
+
+PATH                             SIZE  OBJECT        REMOTE
+data/                         4.2 GiB  e59967c656df  available
+models/bert/tokenizer.json        3 B  ca3d163bab05  available
+models/bert/weights.bin     878.9 MiB  90e38fb2627b  available
+models/gpt/weights.bin      390.6 MiB  348ce6621a96  missing
+
+4 artifacts, 5.4 GiB: 3 available, 1 missing
+```
+
+**With a prefix**, just that corner of it — which is how you find out what a
+project owns without reading the whole registry:
+
+```bash
+avc list --repo https://github.com/acme/artifacts models/bert
+```
+
+**With a tracked directory named exactly**, the files stored inside it:
+
+```bash
+avc list --repo https://github.com/acme/artifacts data
+```
+
+```text
+PATH                      SIZE  OBJECT        REMOTE
+data/raw/2024-01.csv   1.1 GiB  87428fc52280  available
+data/raw/2024-02.csv   1.2 GiB  0263829989b6  available
+data/raw/2024-03.csv   1.9 GiB  55a54008ad1b  available
+
+3 files, 4.2 GiB: 3 available, 0 missing
+```
+
+Reading that list needs the directory's manifest, which `list` fetches when it is
+not already local. A manifest is a few bytes per file; artifact bytes are still
+never downloaded.
+
+`REMOTE` reads `available` only when every object the row needs is on the store —
+for a directory, its manifest *and* every file it names, since a half-uploaded
+directory cannot be restored.
+
+`--porcelain` prints `<path>\t<bytes>\t<algorithm:full-hash>\t<remote-state>`
+with no heading, table, or summary.
 
 ---
 
 ## `avc verify`
 
 ```text
-avc verify [<pointer>...] [--output <dir>] [--porcelain]
+avc verify [<path>...] [--repo <git-url>] [--ref <ref>]
+           [--output <dir>] [--porcelain]
 ```
 
-Re-hashes what is on disk and compares it with what the pointers claim, using
-nothing but the two — no remote, no credentials, no cache, no repository. It
-exits `1` if anything is missing or differs, which makes it a gate.
+Re-hashes what is on disk and compares it with what the pointers claim. No object
+store is contacted and no credentials are read — the pointers and the bytes are
+everything it needs. It exits `1` if anything is missing or differs, which makes
+it a gate.
 
 ```text
-STATUS         SIZE  ARTIFACT
-ok        195.3 KiB  models/final.safetensors
-modified       20 B  data/
-missing           -  config.bin
+verifying 3 artifacts against https://github.com/acme/artifacts@a4f21c0be931 (HEAD)
+  in         .
 
-3 artifacts checked: 1 ok, 2 not matching
+STATUS        SIZE  ARTIFACT
+ok             3 B  models/bert/tokenizer.json
+ok       878.9 MiB  models/bert/weights.bin
+missing          -  models/gpt/weights.bin
+
+3 artifacts checked: 2 ok, 1 not matching
 ```
 
 | Status | Meaning |
@@ -250,28 +375,39 @@ For a directory, `modified` covers a file edited, added, removed, or renamed
 anywhere beneath it: the directory's identity is the hash of the manifest of its
 contents, so any of those changes it.
 
-`--porcelain` prints `<status>\t<bytes on disk>\t<path>`.
+Because it takes `--repo`, it answers a question a checksum file cannot: *does
+this deployed directory still match commit `a4f21c0` of the registry?*
+
+```bash
+avc verify --repo https://github.com/acme/artifacts --ref v2.1.0 models -o /srv/app
+```
 
 Useful places for it:
 
 - **After a fetch into a workspace you do not control**, before you trust it.
 - **After a build**, to prove nothing overwrote an input.
-- **At the start of a job that inherited a workspace** from an earlier stage, to
-  fail fast rather than build against half a dataset.
+- **At the start of a job that inherited a workspace** from an earlier stage.
+- **On a running host**, to detect drift against a released tag.
 
-`avc verify` accepts the same pointer selection as `avc fetch`.
+`--porcelain` prints `<status>\t<bytes on disk>\t<path>`.
 
-> Finding no pointers is not a failure: it prints `no AVC pointers found` and
-> exits `0`. If a gate must not pass on an empty selection, name the pointers
-> explicitly — `avc verify models/final.safetensors.avc` — rather than relying
-> on the directory scan.
+> Finding no artifacts is not a failure: it prints `no AVC pointers found` and
+> exits `0`. If a gate must not pass on an empty selection, name the paths
+> explicitly rather than relying on the default of "everything".
 
 ---
 
 ## Credentials
 
-AVC reads provider-standard environment variables first, which is where every CI
-system puts secrets. Nothing needs to be written to disk.
+Two different things may need authenticating, and they are unrelated:
+
+| For | Uses |
+| --- | --- |
+| Reading pointers from `--repo` | Whatever `git` is configured with — an SSH key, a token in the URL, a credential helper |
+| Reading bytes from the object store | The environment variables below |
+
+AVC reads provider-standard variables first, which is where every CI system puts
+secrets. Nothing needs to be written to disk.
 
 | Variable | Purpose |
 | --- | --- |
@@ -284,13 +420,16 @@ system puts secrets. Nothing needs to be written to disk.
 > **Not supported yet:** AVC does not call instance-metadata endpoints, so IAM
 > instance roles, ECS task roles, and SSO do not work on their own. Federated
 > credentials still work as long as something exchanges them for the three
-> environment variables above first — which is exactly what
+> variables above first — which is exactly what
 > `aws-actions/configure-aws-credentials` and `assume-role` wrappers do.
+
+A token in a `--repo` URL is never echoed: AVC redacts `user:password@` from any
+URL it prints, including inside Git's own error messages.
 
 ### Least privilege
 
-`avc fetch` issues `GetObject` requests and nothing else. A fetch-only job
-should have a policy that says so:
+`avc fetch` issues `GetObject` requests and nothing else. A fetch-only job should
+have a policy that says so:
 
 ```json
 {
@@ -298,15 +437,19 @@ should have a policy that says so:
   "Statement": [{
     "Effect": "Allow",
     "Action": "s3:GetObject",
-    "Resource": "arn:aws:s3:::my-bucket/artifacts/*"
+    "Resource": "arn:aws:s3:::acme-artifacts/*"
   }]
 }
 ```
 
-A job that also runs `avc push` needs `s3:PutObject` and `s3:ListBucket` on the
-bucket — `push` skips objects the remote already has by asking, and S3 answers a
-`HEAD` on a missing object with `403` rather than `404` when `ListBucket` is
-absent.
+`avc list` also needs `s3:ListBucket` on the bucket. A job that runs `avc push`
+needs `s3:PutObject` and `s3:ListBucket` — `push` skips objects the store already
+has by asking, and S3 answers a `HEAD` on a missing object with `403` rather than
+`404` when `ListBucket` is absent.
+
+Read access to the Git repository and read access to the bucket are separate
+grants, and Git is the one that can be scoped to a path. The object store cannot
+distinguish projects, because object keys contain no paths.
 
 ---
 
@@ -317,13 +460,14 @@ absent.
 | Code | Meaning | What a pipeline should do |
 | --- | --- | --- |
 | `0` | Success | Continue |
-| `1` | User, data, or state error — a pointer that does not match, a refusal to overwrite | Fail the build; retrying will not help |
+| `1` | User, data, or state error — a path that names nothing, a pointer that does not match, a refusal to overwrite | Fail the build; retrying will not help |
 | `2` | Invalid CLI usage | Fix the command |
-| `3` | Provider or operational failure — unreachable endpoint, bad signature, missing credentials | Safe to retry |
+| `3` | Provider or operational failure — unreachable endpoint, missing credentials, a ref that does not exist, `git` not installed | Safe to retry |
 
 ```bash
-avc fetch --output . || case $? in
-  3) echo "::warning::object store unreachable, retrying"; sleep 10; avc fetch --output . ;;
+avc fetch models/bert -o . || case $? in
+  3) echo "::warning::registry or store unreachable, retrying"
+     sleep 10; avc fetch models/bert -o . ;;
   *) exit 1 ;;
 esac
 ```
@@ -332,8 +476,8 @@ Errors go to stderr as `avc: <message>`.
 
 ## Color in logs
 
-Color is on when stdout is a terminal and off otherwise, so a redirected log
-gets plain text. Runners that render ANSI in their log viewer can ask for it:
+Color is on when stdout is a terminal and off otherwise, so a redirected log gets
+plain text. Runners that render ANSI in their log viewer can ask for it:
 
 ```bash
 export CLICOLOR_FORCE=1   # or: avc fetch --color always
@@ -348,6 +492,8 @@ never load-bearing — every line reads the same without it.
 
 ### GitHub Actions
 
+A project that consumes artifacts from a separate registry repository:
+
 ```yaml
 name: Train
 on: [push]
@@ -359,9 +505,10 @@ jobs:
       contents: read
       id-token: write        # for OIDC
     env:
-      AVC_REMOTE_URL: s3://my-bucket/artifacts
+      AVC_REPO: https://github.com/acme/artifacts
+      AVC_REF: v2.1.0        # pin it; HEAD is a moving target
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4     # this project, not the registry
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -371,31 +518,38 @@ jobs:
       - name: Install avc
         run: cargo install --git https://github.com/jvdavim/avc avc-cli
 
-      - name: Fetch artifacts
-        run: avc fetch --output .
+      - name: Fetch just this project's model
+        run: avc fetch models/bert --output .
 
       - name: Verify before building
-        run: avc verify --output .
+        run: avc verify models/bert --output .
 
       - run: ./train.sh
 ```
 
-`configure-aws-credentials` exports `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`, which is all AVC needs.
-
-To fetch only what a pull request touched:
+`configure-aws-credentials` exports `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+and `AWS_SESSION_TOKEN`, which is all AVC needs. For a private registry, give
+`git` a token:
 
 ```yaml
-      - run: |
-          git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.avc' \
-            | avc fetch -
+    env:
+      AVC_REPO: https://x-access-token:${{ secrets.REGISTRY_TOKEN }}@github.com/acme/artifacts
+```
+
+If the registry *is* this repository, drop `--repo` entirely and let `fetch` read
+the pointers `actions/checkout` already placed:
+
+```yaml
+      - uses: actions/checkout@v4
+      - run: avc fetch models/bert
 ```
 
 ### GitLab CI
 
 ```yaml
 variables:
-  AVC_REMOTE_URL: s3://my-bucket/artifacts
+  AVC_REPO: https://gitlab.example.com/acme/artifacts.git
+  AVC_REF: main
   AVC_CACHE_DIR: .avc-cache
 
 cache:
@@ -403,11 +557,12 @@ cache:
     files: ["**/*.avc"]
   paths: [.avc-cache]
 
-fetch:
+train:
   stage: build
   script:
-    - avc fetch --output .
-    - avc verify --output .
+    - avc fetch models/bert --output .
+    - avc verify models/bert --output .
+    - ./train.sh
 ```
 
 `AVC_CACHE_DIR` and GitLab's content-keyed cache pair well: the key changes only
@@ -415,8 +570,8 @@ when a pointer does, which is exactly when the objects change.
 
 ### Docker build
 
-Pointers are small and cache-friendly, so copy them first and fetch in their own
-layer. The artifacts are re-fetched only when a pointer actually changes.
+Fetch inside its own layer, so the artifacts are re-downloaded only when the
+reference actually moves.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -424,92 +579,107 @@ FROM rust:1.75 AS avc
 RUN cargo install --git https://github.com/jvdavim/avc avc-cli
 
 FROM debian:bookworm-slim AS artifacts
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=avc /usr/local/cargo/bin/avc /usr/local/bin/avc
 WORKDIR /artifacts
-COPY models/*.avc models/
+ARG AVC_REF=v2.1.0
 RUN --mount=type=secret,id=aws \
     . /run/secrets/aws && \
-    avc fetch --remote-url s3://my-bucket/artifacts --output .
+    avc fetch --repo https://github.com/acme/artifacts --ref "$AVC_REF" \
+              models/bert --output .
 
 FROM python:3.12-slim
 COPY --from=artifacts /artifacts/models /app/models
 ```
 
-Use a build secret mount rather than `ARG` for credentials: build arguments are
-recorded in the image history.
+Pinning `--ref` to a tag is what makes the layer cacheable and the image
+reproducible. Use a build secret mount rather than `ARG` for credentials: build
+arguments are recorded in the image history.
 
-### A deploy job with no repository at all
+### A deploy job with nothing checked out
 
-The minimum AVC needs is the pointer file. Commit it, ship it in the artifact
-bundle, or fetch it from your Git host — then:
+The minimum a deploy needs is the registry URL, a ref, and a path:
 
 ```bash
-curl -sSfLO https://git.example.com/api/v4/projects/1/repository/files/model.bin.avc/raw
-avc fetch model.bin.avc \
-  --remote-url s3://my-bucket/artifacts \
-  --output /srv/app
-avc verify model.bin.avc --output /srv/app
+avc fetch --repo https://github.com/acme/artifacts --ref v2.1.0 \
+          models/bert --output /srv/app
+avc verify --repo https://github.com/acme/artifacts --ref v2.1.0 \
+           models/bert --output /srv/app
 ```
 
-No clone, no `avc init`, no cache — just a pointer, a URL, and credentials.
+No clone, no `avc init`, no cache, no bucket name anywhere.
 
 ### Kubernetes init container
 
 ```yaml
 initContainers:
   - name: fetch-artifacts
-    image: ghcr.io/example/avc:0.1.0
-    args: ["fetch", "--output", "/artifacts"]
+    image: ghcr.io/acme/avc:0.1.0
+    args: ["fetch", "models/bert", "--output", "/artifacts"]
     env:
-      - name: AVC_REMOTE_URL
-        value: s3://my-bucket/artifacts
+      - name: AVC_REPO
+        value: https://github.com/acme/artifacts
+      - name: AVC_REF
+        value: v2.1.0
       - name: AWS_ACCESS_KEY_ID
         valueFrom: { secretKeyRef: { name: avc-s3, key: access-key-id } }
       - name: AWS_SECRET_ACCESS_KEY
         valueFrom: { secretKeyRef: { name: avc-s3, key: secret-access-key } }
     volumeMounts:
       - { name: artifacts, mountPath: /artifacts }
-      - { name: pointers,  mountPath: /workspace }
-    workingDir: /workspace
 ```
 
-Mount the pointer files at `workingDir` (a ConfigMap works — they are a few
-hundred bytes) and the shared volume at `--output`. The container exits `0` only
-once every artifact is on disk and verified, so the app container starts with
-the exact bytes the commit named.
+The container exits `0` only once every artifact is on disk and verified, so the
+app container starts with the exact bytes that tag names. Nothing has to be
+mounted in: the pointers come from Git.
 
-### Publishing from CI
+### Publishing to the registry
 
 Producing artifacts still uses the ordinary repository workflow, because writing
 a pointer is a change to the repository:
 
 ```bash
-avc commit models/final.safetensors
+git clone https://github.com/acme/artifacts && cd artifacts
+avc commit models/bert/weights.bin
 avc push
-git add models/final.safetensors.avc
-git commit -m "Update model"
-git push
+git commit -am "Update BERT weights" && git push
+git tag v2.2.0 && git push --tags
 ```
 
 Give that job `s3:PutObject` and `s3:ListBucket`; give every consuming job
-`s3:GetObject` only.
+`s3:GetObject` only. Tagging is what lets consumers pin.
 
 ---
 
 ## Troubleshooting
 
-**`remote object not found: <hash>`** — the pointer names an object that is not
-on the remote. Almost always a commit whose `avc push` never ran, or a push to a
-different bucket or prefix than the one the job reads. Check with
-`avc list --remote <name>` from a checkout.
+**`git ... failed: couldn't find remote ref`** (exit `3`) — the branch or tag in
+`--ref` does not exist on the server. Check the spelling; remember `HEAD` means
+the default branch.
+
+**`could not run git`** (exit `3`) — reading pointers from `--repo` needs the
+`git` command on `PATH`. Slim container images often do not have it; install it,
+or check out the registry yourself and drop `--repo`.
+
+**`no artifact at models/absent`** (exit `1`) — that path matches nothing at that
+reference. `avc list --repo … models` shows what is actually there.
+
+**`… configures no object store`** (exit `1`) — the repository has no
+`.avc/config.toml` with a remote in it. Run `avc remote add` in the repository
+and commit, or pass `--remote-url` for this run.
+
+**`remote object not found: <hash>`** (exit `1`) — the pointer names an object
+that is not in the store. Almost always a commit whose `avc push` never ran.
+Check with `avc list --repo … <path>`.
 
 **`refusing to replace <path>: it differs from its pointer; use --force`** — the
 workspace is not clean. Add `--force`, or clean the workspace between jobs.
 
 **`no credentials found for profile 'default'`** (exit `3`) — the environment
-variables are not reaching the process. Secrets are commonly scoped to a
-specific job or environment; confirm they are exported in the step that runs
-`avc`.
+variables are not reaching the process. Secrets are commonly scoped to a specific
+job or environment; confirm they are exported in the step that runs `avc`.
 
 **`provider adapter not implemented: gcs`** (exit `3`) — `gs://` and `az://`
 parse and configure but do not transfer yet. See the [roadmap](roadmap.md).
@@ -517,10 +687,6 @@ parse and configure but do not transfer yet. See the [roadmap](roadmap.md).
 **A large fetch fails partway through** — there is no resumable download yet, so
 a dropped connection restarts that object. Objects already written are not
 re-fetched, so re-running the same `avc fetch` resumes at object granularity.
-
-**`no AVC pointers found`** — the job is not in the directory holding the
-pointers, or the checkout did not include them. `fetch` scans the current
-directory, not `--output`.
 
 ## See also
 
