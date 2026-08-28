@@ -182,15 +182,29 @@ provider from a domain is how credentials end up sent to the wrong endpoint.
 | Scheme | Provider | Status in `0.1.0` |
 | --- | --- | --- |
 | `file://` | Local directory | **Implemented** |
-| `s3://` | Amazon S3 | Parses and stores; transfers unimplemented |
-| `s3+https://` | S3-compatible (MinIO, R2, Ceph) | Parses and stores; transfers unimplemented |
+| `s3://` | Amazon S3 | **Implemented** |
+| `s3+https://` | S3-compatible over TLS (MinIO, R2, Ceph, B2) | **Implemented** |
+| `s3+http://` | S3-compatible without TLS (local MinIO, Ceph) | **Implemented** |
 | `gs://` | Google Cloud Storage | Parses and stores; transfers unimplemented |
 | `az://` | Azure Blob Storage | Parses and stores; transfers unimplemented |
 
-Any other scheme, including a bare `https://`, is rejected.
+Any other scheme, including a bare `https://`, is rejected. A `gs://` or `az://`
+remote configures cleanly and then fails any transfer with an explicit
+unsupported-provider error and exit code `3` — never a silent no-op.
+
+S3 requests are signed with AWS Signature Version 4, implemented directly rather
+than through a cloud SDK. Credentials are never read from `.avc/config.toml`,
+which is committed; they come from the environment, then
+`.avc/config.local.toml`, then `~/.aws/credentials`.
+
+Transfers stream in bounded memory in both directions, and a download is hashed
+as it is written: an object whose bytes do not match the pointer is rejected
+before it enters the cache, so a truncated or tampered download never becomes a
+cache entry that later reads would trust.
 
 See [Configuration](configuration.md) for how each URL decomposes into bucket,
-prefix, and endpoint.
+prefix, and endpoint, and for the full credential, region, and endpoint
+precedence.
 
 ## Artifact states
 

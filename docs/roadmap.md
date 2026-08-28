@@ -75,9 +75,13 @@ need is already implemented and tested.
 
 ### Integration test suite
 
-Currently all five tests are `avc-core` unit tests; nothing exercises the CLI end
-to end. Wanted: a harness that builds a temporary Git worktree, runs real
-commands, and asserts on filesystem state and exit codes.
+`avc-core` carries unit tests plus a shared `ObjectStore` contract suite run
+against both backends — the S3 half against a real server when
+`AVC_TEST_S3_ENDPOINT` is set — and `avc-cli` drives the binary through the
+directory workflow and a `file://` round trip. Not yet covered: the rest of the
+commands end to end, S3 transport in CI, and exit codes for provider failures.
+Wanted: a harness that builds a temporary Git worktree, runs real commands, and
+asserts on filesystem state and exit codes.
 
 High value, no architectural knowledge required. **Good first issue.**
 

@@ -40,7 +40,10 @@ hashed and cached, and a manifest naming them becomes one more object, so the
 directory is a single artifact behind a single `data.avc` pointer — see
 [Concepts](concepts.md#directories).
 
-Cloning the repository gives you the pointer. `avc pull` fetches the bytes.
+`avc push` uploads the cached bytes to a remote — a local directory, Amazon S3,
+or any S3-compatible service such as MinIO, Cloudflare R2, Ceph, or Backblaze B2.
+Cloning the repository gives you the pointer. `avc pull` fetches the bytes back,
+verifying each object against its pointer as it downloads.
 Git history stays small, and the pointer gives you an exact, verifiable identity
 for the artifact at every commit.
 
@@ -51,9 +54,10 @@ for the artifact at every commit.
 - **Not Git LFS.** AVC needs no server-side Git hooks, no smudge/clean filters,
   and no `git lfs install` on every clone. The trade-off is that artifact
   materialization is an explicit `avc pull`, not automatic on checkout.
-- **Not yet a cloud tool.** S3, GCS, and Azure URLs parse and store correctly,
-  but transfers return an explicit unsupported-adapter error. Only `file://`
-  remotes move bytes today.
+- **Not yet a universal cloud tool.** `file://`, `s3://`, `s3+https://`, and
+  `s3+http://` remotes move bytes — Amazon S3 and anything that speaks the S3
+  API. `gs://` and `az://` URLs still parse and store correctly, but a transfer
+  returns an explicit unsupported-provider error.
 
 ## Design commitments
 
@@ -69,6 +73,9 @@ These hold across the prototype and are enforced by [`SPEC.md`](../SPEC.md):
   without `--force`. No command deletes remote data.
 - **Explicit providers.** A provider is chosen by URL scheme, never inferred
   from a hostname.
+- **Credentials stay out of Git.** Tracked config holds only bucket, prefix, and
+  endpoint. Keys come from the environment, an ignored `.avc/config.local.toml`,
+  or `~/.aws/credentials`.
 
 ## Project layout
 
@@ -79,6 +86,7 @@ avc/
 ├── docs/                   # this documentation
 └── crates/
     ├── avc-core/           # domain types: pointers, hashing, paths, remotes
+    │                       #   remote/: file and S3 transport, SigV4 signing
     └── avc-cli/            # the `avc` binary and MVP workflows
 ```
 

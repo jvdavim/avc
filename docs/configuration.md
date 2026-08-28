@@ -70,9 +70,9 @@ avc remote add local file:///srv/artifacts
 | `bucket_or_container` | `/srv/artifacts` |
 | `prefix` | *(empty)* |
 
-The only transport implemented in `0.1.0`. Useful for offline development,
-testing, and a shared network mount. The path must be absolute — `file://` URLs
-have no notion of a relative path.
+Useful for offline development, testing, and a shared network mount: it needs no
+credentials and no network. The path must be absolute — `file://` URLs have no
+notion of a relative path.
 
 ### `s3://` — Amazon S3
 
@@ -142,6 +142,10 @@ avc remote add origin az://my-container/artifacts
 ```
 
 Host is the container, path is the prefix.
+
+Both configure and store correctly, but no adapter transfers bytes yet: `push`,
+`pull`, and `list` fail with `provider adapter not implemented` and exit code
+`3`. See [Roadmap](roadmap.md#1-gcs-and-azure-adapters).
 
 ### Rejected URLs
 
