@@ -1,5 +1,6 @@
 mod ci;
 mod git;
+mod progress;
 mod registry;
 mod ui;
 
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use progress::Progress;
 use ui::{Cell, Column, Style, Table};
 
 /// Where the commands built for a pipeline are documented, mentioned in
@@ -43,6 +45,17 @@ struct Cli {
         default_value = "auto"
     )]
     color: ui::ColorChoice,
+
+    /// When to draw a progress bar for transfers. `auto` draws one at a
+    /// terminal and reports periodic lines in a CI pipeline instead.
+    #[arg(
+        long,
+        global = true,
+        value_name = "WHEN",
+        env = "AVC_PROGRESS",
+        default_value = "auto"
+    )]
+    progress: progress::ProgressChoice,
 }
 
 #[derive(Debug, Subcommand)]
@@ -293,6 +306,7 @@ impl From<avc_core::Error> for Failure {
 fn main() {
     let cli = Cli::parse();
     ui::init(cli.color);
+    progress::init(cli.progress);
     if let Err(failure) = run(cli.command) {
         eprintln!(
             "{} {}",
@@ -1086,6 +1100,13 @@ fn materialize(
     copy_atomic(&source, target)
 }
 
+/// What one artifact still has to send.
+struct Upload {
+    pointer: avc_core::Pointer,
+    /// In upload order: a directory's files first, its manifest last.
+    objects: Vec<(avc_core::ObjectId, u64)>,
+}
+
 fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     let repo = load_repo()?;
     let store = open_store(&repo, remote_name)?;
@@ -1097,40 +1118,45 @@ fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     ));
     println!();
 
+    // Deciding what to send before sending any of it is what gives the progress
+    // report a denominator. It costs no extra requests: asking the remote what
+    // it already holds is the same question the upload loop used to ask inline,
+    // one object at a time.
+    let plan = plan_upload(&repo, store.as_ref(), selected)?;
+    let objects: usize = plan.iter().map(|upload| upload.objects.len()).sum();
+    let planned_bytes = plan
+        .iter()
+        .flat_map(|upload| &upload.objects)
+        .map(|(_, size)| size)
+        .sum();
+    let progress = Progress::start("uploading", objects, planned_bytes);
+
     let mut uploaded = 0;
     let mut bytes = 0;
-    for pointer in selected {
-        // A directory expands into its manifest plus one object per file; the
-        // manifest is uploaded last, so it never names bytes that are not
-        // there yet.
-        let mut required = required_objects(&repo, &pointer)?;
-        required.reverse();
+    for upload in plan {
+        let path = display_path(&upload.pointer);
         let mut sent = 0;
         let mut sent_bytes = 0;
-        for (object_id, size) in required {
-            let source = cache_path(&repo, &object_id);
-            if !source.is_file() {
-                return Err(format!("cache object missing for {}", pointer.path).into());
-            }
-            // Objects are immutable, so re-uploading identical bytes is pure
-            // cost. Asking first turns a repeated push into a cheap no-op.
-            if store.exists(&object_id)? {
-                continue;
-            }
+        for (object_id, size) in &upload.objects {
+            progress.item(&path);
+            let source = cache_path(&repo, object_id);
             let mut file = File::open(&source).map_err(io_error)?;
-            store.put(&object_id, size, &mut file)?;
+            store.put(object_id, *size, &mut progress.meter(&mut file))?;
+            progress.object_done();
             sent += 1;
             sent_bytes += size;
         }
         uploaded += sent;
         bytes += sent_bytes;
+        // The bar sits on the line this one is about to occupy.
+        progress.clear();
         if sent == 0 {
-            ui::action("up-to-date", Style::Dim, &display_path(&pointer), None);
+            ui::action("up-to-date", Style::Dim, &path, None);
         } else {
             ui::action(
                 "uploaded",
                 Style::Ok,
-                &display_path(&pointer),
+                &path,
                 Some(&format!(
                     "{}, {}",
                     ui::plural(sent, "object"),
@@ -1139,6 +1165,7 @@ fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
             );
         }
     }
+    progress.finish();
     ui::summary(&format!(
         "pushed {} ({}) to {}",
         ui::plural(uploaded, "object"),
@@ -1146,6 +1173,61 @@ fn push(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
         store.describe()
     ));
     Ok(())
+}
+
+/// Work out which objects actually have to be uploaded.
+///
+/// Two things are dropped here. Objects the remote already holds: they are
+/// immutable and content-addressed, so re-uploading identical bytes is pure
+/// cost, and asking first turns a repeated push into a cheap no-op. And objects
+/// an earlier artifact in this same run is already sending, which is what the
+/// old inline `exists` check achieved by accident — the second artifact asked
+/// after the first had uploaded — and what has to be explicit now that every
+/// question is asked before any answer changes.
+fn plan_upload(
+    repo: &Repo,
+    store: &dyn avc_core::ObjectStore,
+    selected: Vec<avc_core::Pointer>,
+) -> Result<Vec<Upload>, Failure> {
+    let _status = progress::Status::show("checking the remote for objects it already has");
+    let mut plan = Vec::with_capacity(selected.len());
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for pointer in selected {
+        // A directory expands into its manifest plus one object per file; the
+        // manifest is uploaded last, so it never names bytes that are not
+        // there yet.
+        let mut required = required_objects(repo, &pointer)?;
+        required.reverse();
+        let mut objects = Vec::new();
+        for (object_id, size) in required {
+            if !cache_path(repo, &object_id).is_file() {
+                return Err(format!("cache object missing for {}", pointer.path).into());
+            }
+            if !claimed.insert(object_id.hash().to_owned()) {
+                continue;
+            }
+            if store.exists(&object_id)? {
+                continue;
+            }
+            objects.push((object_id, size));
+        }
+        plan.push(Upload { pointer, objects });
+    }
+    Ok(plan)
+}
+
+/// One object a pull expects to download, and the artifact path it belongs to.
+type Wanted = (avc_core::ObjectId, u64, String);
+
+/// What one artifact still has to receive.
+struct Download {
+    pointer: avc_core::Pointer,
+    /// In download order: a directory's manifest first, since nothing else
+    /// about it is known until that has landed and been verified.
+    objects: Vec<Wanted>,
+    /// Whether the files this directory names are still uncounted, because its
+    /// manifest was not in the cache when the plan was drawn up.
+    expands: bool,
 }
 
 fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
@@ -1159,45 +1241,59 @@ fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     ));
     println!();
 
+    // Planned from the cache alone, so it costs nothing and needs no network.
+    let plan = plan_download(&repo, selected)?;
+    let objects: usize = plan.iter().map(|download| download.objects.len()).sum();
+    let planned_bytes = plan
+        .iter()
+        .flat_map(|download| &download.objects)
+        .map(|(_, size, _)| size)
+        .sum();
+    let progress = Progress::start("downloading", objects, planned_bytes);
+
     let mut downloaded = 0;
     let mut bytes = 0;
-    for pointer in selected {
-        // The manifest has to land first: until it is here and verified, the
-        // rest of a directory's objects are unknown.
-        let object_id = pointer.object_id()?;
-        let mut received = usize::from(fetch_object(
-            &repo,
-            store.as_ref(),
-            &object_id,
-            pointer.object.size,
-            &pointer.path,
-        )?);
-        let mut received_bytes = if received > 0 { pointer.object.size } else { 0 };
-        if pointer.is_directory() {
-            let tree = load_tree(&repo, &pointer)?;
-            for entry in &tree.entries {
-                let label = format!("{}/{}", pointer.path, entry.path);
-                if fetch_object(
-                    &repo,
-                    store.as_ref(),
-                    &entry.object_id()?,
-                    entry.size,
-                    &label,
-                )? {
+    for download in plan {
+        let mut received = 0;
+        let mut received_bytes = 0;
+        for (object_id, size, label) in &download.objects {
+            progress.item(label);
+            if fetch_object(&repo, store.as_ref(), object_id, *size, label, &progress)? {
+                received += 1;
+                received_bytes += size;
+            }
+        }
+        // The manifest has arrived, so the files it names can be counted and
+        // added to a total that was drawn up without them.
+        if download.expands {
+            let wanted = wanted_entries(&repo, &download.pointer)?;
+            progress.add(
+                wanted.len(),
+                wanted.iter().map(|(_, size, _)| size).sum::<u64>(),
+            );
+            for (object_id, size, label) in &wanted {
+                progress.item(label);
+                if fetch_object(&repo, store.as_ref(), object_id, *size, label, &progress)? {
                     received += 1;
-                    received_bytes += entry.size;
+                    received_bytes += size;
                 }
             }
         }
         downloaded += received;
         bytes += received_bytes;
+        progress.clear();
         if received == 0 {
-            ui::action("up-to-date", Style::Dim, &display_path(&pointer), None);
+            ui::action(
+                "up-to-date",
+                Style::Dim,
+                &display_path(&download.pointer),
+                None,
+            );
         } else {
             ui::action(
                 "downloaded",
                 Style::Ok,
-                &display_path(&pointer),
+                &display_path(&download.pointer),
                 Some(&format!(
                     "{}, {}",
                     ui::plural(received, "object"),
@@ -1206,6 +1302,7 @@ fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
             );
         }
     }
+    progress.finish();
     println!();
     checkout_selected(paths, false)?;
     ui::summary(&format!(
@@ -1217,23 +1314,86 @@ fn pull(paths: &[String], remote_name: Option<&str>) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Work out which objects are missing from the cache, reading nothing but the
+/// cache itself.
+///
+/// A directory is only expanded when its manifest is already here. When it is
+/// not, the manifest is the one thing that can be planned for, and the files it
+/// names are counted the moment it arrives — which is honest about a total that
+/// genuinely is not knowable yet, and is the only case where the total grows
+/// mid-run.
+fn plan_download(repo: &Repo, selected: Vec<avc_core::Pointer>) -> Result<Vec<Download>, Failure> {
+    let mut plan = Vec::with_capacity(selected.len());
+    for pointer in selected {
+        // A file's own object, or a directory's manifest.
+        let object_id = pointer.object_id()?;
+        let cached = cache_path(repo, &object_id).is_file();
+        let mut objects = Vec::new();
+        if !cached {
+            objects.push((object_id, pointer.object.size, pointer.path.clone()));
+        }
+        // A directory can be read only once its manifest is on disk. Until then
+        // the files it names cannot be planned for at all.
+        let expands = pointer.is_directory() && !cached;
+        if pointer.is_directory() && !expands {
+            objects.extend(wanted_entries(repo, &pointer)?);
+        }
+        plan.push(Download {
+            pointer,
+            objects,
+            expands,
+        });
+    }
+    Ok(plan)
+}
+
+/// The files a tracked directory names that are not in the cache yet.
+fn wanted_entries(repo: &Repo, pointer: &avc_core::Pointer) -> Result<Vec<Wanted>, Failure> {
+    let mut wanted = Vec::new();
+    for entry in load_tree(repo, pointer)?.entries {
+        let object_id = entry.object_id()?;
+        if cache_path(repo, &object_id).is_file() {
+            continue;
+        }
+        wanted.push((
+            object_id,
+            entry.size,
+            format!("{}/{}", pointer.path, entry.path),
+        ));
+    }
+    Ok(wanted)
+}
+
 /// Ensure one object is in the cache, downloading it if it is not.
 ///
 /// Reports whether a transfer actually happened, so a pull that had nothing to
-/// do says nothing rather than claiming work.
+/// do says nothing rather than claiming work. A planned object can still turn
+/// out to be here — a directory holding the same bytes at two paths names one
+/// object twice — and that counts as progress even though nothing moved,
+/// because the bar measures a plan being worked through, not bytes for their
+/// own sake.
 fn fetch_object(
     repo: &Repo,
     store: &dyn avc_core::ObjectStore,
     object: &avc_core::ObjectId,
     size: u64,
     label: &str,
+    progress: &Progress,
 ) -> Result<bool, Failure> {
     let destination = cache_path(repo, object);
     if destination.is_file() {
+        progress.done(size);
         return Ok(false);
     }
     let mut body = store.get(object)?;
-    download_verified(&mut body, &destination, object, size, label)?;
+    download_verified(
+        &mut progress.meter(&mut *body),
+        &destination,
+        object,
+        size,
+        label,
+    )?;
+    progress.object_done();
     Ok(true)
 }
 

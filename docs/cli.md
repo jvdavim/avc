@@ -27,7 +27,8 @@ avc verify [<path>...] [--repo <git-url>] [--ref <ref>]
            [--output <dir>] [--porcelain]
 ```
 
-Every command also accepts `--color <auto|always|never>`.
+Every command also accepts `--color <auto|always|never>` and
+`--progress <auto|always|never>`.
 
 ## Global behavior
 
@@ -70,6 +71,33 @@ sequence.
 `--color <auto|always|never>` flag, the `AVC_COLOR` environment variable,
 `NO_COLOR`, `CLICOLOR_FORCE`, and `TERM=dumb` are all honored, in that order of
 precedence. Color is decoration: every line reads identically without it.
+
+**Progress.** `push`, `pull`, and `fetch` report how far along a transfer is,
+in one of two forms. At a terminal it is a bar on **stderr** that redraws in
+place and erases itself when the command finishes, so it never lands in a
+redirect and never scrolls the artifact lines away:
+
+```text
+uploading [=============>          ]  60%  24.5 MiB/41.0 MiB  models/bert/weights.bin  43.2 MiB/s  eta 0:11
+```
+
+In a CI pipeline it is an ordinary line on stdout every ten seconds instead,
+because a log is a file read after the fact and an animated line is thousands of
+unreadable fragments in it:
+
+```text
+uploading     60%  1/4 objects  24.5 MiB/41.0 MiB (43.2 MiB/s, eta 0:11)
+```
+
+A pipeline is recognized by `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`,
+`GITLAB_CI`, `JENKINS_URL`, `TEAMCITY_VERSION`, or `TF_BUILD` being set to
+anything other than `0`, `false`, or `no`; that test wins over the terminal
+check, since some runners do allocate a pseudo-terminal. A pipe, a redirect, and
+`TERM=dumb` get the same lines a pipeline does. `--progress <auto|always|never>`
+and `$AVC_PROGRESS` override the choice, `--porcelain` suppresses it entirely,
+and the bar is laid out for `$COLUMNS` columns, or 80 when that is unset.
+Everything progress reports is also in the summary each command prints when it
+finishes, so a run with progress turned off loses nothing.
 
 **Porcelain.** `status`, `list`, `fetch`, and `verify` accept `--porcelain`,
 which prints tab-separated records with no header, no summary, and no color.
@@ -386,7 +414,12 @@ pushed 4 objects (12.0 MiB) to https://s3.eu-west-1.amazonaws.com/my-bucket
 
 Objects already present on the remote are skipped — reported as
 `up-to-date` — because content-addressed objects are immutable and
-re-uploading identical bytes is pure cost. Uploads stream in bounded memory.
+re-uploading identical bytes is pure cost. Uploads stream in bounded memory,
+with [progress](#global-behavior) reported as they go.
+
+The remote is asked what it already holds for every selected object before the
+first byte is uploaded, which is what gives progress a total to measure against.
+It is the same set of `HEAD` requests either way, so it costs nothing extra.
 
 A directory uploads as its files followed by its manifest — `uploaded data/ (4
 objects, 12.0 MiB)` — in that order, so a manifest on the remote never names bytes that
@@ -430,7 +463,9 @@ Objects already in the cache are not re-downloaded.
 
 A directory downloads its manifest first — until that has arrived and been
 verified, the rest of its objects are unknown — then every file the manifest
-names, then materializes the tree.
+names, then materializes the tree. That is also the one case where the
+[progress](#global-behavior) total grows part way through: on a first pull, the
+files a directory contains are counted the moment its manifest names them.
 
 Each download is hashed as it is written and checked against its pointer's size
 and digest before it becomes visible in the cache. An object that does not match

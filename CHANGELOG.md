@@ -46,6 +46,19 @@ include a breaking format change. See
 - Terminal-aware color, honoring `--color <auto|always|never>`, `AVC_COLOR`,
   `NO_COLOR`, `CLICOLOR_FORCE`, and `TERM=dumb`. Color is decoration only:
   every line reads identically without it.
+- **Transfer progress** on `push`, `pull`, and `fetch`, in the form the run
+  calls for. At a terminal it is a bar on stderr — percentage, bytes, the file
+  moving, rate, and an estimate — redrawn in place and erased when the command
+  finishes, so it never lands in a redirect and never scrolls the artifact lines
+  away. In a CI pipeline it is an ordinary stdout line every ten seconds
+  instead, since a log is a file read after the fact and a redrawn line is
+  thousands of unreadable fragments in it. A pipeline is recognized by `CI`,
+  `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`, `GITLAB_CI`, `JENKINS_URL`,
+  `TEAMCITY_VERSION`, or `TF_BUILD`, ahead of the terminal test because some
+  runners allocate a pseudo-terminal; a pipe, a redirect, and `TERM=dumb` are
+  treated the same way. `--progress <auto|always|never>` and `AVC_PROGRESS`
+  override it, `--porcelain` suppresses it, and the summary each command prints
+  still says everything progress said. `$COLUMNS` sets the width, or 80.
 - `AVC_REPO`, `AVC_REF`, and `AVC_CACHE_DIR` environment variables, so a
   pipeline can configure the CI/CD commands once rather than on every command
   line. A `--repo` URL containing `user:password@` is redacted everywhere AVC

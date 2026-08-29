@@ -31,7 +31,8 @@ avc/
         ├── src/ci.rs           # fetch and verify: the CI/CD commands
         ├── src/registry.rs     # pointers and config, from Git or from disk
         ├── src/git.rs          # shallow reads of a repository reference
-        └── src/ui.rs           # ASCII tables, color detection, message vocabulary
+        ├── src/ui.rs           # ASCII tables, color detection, message vocabulary
+        └── src/progress.rs     # a bar for a terminal, periodic lines for a log
 ```
 
 The split is deliberate: **`avc-core` knows nothing about the filesystem layout
@@ -150,9 +151,9 @@ included.
 
 ## `avc-cli`
 
-Five modules: `main.rs` for the repository workflows, `registry.rs` and `git.rs`
+Six modules: `main.rs` for the repository workflows, `registry.rs` and `git.rs`
 for reading a repository however it is addressed, `ci.rs` for the commands built
-for a pipeline, and `ui.rs` for presentation.
+for a pipeline, and `ui.rs` and `progress.rs` for presentation.
 
 ### 1. Clap definitions
 
@@ -217,6 +218,30 @@ the wrong width.
 Color is resolved once into two atomics — stdout and stderr are decided
 separately, since one can be a terminal while the other is a file. Every
 command's `--porcelain` path bypasses `ui.rs` entirely.
+
+### 2d. `progress.rs` — watching a transfer
+
+One `Progress` type with two renderers, chosen once by `progress::init` from
+`--progress` and the environment: a bar redrawn on stderr for a terminal, and a
+line on stdout every ten seconds for a build agent, whose log is a file in which
+a carriage return is just a character. A build agent is tested for ahead of the
+terminal, because some of them allocate a pseudo-terminal.
+
+`Progress::meter` wraps a reader, so a single large object moves the bar as its
+bytes stream rather than jumping when it lands — the one thing that needs to
+reach inside a transfer, and the reason `ObjectStore::put` takes a `&mut dyn
+Read` it consumes exactly once. `clear` takes the terminal line back before a
+command prints an artifact line over it, and `Drop` does the same on the way out
+of an error, so a failure is never printed across a half-drawn bar.
+
+The counts a bar measures against come from a planning pass, which is what the
+`Upload` and `Download` plans in `main.rs` and `Fetcher::plan` in `ci.rs` are
+for. Each moves work that used to happen inline — asking a remote what it holds,
+reading a directory's manifest — ahead of the first byte, without adding a
+request or a read. Only a first `pull` of a tracked directory cannot be counted
+up front, since its manifest is what names the files; there the total grows as
+manifests arrive, and `percent` stays below 100 until every object is accounted
+for so a growing total cannot read as finished-then-not.
 
 ### 3. Filesystem helpers
 

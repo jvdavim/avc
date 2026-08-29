@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use crate::progress::Progress;
 use crate::registry::Registry;
 use crate::ui::{self, Cell, Column, Style, Table};
 use crate::{Failure, State};
@@ -157,6 +158,14 @@ struct Fetcher<'a> {
     args: &'a FetchArgs,
     /// Root the pointers' paths are resolved against.
     output: PathBuf,
+    /// What the run has got through so far.
+    ///
+    /// Unlike `push` and `pull`, this counts every object the selection names,
+    /// not only the ones that move: `fetch` earns its keep by re-hashing what
+    /// is already on disk, and on a directory of large files that is most of
+    /// the wall clock. A bar that ignored it would sit still through the part
+    /// of the run somebody is actually waiting on.
+    progress: Progress,
     /// Where each object has already landed during this run.
     ///
     /// A directory holding the same bytes at two paths names one object twice,
@@ -182,6 +191,8 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
         store,
         args,
         output: output_root(args.output.as_ref(), &registry),
+        // Replaced below, once the plan says how much there is to get through.
+        progress: Progress::off(),
         placed: std::collections::HashMap::new(),
     };
 
@@ -199,19 +210,30 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
         println!();
     }
 
+    let plan = fetcher.plan(&selected)?;
+    // `--porcelain` is a contract, and a progress line written into it is
+    // corruption rather than decoration.
+    if !args.porcelain {
+        fetcher.progress = Progress::start(
+            "fetching",
+            plan.iter().map(|item| item.files()).sum(),
+            plan.iter().map(|item| item.bytes()).sum(),
+        );
+    }
+
     let mut objects = 0;
     let mut bytes = 0;
-    for pointer in &selected {
-        let transfer = fetcher.artifact(pointer)?;
+    for item in &plan {
+        let transfer = fetcher.artifact(item)?;
         objects += transfer.objects;
         bytes += transfer.bytes;
         let (state, style) = transfer.state(args.dry_run);
-        let path = crate::display_path(pointer);
+        let path = crate::display_path(&item.pointer);
         if args.porcelain {
             println!("{state}\t{}\t{}\t{path}", transfer.objects, transfer.bytes);
             continue;
         }
-        let detail = if pointer.is_directory() {
+        let detail = if item.pointer.is_directory() {
             format!(
                 "{}, {}",
                 ui::plural(transfer.files, "file"),
@@ -220,10 +242,12 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
         } else {
             ui::size(transfer.total_bytes)
         };
+        fetcher.progress.clear();
         ui::action(state, style, &path, Some(&detail));
     }
 
     if !args.porcelain {
+        fetcher.progress.finish();
         ui::summary(&format!(
             "{} {} ({}) for {}",
             if args.dry_run {
@@ -239,14 +263,65 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
     Ok(())
 }
 
+/// One selected artifact, resolved: what it is and, for a directory, what it
+/// contains.
+struct Planned {
+    pointer: avc_core::Pointer,
+    tree: Option<avc_core::Tree>,
+}
+
+impl Planned {
+    /// Files this artifact is made of — one, or however many its manifest
+    /// names. The manifest itself is not one of them; see [`Transfer`].
+    fn files(&self) -> usize {
+        self.tree.as_ref().map_or(1, |tree| tree.entries.len())
+    }
+
+    fn bytes(&self) -> u64 {
+        self.tree
+            .as_ref()
+            .map_or(self.pointer.object.size, |tree| tree.total_size())
+    }
+}
+
 impl Fetcher<'_> {
-    /// Download one artifact: a file, or a directory's manifest and every file
-    /// that manifest names.
-    fn artifact(&mut self, pointer: &avc_core::Pointer) -> Result<Transfer, Failure> {
-        let mut transfer = Transfer::default();
-        if !pointer.is_directory() {
-            transfer.files = 1;
-            transfer.total_bytes = pointer.object.size;
+    /// Resolve every selected artifact down to the files it is made of.
+    ///
+    /// Manifests are read here rather than in the middle of the transfer, which
+    /// costs nothing — each is read exactly once either way — and buys an
+    /// honest total to measure against. A manifest is metadata of a few bytes
+    /// per file, never artifact content, so reading one is not a transfer a
+    /// pipeline should see reported, and it is read even on a dry run because
+    /// it is what decides the answer a dry run gives.
+    fn plan(&self, selected: &[avc_core::Pointer]) -> Result<Vec<Planned>, Failure> {
+        // Suppressed under `--porcelain` along with everything else that is not
+        // a record, even though this one is transient and lands on stderr.
+        let _status = (!self.args.porcelain)
+            .then(|| crate::progress::Status::show("reading directory manifests"));
+        selected
+            .iter()
+            .map(|pointer| {
+                let tree = match pointer.is_directory() {
+                    true => Some(self.manifest(pointer)?),
+                    false => None,
+                };
+                Ok(Planned {
+                    pointer: pointer.clone(),
+                    tree,
+                })
+            })
+            .collect()
+    }
+
+    /// Download one artifact: a file, or every file its manifest names.
+    fn artifact(&mut self, item: &Planned) -> Result<Transfer, Failure> {
+        let pointer = &item.pointer;
+        let mut transfer = Transfer {
+            files: item.files(),
+            total_bytes: item.bytes(),
+            ..Transfer::default()
+        };
+        let Some(tree) = &item.tree else {
             let target = self.output.join(&pointer.path);
             self.place(
                 &pointer.object_id()?,
@@ -256,14 +331,8 @@ impl Fetcher<'_> {
                 &mut transfer,
             )?;
             return Ok(transfer);
-        }
+        };
 
-        // The manifest decides what else to download, so it is read even on a
-        // dry run. It is metadata of a few bytes per file, never artifact
-        // content, and it is verified against the pointer before it is parsed.
-        let tree = self.manifest(pointer)?;
-        transfer.files = tree.entries.len();
-        transfer.total_bytes = tree.total_size();
         for entry in &tree.entries {
             let label = format!("{}/{}", pointer.path, entry.path);
             let target = self.output.join(&pointer.path).join(&entry.path);
@@ -333,9 +402,12 @@ impl Fetcher<'_> {
         label: &str,
         transfer: &mut Transfer,
     ) -> Result<(), Failure> {
+        self.progress.item(label);
         if target.exists() {
             let actual = avc_core::hash_file(target)?;
             if actual.size == size && actual.object == *object {
+                // Already correct, and proving it cost a full read of the file.
+                self.progress.done(size);
                 return Ok(());
             }
             if !self.args.force {
@@ -357,24 +429,46 @@ impl Fetcher<'_> {
         self.placed
             .insert(object.hash().to_owned(), target.to_path_buf());
         if self.args.dry_run {
+            self.progress.done(size);
             return Ok(());
         }
 
         match source {
-            Source::Copy(path) => crate::copy_atomic(&path, target),
+            Source::Copy(path) => {
+                crate::copy_atomic(&path, target)?;
+                self.progress.done(size);
+                Ok(())
+            }
             // The cacheless path, and the default: bytes go from the remote to
             // where they belong, hashed on the way, written exactly once.
             Source::Remote if self.args.cache.is_none() => {
                 let mut body = self.store.get(object)?;
-                crate::download_verified(&mut body, target, object, size, label)
+                // Metered, so a single large object still moves the bar.
+                crate::download_verified(
+                    &mut self.progress.meter(&mut *body),
+                    target,
+                    object,
+                    size,
+                    label,
+                )?;
+                self.progress.object_done();
+                Ok(())
             }
             // With a cache, the object lands there first so the next job can
             // skip the network, and the worktree copy comes off local disk.
             Source::Remote => {
                 let cached = self.cache_path(object).expect("a cache is configured");
                 let mut body = self.store.get(object)?;
-                crate::download_verified(&mut body, &cached, object, size, label)?;
-                crate::copy_atomic(&cached, target)
+                crate::download_verified(
+                    &mut self.progress.meter(&mut *body),
+                    &cached,
+                    object,
+                    size,
+                    label,
+                )?;
+                crate::copy_atomic(&cached, target)?;
+                self.progress.object_done();
+                Ok(())
             }
         }
     }

@@ -148,8 +148,10 @@ This is the sharpest edge in `0.1.0` and worth fixing early.
 
 ## Longer term
 
-- **Concurrent transfers**, with progress reporting. Uploading fifty artifacts
-  serially wastes most of the available bandwidth.
+- **Concurrent transfers.** Uploading fifty artifacts serially wastes most of
+  the available bandwidth. Progress reporting already exists and is written
+  around a single-threaded run; it will need a lock and a per-object accounting
+  of what is in flight.
 - **Resumable transfers** — multipart upload and ranged download, so a dropped
   connection does not restart a 40 GB push.
 - **Remote `gc`**, gated behind explicit confirmation. `SPEC.md` currently

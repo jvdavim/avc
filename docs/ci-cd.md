@@ -486,6 +486,36 @@ export CLICOLOR_FORCE=1   # or: avc fetch --color always
 `NO_COLOR=1`, `--color never`, and `AVC_COLOR=never` all turn it off. Color is
 never load-bearing — every line reads the same without it.
 
+## Progress in logs
+
+`fetch`, `push`, and `pull` report how far along a transfer is. In a pipeline
+that report is an ordinary line on stdout every ten seconds — never the
+in-place bar a workstation gets, because a log is a file read after the fact and
+a redrawn line is thousands of `\r`-separated fragments in it:
+
+```text
+fetching      62%  5/12 objects  480.0 MiB/1.2 GiB (12.3 MiB/s, eta 0:58)
+downloaded   models/bert/weights.bin (878.9 MiB)
+```
+
+The present participle is what distinguishes a progress line from the
+`downloaded` and `uploaded` lines that record what actually happened, so
+`grep -v '^fetching'` leaves the result intact. Nothing appears at all until a
+transfer has been running for ten seconds, so a job that moves a few megabytes
+prints exactly what it printed before this existed.
+
+A pipeline is recognized by `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`,
+`GITLAB_CI`, `JENKINS_URL`, `TEAMCITY_VERSION`, or `TF_BUILD` being set to
+anything but `0`, `false`, or `no` — and that test wins over the terminal check,
+since some runners allocate a pseudo-terminal. A pipe, a redirect, and
+`TERM=dumb` are treated the same way. If your runner is not on that list and
+gives `avc` a terminal, `--progress never` or `AVC_PROGRESS=never` turns
+progress off; `--porcelain` already implies it, since a progress line written
+into a machine-readable stream is corruption rather than decoration.
+
+Progress is never the only place a fact appears: the summary each command prints
+when it finishes says the same thing, so a job that suppresses it loses nothing.
+
 ---
 
 ## Recipes
