@@ -23,28 +23,38 @@ pub(crate) struct Registry {
     repo: Repo,
     /// How this registry is named in output — a URL and commit, or a path.
     description: String,
+    /// The worktree these artifacts belong in, when there is one.
+    ///
+    /// Distinct from `repo.root`, which is wherever the *pointers* were read
+    /// from. Those are the same directory for a plain local repository and
+    /// different for a revision of one: reading `v1.0.0` in a checkout puts the
+    /// pointers in a temporary directory, but the artifacts they name still
+    /// belong in the worktree the caller is standing in. A registry named by
+    /// URL has no worktree at all.
+    worktree: Option<PathBuf>,
     /// Held only to keep a temporary checkout alive for this registry's
     /// lifetime; dropping it deletes the directory `repo.root` points into.
     _checkout: Option<git::Checkout>,
 }
 
 impl Registry {
-    /// Open a repository from a Git URL, reading its pointers at `reference`.
+    /// Open a repository from a Git URL, reading its pointers at `revision`.
     ///
     /// Nothing but pointers and configuration is read: artifacts are gitignored,
     /// so the checkout is text, and the bytes come later from the object store.
-    pub(crate) fn from_git(url: &str, reference: &str) -> Result<Self, Failure> {
-        let checkout = git::Checkout::shallow(url, reference)?;
-        let description = format!("{}@{} ({reference})", git::redact(url), checkout.commit());
+    pub(crate) fn from_git(url: &str, revision: &str) -> Result<Self, Failure> {
+        let checkout = git::Checkout::at(url, revision)?;
+        let description = format!("{}@{} ({revision})", git::redact(url), checkout.commit());
         let repo = Repo::at(checkout.path().to_path_buf())?;
         Ok(Self {
             repo,
             description,
+            worktree: None,
             _checkout: Some(checkout),
         })
     }
 
-    /// Open a repository already on disk.
+    /// Open a repository already on disk, reading the pointers in it.
     ///
     /// The Git worktree root is preferred over the current directory, because a
     /// pointer's `path` is relative to the repository root and resolving it
@@ -56,21 +66,56 @@ impl Registry {
         };
         Ok(Self {
             description: root.display().to_string(),
+            worktree: Some(root.clone()),
             repo: Repo::at(root)?,
             _checkout: None,
         })
     }
 
+    /// Open one revision of a repository on disk.
+    ///
+    /// The pointers come out of Git rather than off the working tree, which is
+    /// the difference between "what this artifact is" and "what this artifact
+    /// was at `v1.0.0`". The artifacts themselves still belong to the worktree
+    /// the caller is standing in, so `avc fetch --ref v1.0.0` restores that
+    /// version into place and `avc verify --ref v1.0.0` checks what is on disk
+    /// against it.
+    pub(crate) fn from_revision(root: PathBuf, revision: &str) -> Result<Self, Failure> {
+        // Read the way any other repository is read, with the worktree itself
+        // as the URL. Git clones a path as readily as it clones a URL, and one
+        // code path means a revision means the same thing wherever it is named.
+        let checkout = git::Checkout::at(&root.display().to_string(), revision)?;
+        let description = format!("{}@{} ({revision})", root.display(), checkout.commit());
+        let repo = Repo::at(checkout.path().to_path_buf())?;
+        Ok(Self {
+            repo,
+            description,
+            worktree: Some(root),
+            _checkout: Some(checkout),
+        })
+    }
+
     /// Open whichever source the arguments describe.
-    pub(crate) fn open(url: Option<&str>, reference: &str) -> Result<Self, Failure> {
-        match url {
-            Some(url) => Self::from_git(url, reference),
-            None => Self::from_directory(None),
+    ///
+    /// A revision is optional, and its absence is not the same as `HEAD`. With
+    /// no revision, a local repository is read off the working tree — so a
+    /// pointer that has been written but not committed still counts, which is
+    /// what every other command does. Naming a revision, `HEAD` included, reads
+    /// the pointers Git holds at that commit instead.
+    pub(crate) fn open(url: Option<&str>, revision: Option<&str>) -> Result<Self, Failure> {
+        match (url, revision) {
+            (Some(url), revision) => Self::from_git(url, revision.unwrap_or("HEAD")),
+            (None, Some(revision)) => Self::from_revision(crate::find_root()?, revision),
+            (None, None) => Self::from_directory(None),
         }
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.repo.root
+    /// The worktree these artifacts belong in, if any. See [`Registry`].
+    ///
+    /// This, and not `repo.root`, is where a pointer's path is resolved
+    /// against: the two differ exactly when a revision was named.
+    pub(crate) fn worktree(&self) -> Option<&Path> {
+        self.worktree.as_deref()
     }
 
     /// The underlying repository, for the helpers that read its cache.
@@ -83,15 +128,6 @@ impl Registry {
 
     pub(crate) fn describe(&self) -> &str {
         &self.description
-    }
-
-    /// Whether this registry is a directory the caller can write into.
-    ///
-    /// A registry read from a Git URL lives in a temporary checkout that is
-    /// deleted when the command ends, so its root is not somewhere artifacts
-    /// may be materialized.
-    pub(crate) fn is_local(&self) -> bool {
-        self._checkout.is_none()
     }
 
     /// Every artifact this repository tracks, sorted by path.

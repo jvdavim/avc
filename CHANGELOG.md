@@ -21,12 +21,29 @@ include a breaking format change. See
   `--cache` for a runner that caches a directory between jobs, `--dry-run`, and
   `--force`. See the new [CI/CD guide](docs/ci-cd.md).
 - **A repository is addressed by its Git URL, not by its object store.**
-  `--repo <git-url>` and `--ref <ref>` (or `$AVC_REPO` and `$AVC_REF`) make
+  `--repo <git-url>` and `--ref <rev>` (or `$AVC_REPO` and `$AVC_REF`) make
   `fetch`, `verify`, and `list` read pointers from a shallow, text-only read of
-  one Git reference, and read the object store out of the `.avc/config.toml`
-  that came with them. A consumer never names a bucket, a prefix, or an
-  endpoint, so moving storage does not break them; `--remote-url` overrides it
-  for a single run. Reading from a Git URL requires the `git` command.
+  one revision, and read the object store out of the `.avc/config.toml` that
+  came with them. A consumer never names a bucket, a prefix, or an endpoint, so
+  moving storage does not break them; `--remote-url` overrides it for a single
+  run. Reading from a Git URL requires the `git` command.
+- **Any revision of a registry can be named.** `--ref` takes anything that
+  names one commit: a branch, a tag, `HEAD` for the default branch, a commit id
+  whole *or abbreviated*, or a fully qualified `refs/heads/…` or `refs/tags/…`
+  name for a repository where a branch and a tag collide. An abbreviated id is
+  resolved by fetching every branch and tag without their file contents, since a
+  prefix is not a name a server can look up — whole ids and tags stay a single
+  shallow fetch, and are what a pipeline should use. The commit a revision
+  resolved to is printed in the heading.
+- **`--ref` works inside a checkout**, with no `--repo`, reading the pointers
+  Git holds at that commit rather than the ones on disk — so `avc list --ref
+  v1.0.0` shows what a release shipped, `avc verify --ref v1.0.0` asks whether
+  the working tree still matches it, and `avc fetch --ref v1.0.0 --force`
+  restores that version in place. Artifacts belong to the worktree, not to the
+  temporary checkout the pointers were read out of. Omitting `--ref` is
+  deliberately *not* the same as `--ref HEAD`: with no revision a local
+  repository is read off the working tree, so an uncommitted pointer still
+  counts, as it does everywhere else.
 - **Path selection inside a repository**, shared by `commit`, `push`, `pull`,
   `checkout`, `remove`, `fetch`, `verify`, and `list`. A path matches an
   artifact exactly or acts as a directory prefix naming everything beneath it,

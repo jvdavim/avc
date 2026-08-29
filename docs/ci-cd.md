@@ -119,20 +119,61 @@ avc fetch [<path>...] [--repo <git-url>] [--ref <ref>]
 | `$AVC_REPO` | `AVC_REPO=https://github.com/acme/artifacts` | no |
 | *(neither)* | reads the pointers already on disk | yes |
 
-`--ref` (or `$AVC_REF`, default `HEAD`) selects a branch, a tag, or a commit.
-`HEAD` means the repository's default branch. Pin a tag or a commit for anything
-reproducible:
+### Naming the revision
+
+`--ref` (or `$AVC_REF`) selects which revision of the registry to read pointers
+at. Anything that names one commit works:
+
+| Revision | Example | Cost |
+| --- | --- | --- |
+| Default branch | *(omitted)*, or `HEAD` | one shallow fetch |
+| Branch | `--ref main` | one shallow fetch |
+| Tag | `--ref v2.1.0` | one shallow fetch |
+| Commit | `--ref a4f21c0be9315d0f2c8e...` | one shallow fetch |
+| Abbreviated commit | `--ref a4f21c0` | see below |
+| Fully qualified | `--ref refs/tags/v2.1.0` | one shallow fetch |
+
+Pin a tag or a commit for anything reproducible:
 
 ```bash
 avc fetch --repo https://github.com/acme/artifacts --ref v2.1.0 models/bert -o .
 ```
 
-The commit a reference resolved to is printed in the heading — `@a4f21c0be931`
+The commit a revision resolved to is printed in the heading — `@a4f21c0be931`
 above — so a log records exactly which version of a moving branch a build used.
 
+Reach for `refs/tags/…` or `refs/heads/…` only when a branch and a tag share a
+name; otherwise the short form means the same thing.
+
+**Abbreviated commits cost more.** A prefix is not a name, so no server can look
+one up: AVC falls back to fetching every branch and tag — commits and trees, but
+not file contents — and resolving the prefix locally. That is fine at a
+workstation and wasteful in a pipeline, where `${{ github.sha }}` and its
+equivalents are already whole. Name a tag, a branch, or a full commit in CI.
+
 Any URL `git` understands works, including `git@host:org/repo.git` and
-`file:///path/to/repo`. A commit SHA needs a server that allows fetching one
-directly, which the major hosts do.
+`file:///path/to/repo`.
+
+### A revision inside a checkout
+
+`--ref` works without `--repo` too, against the repository you are standing in.
+It reads the pointers Git holds at that commit rather than the ones on disk, so
+it answers "what was this artifact at `v1.0.0`?" without moving your branch:
+
+```bash
+avc list   --ref v1.0.0            # what that release shipped
+avc verify --ref v1.0.0            # does the working tree still match it?
+avc fetch  --ref v1.0.0 --force    # put that version back
+```
+
+The artifacts belong to your worktree, not to the temporary checkout the
+pointers came out of, so `fetch` writes them where they normally live — and, as
+always, refuses to overwrite anything that differs until told to with `--force`.
+
+Omitting `--ref` is not the same as `--ref HEAD`. With no revision, a local
+repository is read off the working tree, so a pointer you have written but not
+committed still counts, exactly as it does for `status` or `push`. Naming a
+revision always reads Git.
 
 ### Naming the path
 
@@ -685,9 +726,14 @@ Give that job `s3:PutObject` and `s3:ListBucket`; give every consuming job
 
 ## Troubleshooting
 
-**`git ... failed: couldn't find remote ref`** (exit `3`) — the branch or tag in
-`--ref` does not exist on the server. Check the spelling; remember `HEAD` means
-the default branch.
+**`no branch, tag, or commit named ...`** (exit `3`) — the revision in `--ref`
+does not exist on the server. Check the spelling; remember that omitting `--ref`
+means the default branch, and that a name is looked up as a ref before it is
+tried as a commit id.
+
+**`no commit in ... matches ...`** (exit `3`) — the revision looked like a commit
+id, but no commit on any branch or tag has it as a prefix, or more than one does.
+Name more characters, or name the branch or tag instead.
 
 **`could not run git`** (exit `3`) — reading pointers from `--repo` needs the
 `git` command on `PATH`. Slim container images often do not have it; install it,

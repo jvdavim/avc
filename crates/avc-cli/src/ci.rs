@@ -40,14 +40,11 @@ pub struct FetchArgs {
     #[arg(long, value_name = "URL", env = "AVC_REPO")]
     pub repo: Option<String>,
 
-    /// Branch, tag, or commit to read pointers at.
-    #[arg(
-        long = "ref",
-        value_name = "REF",
-        env = "AVC_REF",
-        default_value = "HEAD"
-    )]
-    pub reference: String,
+    /// Revision to read pointers at: a branch, a tag, a commit, or a fully
+    /// qualified `refs/...` name. Defaults to the repository's default branch,
+    /// or, in a checkout, to the pointers on disk.
+    #[arg(long = "ref", value_name = "REV", env = "AVC_REF")]
+    pub reference: Option<String>,
 
     /// Named object store, when the repository configures more than one.
     #[arg(long, value_name = "NAME")]
@@ -90,14 +87,11 @@ pub struct VerifyArgs {
     #[arg(long, value_name = "URL", env = "AVC_REPO")]
     pub repo: Option<String>,
 
-    /// Branch, tag, or commit to read pointers at.
-    #[arg(
-        long = "ref",
-        value_name = "REF",
-        env = "AVC_REF",
-        default_value = "HEAD"
-    )]
-    pub reference: String,
+    /// Revision to read pointers at: a branch, a tag, a commit, or a fully
+    /// qualified `refs/...` name. Defaults to the repository's default branch,
+    /// or, in a checkout, to the pointers on disk.
+    #[arg(long = "ref", value_name = "REV", env = "AVC_REF")]
+    pub reference: Option<String>,
 
     /// Directory the artifacts were written into.
     #[arg(long, short, value_name = "DIR")]
@@ -178,7 +172,7 @@ struct Fetcher<'a> {
 
 /// Fetch the artifacts a repository path names, straight to where they belong.
 pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
-    let registry = Registry::open(args.repo.as_deref(), &args.reference)?;
+    let registry = Registry::open(args.repo.as_deref(), args.reference.as_deref())?;
     let selected = select(&registry, &args.paths)?;
     if selected.is_empty() {
         return report_nothing_found(args.porcelain);
@@ -529,7 +523,7 @@ enum Source {
 /// from another — and, with `--repo`, as a check that a deployed directory
 /// still matches a particular commit of the registry.
 pub fn verify(args: &VerifyArgs) -> Result<(), Failure> {
-    let registry = Registry::open(args.repo.as_deref(), &args.reference)?;
+    let registry = Registry::open(args.repo.as_deref(), args.reference.as_deref())?;
     let selected = select(&registry, &args.paths)?;
     if selected.is_empty() {
         return report_nothing_found(args.porcelain);
@@ -605,13 +599,17 @@ fn select(registry: &Registry, paths: &[String]) -> Result<Vec<avc_core::Pointer
 ///
 /// Defaulting to the repository root rather than the current directory is what
 /// makes a pointer's path mean the same thing in a pipeline as it does in a
-/// checkout. A registry read from a Git URL has no meaningful root of its own —
-/// its checkout is a temporary directory — so that case falls back to here.
+/// checkout. The root is the worktree the registry belongs to, which is not
+/// where its pointers were read from: `--ref v1.0.0` in a checkout reads
+/// pointers out of a temporary directory, but the artifacts they name still
+/// belong in the worktree. A registry named by URL has no worktree, so that
+/// case falls back to here.
 fn output_root(explicit: Option<&PathBuf>, registry: &Registry) -> PathBuf {
     match explicit {
         Some(path) => path.clone(),
-        None if registry.is_local() => registry.root().to_path_buf(),
-        None => PathBuf::from("."),
+        None => registry
+            .worktree()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
     }
 }
 

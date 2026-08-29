@@ -75,6 +75,20 @@ fn git(directory: &Path, arguments: &[&str]) {
     );
 }
 
+fn git_output(directory: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(directory)
+        .output()
+        .expect("these tests need the git command");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 /// Commit everything, with an identity that does not depend on the machine.
 fn commit(directory: &Path, message: &str) {
     git(directory, &["add", "--all"]);
@@ -512,6 +526,169 @@ fn works_inside_a_checkout_without_a_repo_url() {
         ),
         "ok\t12\tmodels/gpt/weights.bin\n"
     );
+}
+
+/// Publish a second version of one artifact, leaving the first tagged
+/// `v1.0.0`, and answer the commit the first version lives at.
+fn publish_two_versions(source: &Path) -> String {
+    git(source, &["tag", "v1.0.0"]);
+    let first = git_output(source, &["rev-parse", "HEAD"]);
+    write(
+        &source.join("models/gpt/weights.bin"),
+        "gpt weights, retrained\n",
+    );
+    run(source, &["commit", "models/gpt/weights.bin"]);
+    run(source, &["push"]);
+    commit(source, "Retrain gpt");
+    first
+}
+
+/// A revision is whatever names a commit, and all the spellings of one commit
+/// have to reach the same artifacts.
+#[test]
+fn a_registry_can_be_read_at_any_revision() {
+    let registry = Registry::new("revisions");
+    let source = registry.source();
+    let first = publish_two_versions(&source);
+    let job = registry.job("job");
+
+    let at = |revision: &str| {
+        run(
+            &job,
+            &[
+                "list",
+                "--repo",
+                &registry.url(),
+                "--ref",
+                revision,
+                "--porcelain",
+            ],
+        )
+    };
+
+    // A tag, a whole commit id, an abbreviated one — which no server can look
+    // up, so it costs a search of the history — and a fully qualified name,
+    // for a repository where a branch and a tag share one.
+    for revision in ["v1.0.0", &first, &first[..8], "refs/tags/v1.0.0"] {
+        let listed = at(revision);
+        assert!(
+            listed.contains("models/gpt/weights.bin\t12\t"),
+            "{revision}: {listed}"
+        );
+    }
+    // A branch, and the default branch by way of `HEAD`, name the newer one.
+    for revision in ["main", "HEAD", "refs/heads/main"] {
+        let listed = at(revision);
+        assert!(
+            listed.contains("models/gpt/weights.bin\t23\t"),
+            "{revision}: {listed}"
+        );
+    }
+
+    // Fetching at a revision brings back that version's bytes, not the tip's.
+    run(
+        &job,
+        &[
+            "fetch",
+            "models/gpt",
+            "--repo",
+            &registry.url(),
+            "--ref",
+            "v1.0.0",
+            "-o",
+            ".",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(job.join("models/gpt/weights.bin")).unwrap(),
+        "gpt weights\n"
+    );
+}
+
+/// In a checkout, a revision reads what Git holds rather than what is on disk.
+///
+/// Accepting `--ref` and ignoring it would make `avc verify --ref` a gate that
+/// passes whatever the worktree contains, which is worse than not offering one.
+#[test]
+fn a_revision_in_a_checkout_reads_git_rather_than_the_working_tree() {
+    let registry = Registry::new("revision-local");
+    let source = registry.source();
+    publish_two_versions(&source);
+
+    // What is on disk is the retrained model, and that is what a command with
+    // no revision sees — including a pointer written but not yet committed.
+    let disk = run(&source, &["list", "--porcelain"]);
+    assert!(disk.contains("models/gpt/weights.bin\t23\t"), "{disk}");
+    let tagged = run(&source, &["list", "--ref", "v1.0.0", "--porcelain"]);
+    assert!(tagged.contains("models/gpt/weights.bin\t12\t"), "{tagged}");
+
+    // The worktree matches the commit it was built from, and does not match the
+    // older tag — which is the whole point of being able to name one.
+    run(&source, &["verify"]);
+    let against_tag = avc(&source, &["verify", "--ref", "v1.0.0"]);
+    assert_eq!(against_tag.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&against_tag.stdout).contains("models/gpt/weights.bin"),
+        "{}",
+        String::from_utf8_lossy(&against_tag.stdout)
+    );
+
+    // Artifacts still belong to the worktree rather than to the temporary
+    // checkout the pointers were read out of, so restoring a version puts it
+    // back where it was — and refuses to overwrite until told to.
+    let refused = avc(&source, &["fetch", "models/gpt", "--ref", "v1.0.0"]);
+    assert_eq!(refused.status.code(), Some(1));
+    run(
+        &source,
+        &["fetch", "models/gpt", "--ref", "v1.0.0", "--force"],
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("models/gpt/weights.bin")).unwrap(),
+        "gpt weights\n"
+    );
+}
+
+#[test]
+fn a_revision_that_names_nothing_says_so_plainly() {
+    let registry = Registry::new("revision-missing");
+    let job = registry.job("job");
+
+    let missing = avc(
+        &job,
+        &[
+            "fetch",
+            "--repo",
+            &registry.url(),
+            "--ref",
+            "no-such-thing",
+            "-o",
+            ".",
+        ],
+    );
+    // A provider failure, which `SPEC.md` reserves exit code 3 for.
+    assert_eq!(missing.status.code(), Some(3));
+    let message = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        message.contains("no branch, tag, or commit named `no-such-thing`"),
+        "{message}"
+    );
+
+    // A name that could have been a commit id is answered in those terms,
+    // because that is the search that actually failed.
+    let hex = avc(
+        &job,
+        &[
+            "fetch",
+            "--repo",
+            &registry.url(),
+            "--ref",
+            "deadbeef",
+            "-o",
+            ".",
+        ],
+    );
+    let message = String::from_utf8_lossy(&hex.stderr);
+    assert!(message.contains("no commit in"), "{message}");
 }
 
 /// Every regular file beneath `root`.

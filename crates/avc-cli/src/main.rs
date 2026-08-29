@@ -165,14 +165,11 @@ struct ListArgs {
     /// Git URL of the repository to list. Needs no clone and no local checkout.
     #[arg(long, value_name = "URL", env = "AVC_REPO")]
     repo: Option<String>,
-    /// Branch, tag, or commit to read pointers at.
-    #[arg(
-        long = "ref",
-        value_name = "REF",
-        env = "AVC_REF",
-        default_value = "HEAD"
-    )]
-    reference: String,
+    /// Revision to read pointers at: a branch, a tag, a commit, or a fully
+    /// qualified `refs/...` name. Defaults to the repository's default branch,
+    /// or, in a checkout, to the pointers on disk.
+    #[arg(long = "ref", value_name = "REV", env = "AVC_REF")]
+    reference: Option<String>,
     #[arg(long)]
     remote: Option<String>,
     /// Object store URL, overriding the one the repository configures.
@@ -830,7 +827,7 @@ pub(crate) fn display_path(pointer: &avc_core::Pointer) -> String {
 /// dumping it: a prefix shows the artifacts beneath it, and a tracked directory
 /// shows the files inside it.
 fn list(args: &ListArgs) -> Result<(), Failure> {
-    let registry = registry::Registry::open(args.repo.as_deref(), &args.reference)?;
+    let registry = registry::Registry::open(args.repo.as_deref(), args.reference.as_deref())?;
     let selected = registry.select(&args.paths)?;
     if selected.is_empty() {
         if !args.porcelain {

@@ -218,16 +218,17 @@ one — `avc fetch` and `avc verify` — read theirs from the environment:
 | Variable | Equivalent flag | Applies to |
 | --- | --- | --- |
 | `AVC_REPO` | `--repo <git-url>` | `fetch`, `verify`, `list` |
-| `AVC_REF` | `--ref <ref>` | `fetch`, `verify`, `list` |
+| `AVC_REF` | `--ref <rev>` | `fetch`, `verify`, `list` |
 | `AVC_CACHE_DIR` | `--cache <dir>` | `avc fetch` |
 | `AVC_COLOR` | `--color <auto\|always\|never>` | every command |
+| `AVC_PROGRESS` | `--progress <auto\|always\|never>` | every command |
 
 Setting `AVC_REPO` and `AVC_REF` once at the top of a pipeline reduces every job
 to `avc fetch <path>`. A flag on the command line always wins over the variable.
 
 Note what is *not* in that table: there is no environment variable naming a
 bucket. The object store belongs to the repository, read from the
-`.avc/config.toml` at the reference being consumed, so a consumer configures
+`.avc/config.toml` at the revision being consumed, so a consumer configures
 credentials and nothing else. `--remote-url` overrides it for a single run when
 you genuinely need a different store — a mirror, or an air-gapped copy.
 

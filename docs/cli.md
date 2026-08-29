@@ -9,7 +9,7 @@ avc init
 avc remote add <name> <provider-url>
 avc remote list
 avc add <path> [<path>...]
-avc list [<path>...] [--repo <git-url>] [--ref <ref>] [--remote <name>] [--porcelain]
+avc list [<path>...] [--repo <git-url>] [--ref <rev>] [--remote <name>] [--porcelain]
 avc status [--porcelain]
 avc commit <path> [<path>...] [--force]
 avc push [<path>...] [--remote <name>]
@@ -20,10 +20,10 @@ avc gc [--remote <name>] [--dry-run]
 avc doctor
 
 # built for CI/CD -- see docs/ci-cd.md
-avc fetch [<path>...] [--repo <git-url>] [--ref <ref>]
+avc fetch [<path>...] [--repo <git-url>] [--ref <rev>]
           [--remote <name>] [--remote-url <url>]
           [--output <dir>] [--cache <dir>] [--force] [--dry-run] [--porcelain]
-avc verify [<path>...] [--repo <git-url>] [--ref <ref>]
+avc verify [<path>...] [--repo <git-url>] [--ref <rev>]
            [--output <dir>] [--porcelain]
 ```
 
@@ -43,9 +43,32 @@ requires `.avc/config.toml` to exist, otherwise:
 
 **Repository-free commands.** `avc fetch`, `avc verify`, and `avc list` need
 neither when given `--repo <git-url>`: they read the pointers, and the object
-store the pointers belong to, out of a shallow read of that Git reference. That
-is what lets a build agent name a repository and a path inside it without
-cloning anything. See [CI/CD](ci-cd.md).
+store the pointers belong to, out of a shallow read of one revision of that
+repository. That is what lets a build agent name a repository and a path inside
+it without cloning anything. See [CI/CD](ci-cd.md).
+
+**Revisions.** Those same three commands take `--ref <rev>` (or `$AVC_REF`),
+which names the revision of the registry to read pointers at. Anything that
+names one commit works: a branch, a tag, `HEAD` for the default branch, a commit
+id whole or abbreviated, or a fully qualified `refs/heads/…` or `refs/tags/…`
+name for a repository where a branch and a tag collide. The commit it resolved
+to is printed in the heading, so a log records what a moving branch meant on the
+day it ran.
+
+`--ref` works with or without `--repo`. Inside a checkout it reads the pointers
+Git holds at that commit rather than the ones on disk, which is what makes
+`avc verify --ref v1.0.0` a real question about the working tree. The artifacts
+still belong to the worktree, so `avc fetch --ref v1.0.0 --force` restores that
+version in place.
+
+Omitting `--ref` is not the same as `--ref HEAD`. With no revision, a local
+repository is read off the working tree — an uncommitted pointer still counts,
+as everywhere else — while naming a revision always reads Git.
+
+An abbreviated commit id costs more than the rest: a prefix is not a name, so no
+server can look one up, and AVC falls back to fetching every branch and tag
+(commits and trees, not file contents) to resolve it locally. Name a tag, a
+branch, or a whole commit id in a pipeline.
 
 **Pointer discovery.** Commands that operate on "all artifacts" find them by
 recursively scanning the worktree for files ending in `.avc`, skipping the `.git`
@@ -317,7 +340,7 @@ mtime/size fast path yet — see [Roadmap](roadmap.md).
 Browse what a repository stores, **without downloading artifact bytes**.
 
 ```bash
-avc list [<path>...] [--repo <git-url>] [--ref <ref>]
+avc list [<path>...] [--repo <git-url>] [--ref <rev>]
          [--remote <name>] [--remote-url <url>] [--porcelain]
 ```
 
@@ -615,7 +638,7 @@ reference.
 Download the artifacts at a path in a repository, straight to where they belong.
 
 ```bash
-avc fetch [<path>...] [--repo <git-url>] [--ref <ref>]
+avc fetch [<path>...] [--repo <git-url>] [--ref <rev>]
           [--remote <name>] [--remote-url <url>]
           [--output <dir>] [--cache <dir>]
           [--force] [--dry-run] [--porcelain]
@@ -636,10 +659,10 @@ fetched 2 objects (878.9 MiB) for 2 artifacts
 | --- | --- | --- |
 | `<path>...` | every artifact | Paths inside the repository — an artifact, a prefix, or `-` for stdin |
 | `--repo <url>` | `$AVC_REPO`, else the checkout on disk | Git URL to read pointers from |
-| `--ref <ref>` | `$AVC_REF`, else `HEAD` | Branch, tag, or commit |
+| `--ref <rev>` | `$AVC_REF`, else the default branch, or the pointers on disk | Revision to read pointers at: a branch, tag, commit, or `refs/...` name |
 | `--remote <name>` | the repository's default | Named object store, when it configures several |
 | `--remote-url <url>` | the repository's own | Object store URL, overriding what the repository says |
-| `-o`, `--output <dir>` | repository root, or `.` with `--repo` | Root the pointers' paths are resolved against |
+| `-o`, `--output <dir>` | worktree root, or `.` with `--repo` | Root the pointers' paths are resolved against |
 | `--cache <dir>` | `$AVC_CACHE_DIR`, else none | Read from and populate a cache directory |
 | `--force` | off | Overwrite files whose contents differ from their pointer |
 | `--dry-run` | off | Report the transfer without making it |
@@ -690,7 +713,7 @@ is not counted.
 Check artifacts on disk against their pointers, using nothing but the two.
 
 ```bash
-avc verify [<path>...] [--repo <git-url>] [--ref <ref>]
+avc verify [<path>...] [--repo <git-url>] [--ref <rev>]
            [--output <dir>] [--porcelain]
 ```
 
@@ -710,8 +733,8 @@ missing          -  models/gpt/weights.bin
 | --- | --- | --- |
 | `<path>...` | every artifact | Same path selection as `avc fetch` |
 | `--repo <url>` | `$AVC_REPO`, else the checkout on disk | Git URL to read pointers from |
-| `--ref <ref>` | `$AVC_REF`, else `HEAD` | Branch, tag, or commit |
-| `-o`, `--output <dir>` | repository root, or `.` with `--repo` | Root the artifacts were written into |
+| `--ref <rev>` | `$AVC_REF`, else the default branch, or the pointers on disk | Revision to read pointers at: a branch, tag, commit, or `refs/...` name |
+| `-o`, `--output <dir>` | worktree root, or `.` with `--repo` | Root the artifacts were written into |
 | `--porcelain` | off | `<status>\t<bytes on disk>\t<path>`, no heading or summary |
 
 No object store is contacted and no credentials are read. Exits `1` if any

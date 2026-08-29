@@ -186,6 +186,23 @@ lands there is pointer files and configuration: text. That is the whole reason a
 consumer can name a Git URL instead of a bucket — the two halves of a repository
 travel in the same commit, and reading one is cheap.
 
+A revision is whatever names one commit, and almost all of them cost that single
+shallow fetch: the server resolves the name. The exception is an abbreviated
+commit id, which is a prefix rather than a name and so is never advertised;
+`fetch_history` falls back to every branch and tag with `--filter=blob:none` and
+resolves it locally. That fallback is guarded twice over — the revision has to
+*look* like a commit id, and the first failure has to be the server saying it
+has no such ref — so an unreachable host or a missing credential is reported as
+what it was instead of being retried more expensively.
+
+`Registry` keeps two roots apart, and the distinction is the reason `--ref`
+works inside a checkout. `repo.root` is where the *pointers* were read from,
+which for any named revision is a temporary directory. `worktree` is where the
+*artifacts* belong, which is the caller's repository whenever there is one. They
+coincide for a plain local read, differ for a local revision, and only the
+second is absent for a registry named by URL — which is exactly the rule
+`ci::output_root` needs.
+
 `registry::select` resolves path selectors against a set of pointers, matching a
 path exactly or as a directory prefix. It is shared with `main.rs`, so
 `avc push models/bert` and `avc fetch models/bert` mean the same thing, and there
