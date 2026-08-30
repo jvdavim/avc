@@ -51,6 +51,15 @@ pub struct LocalRemoteOverride {
     /// custom endpoint is set, which is what every S3-compatible server wants.
     #[serde(default)]
     pub force_path_style: Option<bool>,
+    /// PEM bundle of certificate authorities to verify servers against,
+    /// replacing the built-in roots. For a network that terminates TLS at a
+    /// proxy signing with a private CA. See [`super::tls`].
+    #[serde(default)]
+    pub ca_bundle: Option<String>,
+    /// Verify against the operating system's trust store rather than the
+    /// built-in roots — where a managed machine already has its private CA.
+    #[serde(default)]
+    pub use_system_certs: Option<bool>,
 }
 
 /// Resolve credentials for `remote`, consulting the chain above.

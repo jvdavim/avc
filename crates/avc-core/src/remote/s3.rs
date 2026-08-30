@@ -13,6 +13,7 @@ use url::Url;
 
 use super::credentials::{self, Credentials, LocalRemoteOverride};
 use super::sigv4::{format_amz_date, CanonicalRequest, SigningContext, EMPTY_PAYLOAD_SHA256};
+use super::tls::{self, TrustRoots};
 use super::{object_from_key, object_key, xml, ObjectStore, RemoteObject};
 use crate::{Error, ObjectId, RemoteConfig, Result};
 
@@ -29,6 +30,8 @@ pub struct S3Settings {
     pub endpoint: String,
     pub force_path_style: bool,
     pub credentials: Credentials,
+    /// Which certificate authorities may vouch for the server.
+    pub trust_roots: TrustRoots,
 }
 
 impl S3Settings {
@@ -58,6 +61,7 @@ impl S3Settings {
             endpoint,
             force_path_style,
             credentials: credentials::resolve(remote, local)?,
+            trust_roots: tls::resolve(local),
         })
     }
 }
@@ -90,17 +94,21 @@ impl S3Store {
                 .map_err(|_| Error::InvalidRemote(settings.bucket.clone()))?;
             virtual_host
         };
+        // Let 4xx and 5xx arrive as responses, not errors: S3 explains itself
+        // in the XML body, and a 404 is an ordinary answer to `exists`.
+        let agent = ureq::Agent::new_with_config({
+            let builder = ureq::config::Config::builder().http_status_as_error(false);
+            // The bundle is read now rather than at the first request, so
+            // an unreadable one is reported as itself.
+            match tls::configure(&settings.trust_roots)? {
+                Some(tls) => builder.tls_config(tls).build(),
+                None => builder.build(),
+            }
+        });
         Ok(Self {
             settings,
             base,
-            // Let 4xx and 5xx arrive as responses, not errors: S3 explains
-            // itself in the XML body, and a 404 is an ordinary answer to
-            // `exists`.
-            agent: ureq::Agent::new_with_config(
-                ureq::config::Config::builder()
-                    .http_status_as_error(false)
-                    .build(),
-            ),
+            agent,
         })
     }
 
@@ -235,10 +243,15 @@ impl S3Store {
                 "{method} {} failed with HTTP {status}",
                 self.describe_key(path)
             ))),
-            Err(error) => Err(Error::Provider(format!(
-                "{method} {} failed: {error}",
-                self.describe_key(path)
-            ))),
+            Err(error) => {
+                let message = format!("{method} {} failed: {error}", self.describe_key(path));
+                Err(Error::Provider(
+                    match tls::failure_hint(&error.to_string(), &self.settings.trust_roots) {
+                        Some(hint) => format!("{message}\n  {hint}"),
+                        None => message,
+                    },
+                ))
+            }
         }
     }
 
@@ -395,6 +408,7 @@ mod tests {
                 secret_access_key: "secret".into(),
                 session_token: None,
             },
+            trust_roots: TrustRoots::Builtin,
         }
     }
 

@@ -4,6 +4,15 @@ Thanks for considering a contribution. AVC is a young project, which means the
 barrier to making a real difference is low and almost every part of it is still
 open to discussion.
 
+> [!WARNING]
+> **AVC is vibe coded.** Nearly all of its code, tests, and documentation were
+> written by AI coding assistants under human direction and review. It is worth
+> saying plainly, because it changes what is most useful to send: a place where
+> the documentation confidently describes behavior the code does not have is a
+> *real bug*, and finding one is among the most valuable contributions there is.
+> Human-written contributions are welcome without qualification — nothing here
+> needs to be produced the way the existing code was.
+
 By participating you agree to abide by the
 [Code of Conduct](../CODE_OF_CONDUCT.md).
 

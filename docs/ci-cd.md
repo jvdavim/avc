@@ -457,6 +457,8 @@ secrets. Nothing needs to be written to disk.
 | `AWS_SESSION_TOKEN` | Temporary credentials — set this when using OIDC or `assume-role` |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Signing region; defaults to `us-east-1` |
 | `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` | Overrides the endpoint, for MinIO, R2, Ceph |
+| `AVC_CA_BUNDLE` / `AWS_CA_BUNDLE` / `SSL_CERT_FILE` | PEM bundle of certificate authorities to trust, for a runner behind a TLS-inspecting proxy |
+| `AVC_SYSTEM_CERTS` | `1` to verify against the runner's own trust store instead of the built-in roots |
 
 > **Not supported yet:** AVC does not call instance-metadata endpoints, so IAM
 > instance roles, ECS task roles, and SSO do not work on their own. Federated
@@ -752,6 +754,18 @@ Check with `avc list --repo … <path>`.
 
 **`refusing to replace <path>: it differs from its pointer; use --force`** — the
 workspace is not clean. Add `--force`, or clean the workspace between jobs.
+
+**`invalid peer certificate: UnknownIssuer`** (exit `3`) — the runner is behind
+a proxy that inspects TLS and re-signs it with a private CA. Mount your
+organization's PEM bundle into the job and set `AVC_CA_BUNDLE` to it, or set
+`AVC_SYSTEM_CERTS=1` if the image already carries the CA in its trust store. A
+self-hosted runner on a corporate network is the usual place this appears; see
+[Configuration](configuration.md#tls-and-corporate-proxies). There is no option
+to skip verification.
+
+**`cannot read the CA bundle at …`** (exit `3`) — `AVC_CA_BUNDLE` points at a
+path that is not in the container. Mount it, or bake it into the image; a path
+that exists on the runner host is not a path that exists inside the job.
 
 **`no credentials found for profile 'default'`** (exit `3`) — the environment
 variables are not reaching the process. Secrets are commonly scoped to a specific

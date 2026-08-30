@@ -2,6 +2,15 @@
 
 Thanks for your interest in contributing.
 
+> [!WARNING]
+> **AVC is vibe coded.** Nearly all of its code, tests, and documentation were
+> written by AI coding assistants under human direction and review. Two things
+> follow for a contributor. First, a report that the documentation describes
+> behavior the code does not have is a *real bug* and one of the most useful
+> things you can send. Second, human-written contributions are welcome without
+> qualification — nothing here needs to be produced the way the existing code
+> was.
+
 **The full contributing guide lives at [`docs/contributing.md`](docs/contributing.md).**
 
 ## Quick start

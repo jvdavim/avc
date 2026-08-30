@@ -25,6 +25,7 @@ avc/
     │           ├── s3.rs           # S3 and S3-compatible REST transport
     │           ├── sigv4.rs        # AWS Signature Version 4
     │           ├── credentials.rs  # credential, region, profile, endpoint resolution
+    │           ├── tls.rs          # which certificate authorities to trust
     │           └── xml.rs          # minimal reader for S3 responses
     └── avc-cli/                # binary: the `avc` command
         ├── src/main.rs         # clap definitions and the repository workflows
@@ -135,6 +136,15 @@ ever enter at the first two, so the tracked file can name a region and a profile
 without ever holding a credential. The profile is the one setting where
 `config.local.toml` outranks the environment, because a profile written into a
 repository's local file is a statement about *that* repository.
+
+`tls.rs` decides which certificate authorities may vouch for a server: the
+built-in Mozilla roots by default, or — for a network that terminates TLS at a
+proxy and re-signs it with a private CA — the operating system's trust store or
+a named PEM bundle. The bundle is read when the agent is built rather than at
+the first request, so a bad path is reported as a bad path. There is
+deliberately no way to disable verification, and a rejected certificate is the
+one transport failure that gets a hint appended naming the setting that fixes
+it.
 
 `s3.rs` picks addressing style from configuration: virtual-hosted for Amazon S3,
 path-style whenever an endpoint is set. It sets `content-length` explicitly,

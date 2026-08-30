@@ -8,6 +8,14 @@ local content-addressed cache and synchronizes them with an object store.
 > and remain provisional. See [`../SPEC.md`](../SPEC.md) for the normative rules
 > and [Roadmap](roadmap.md) for what is not built yet.
 
+> [!WARNING]
+> **This project is vibe coded.** Nearly all of AVC's code, tests, and
+> documentation — including these pages — were written by AI coding assistants
+> under human direction and review. Nothing here has been audited or run at
+> scale in production. Read the code before trusting it with data you cannot
+> lose, and where these documents and the code disagree, the code is what runs:
+> please report the mismatch as a bug.
+
 ## Start here
 
 | If you want to… | Read |

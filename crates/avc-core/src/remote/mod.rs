@@ -8,6 +8,7 @@ mod credentials;
 mod file;
 mod s3;
 mod sigv4;
+pub mod tls;
 mod xml;
 
 use std::io::Read;
@@ -15,6 +16,7 @@ use std::io::Read;
 pub use credentials::{Credentials, LocalRemoteOverride};
 pub use file::FileStore;
 pub use s3::{S3Settings, S3Store};
+pub use tls::TrustRoots;
 
 use crate::{ObjectId, Provider, RemoteConfig, Result};
 

@@ -43,6 +43,9 @@ avc fetch --repo https://github.com/acme/artifacts models/bert -o .
   learns your repository's directory structure.
 - 🎯 **Explicit providers.** Transport is chosen by URL scheme, never guessed
   from a hostname.
+- 🏢 **Works behind a corporate proxy.** A TLS-inspecting network is a supported
+  configuration, not a wall: trust the machine's own certificate store or name a
+  PEM bundle. Verification can never be switched off.
 - 🧩 **Deduplicates by construction.** Identical bytes have one key, whether they
   appear in ten paths, ten branches, or twice inside one tracked directory.
 - 📁 **Directories are one artifact.** `avc add data/` tracks a whole tree behind
@@ -62,6 +65,25 @@ avc fetch --repo https://github.com/acme/artifacts models/bert -o .
 > to end; `gs://` and `az://` still configure correctly and then return an
 > explicit unsupported-adapter error on transfer. On-disk formats are
 > provisional. See the [roadmap](docs/roadmap.md).
+
+> [!WARNING]
+> **AVC is a vibe-coded project.** Nearly all of its code, tests, and
+> documentation were written by AI coding assistants, directed and reviewed by a
+> human maintainer. That is worth knowing before you trust it with anything:
+>
+> - **Read it before you rely on it.** The test suite is real and passes, but a
+>   generated codebase can be confidently wrong in ways review does not always
+>   catch, and prose that reads authoritatively is not evidence that the code
+>   beneath it was exercised.
+> - **The documentation is generated too.** Where these documents and the code
+>   disagree, the code is what runs. Report the mismatch — that is a bug.
+> - **Nothing here has been audited**, by a security reviewer or otherwise.
+> - **It has not been run at scale in production** by anyone.
+>
+> The design decisions are deliberate and the tests are written to be
+> falsifiable rather than decorative, but treat this as what it is: a young
+> prototype whose confidence exceeds its mileage. Back up anything you cannot
+> lose, and see [`SECURITY.md`](SECURITY.md).
 
 ## Installation
 
@@ -275,9 +297,29 @@ leaks from:
 
 1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
 2. `.avc/config.local.toml`, which `avc init` gitignores
-3. `~/.aws/credentials` for `$AWS_PROFILE`, or `default`
+3. `~/.aws/credentials` for the active profile
+4. The tracked `.avc/config.toml`, which may name a `region` and a `profile` —
+   names, never secrets
 
 See [Configuration](docs/configuration.md#credentials) for the full table.
+
+### Corporate networks and custom certificates
+
+A proxy that inspects TLS re-signs every connection with a certificate authority
+private to your organization, and a client carrying only the public roots
+rejects it. Point AVC at the CA that should be trusted:
+
+```bash
+export AVC_SYSTEM_CERTS=1                          # use the machine's own trust store
+export AVC_CA_BUNDLE=/etc/ssl/corporate-root.pem   # or name a PEM bundle
+```
+
+`AWS_CA_BUNDLE` and `SSL_CERT_FILE` are honored too, so a machine already set up
+for the AWS CLI or `curl` needs nothing further, and the same paths can be
+written into the gitignored `config.local.toml`. A rejected certificate says
+which of these to reach for rather than leaving you to guess. There is no option
+to disable verification. See
+[TLS and corporate proxies](docs/configuration.md#tls-and-corporate-proxies).
 
 ### Storage
 

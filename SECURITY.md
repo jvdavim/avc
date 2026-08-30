@@ -4,6 +4,14 @@
 
 AVC is a `0.x` prototype. Only the latest release receives security fixes.
 
+> [!WARNING]
+> **AVC is vibe coded and has never been audited.** Nearly all of its code —
+> including the SigV4 signer, the TLS trust configuration, and every path that
+> writes to your filesystem — was written by AI coding assistants under human
+> direction and review. Review it yourself before deploying it anywhere its
+> failure would matter, and weigh the code accordingly: an implementation that
+> looks plausible is not evidence of a correct one.
+
 | Version | Supported |
 | --- | --- |
 | 0.1.x | Yes |

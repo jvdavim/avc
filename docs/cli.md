@@ -122,6 +122,15 @@ and the bar is laid out for `$COLUMNS` columns, or 80 when that is unset.
 Everything progress reports is also in the summary each command prints when it
 finishes, so a run with progress turned off loses nothing.
 
+**TLS.** Every `https` remote is verified against the Mozilla root set built
+into the binary. On a network that inspects TLS through a proxy, set
+`AVC_SYSTEM_CERTS=1` to verify against the machine's own trust store instead, or
+point `AVC_CA_BUNDLE` at your organization's PEM bundle; `AWS_CA_BUNDLE` and
+`SSL_CERT_FILE` are honored too, so a machine already set up for the AWS CLI or
+`curl` needs nothing else. A rejected certificate says which of these to reach
+for. There is no option to skip verification. See
+[Configuration](configuration.md#tls-and-corporate-proxies).
+
 **Porcelain.** `status`, `list`, `fetch`, and `verify` accept `--porcelain`,
 which prints tab-separated records with no header, no summary, and no color.
 That format is a stable interface; the human-facing tables are not. See

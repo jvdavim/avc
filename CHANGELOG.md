@@ -13,6 +13,25 @@ include a breaking format change. See
 
 ### Added
 
+- **The documentation says the project is vibe coded.** README, the docs index,
+  both contributing guides, and `SECURITY.md` now state plainly that nearly all
+  of AVC's code, tests, and documentation were written by AI coding assistants
+  under human direction and review — that none of it has been audited, and that
+  documentation describing behavior the code does not have should be reported as
+  the bug it is.
+- **Custom certificate authorities, for networks that inspect TLS.** A proxy
+  that terminates TLS re-signs it with a private CA, which the built-in Mozilla
+  roots reject. `AVC_SYSTEM_CERTS=1` verifies against the machine's own trust
+  store instead; `AVC_CA_BUNDLE` names a PEM bundle, as do the pre-existing
+  `AWS_CA_BUNDLE` and `SSL_CERT_FILE` that a managed machine usually already
+  sets; `ca_bundle` and `use_system_certs` in `.avc/config.local.toml` make
+  either permanent for one repository. A bundle is read and validated when the
+  command starts, so a wrong path is reported as a wrong path, and a rejected
+  certificate names the setting that fixes it. There is deliberately no way to
+  disable verification. See
+  [TLS and corporate proxies](docs/configuration.md#tls-and-corporate-proxies).
+  Reading the system trust store enables one HTTP-client feature flag, which
+  adds three transitive crates and no direct dependency.
 - **A remote records its region and its AWS profile.** `avc remote add
   --region <region>` pins the SigV4 signing region in the tracked
   `.avc/config.toml`, and `--profile <name>` names the section of `~/.aws/config`

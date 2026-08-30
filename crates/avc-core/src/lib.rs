@@ -13,7 +13,7 @@ pub use hashing::{hash_file, hash_reader, HashResult, StreamHasher};
 pub use object::{ObjectId, ALGORITHM};
 pub use path::{normalize_repo_path, pointer_path, validate_repo_path};
 pub use pointer::{Artifact, ArtifactKind, ObjectMetadata, Pointer, POINTER_VERSION};
-pub use remote::{Credentials, LocalRemoteOverride, ObjectStore, RemoteObject};
+pub use remote::{Credentials, LocalRemoteOverride, ObjectStore, RemoteObject, TrustRoots};
 pub use tree::{Tree, TreeEntry, TREE_MEDIA_TYPE, TREE_VERSION};
 
 /// Errors returned by core validation and serialization operations.
@@ -42,6 +42,8 @@ pub enum Error {
     #[error("provider adapter not implemented: {0}")]
     UnsupportedProvider(&'static str),
     #[error("{0}")]
+    Tls(String),
+    #[error("{0}")]
     Provider(String),
 }
 
@@ -51,7 +53,10 @@ impl Error {
     pub fn is_provider_failure(&self) -> bool {
         matches!(
             self,
-            Error::Provider(_) | Error::MissingCredentials(_) | Error::UnsupportedProvider(_)
+            Error::Provider(_)
+                | Error::MissingCredentials(_)
+                | Error::UnsupportedProvider(_)
+                | Error::Tls(_)
         )
     }
 }
