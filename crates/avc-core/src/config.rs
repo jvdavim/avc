@@ -21,6 +21,14 @@ pub struct RemoteConfig {
     pub prefix: String,
     #[serde(default)]
     pub endpoint_url: Option<String>,
+    /// SigV4 signing region, when the repository pins one. Overridden by the
+    /// environment and by `.avc/config.local.toml`.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Named section of `~/.aws/credentials` and `~/.aws/config` to read.
+    /// A name only: the secrets stay in the shared files, never here.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl RemoteConfig {
@@ -43,6 +51,8 @@ impl RemoteConfig {
                 bucket_or_container: path.to_string_lossy().into_owned(),
                 prefix: String::new(),
                 endpoint_url: None,
+                region: None,
+                profile: None,
             });
         }
         let host = parsed
@@ -84,6 +94,8 @@ impl RemoteConfig {
             bucket_or_container,
             prefix,
             endpoint_url,
+            region: None,
+            profile: None,
         })
     }
 }

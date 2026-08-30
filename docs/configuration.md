@@ -4,7 +4,7 @@ AVC keeps configuration in two files under `.avc/`.
 
 | File | Tracked by Git? | Contains |
 | --- | --- | --- |
-| `.avc/config.toml` | **Yes** — commit it | Providers, buckets, prefixes, endpoints, remote names |
+| `.avc/config.toml` | **Yes** — commit it | Providers, buckets, prefixes, endpoints, regions, profile names, remote names |
 | `.avc/config.local.toml` | No — gitignored | Machine-local overrides |
 
 The split exists so a team shares *where artifacts live* without sharing *how to
@@ -23,6 +23,8 @@ name = "origin"
 provider = "s3"
 bucket_or_container = "my-bucket"
 prefix = "artifacts"
+region = "sa-east-1"
+profile = "artifacts"
 
 [[remotes]]
 name = "minio"
@@ -48,6 +50,14 @@ prefix = ""
 | `remotes[].bucket_or_container` | string | Bucket, container, or — for `file` — an absolute directory path |
 | `remotes[].prefix` | string, optional | Key prefix inside the bucket |
 | `remotes[].endpoint_url` | string, optional | Custom endpoint for S3-compatible services |
+| `remotes[].region` | string, optional | SigV4 signing region, and the region the bucket is in |
+| `remotes[].profile` | string, optional | Section of `~/.aws/config` and `~/.aws/credentials` to authenticate with |
+
+`region` and `profile` hold *names*, never secrets, which is why they belong in
+the committed file: a clone reaches the right bucket in the right region through
+the right profile with no local setup. Both are set by `avc remote add --region`
+and `--profile`, and both are overridden by the environment and by
+`config.local.toml` — see [Credentials](#credentials).
 
 An empty `config.toml` (as written by `init`, which seeds it with only a comment)
 is valid and parses as "no remotes configured."
@@ -176,7 +186,9 @@ sizes and the fact that two repositories reference identical content.
 
 ## Credentials
 
-**Never put credentials in `.avc/config.toml`.** It is committed to Git.
+**Never put credentials in `.avc/config.toml`.** It is committed to Git. A
+`region` and a `profile` name are fine there — neither authenticates anything
+on its own — but a key never is.
 
 For S3 remotes, credentials resolve in this order — first match wins:
 
@@ -184,7 +196,7 @@ For S3 remotes, credentials resolve in this order — first match wins:
 | --- | --- | --- |
 | 1 | Environment | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` |
 | 2 | `.avc/config.local.toml` | `access_key_id`, `secret_access_key`, `session_token` |
-| 3 | `~/.aws/credentials` | `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token` for `$AWS_PROFILE`, else `[default]` |
+| 3 | `~/.aws/credentials` | `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token` for the active profile |
 
 Provider-standard chains come first so a repository-local file can be
 overridden but never silently override the environment — AVC does not become
@@ -194,8 +206,15 @@ Region and endpoint resolve on the same principle:
 
 | Setting | Order |
 | --- | --- |
-| Region | `AWS_REGION` → `AWS_DEFAULT_REGION` → `config.local.toml` → `~/.aws/config` → `us-east-1` |
+| Region | `AWS_REGION` → `AWS_DEFAULT_REGION` → `config.local.toml` → `region` in `config.toml` → `~/.aws/config` → `us-east-1` |
+| Profile | `config.local.toml` → `AWS_PROFILE` → `profile` in `config.toml` → `default` |
 | Endpoint | `AWS_ENDPOINT_URL_S3` → `AWS_ENDPOINT_URL` → `config.local.toml` → `endpoint_url` in `config.toml` |
+
+The active profile decides which section of `~/.aws/credentials` supplies keys
+and which section of `~/.aws/config` supplies a region. It is the one setting
+where `config.local.toml` outranks the environment: someone who wrote a profile
+into a repository's local file meant *that* repository, not whatever
+`AWS_PROFILE` happens to hold in the shell that ran the command.
 
 `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` relocate the shared files.
 
@@ -259,10 +278,10 @@ secret_access_key = "minioadmin"
 | --- | --- |
 | `name` | Must match a remote in `config.toml`; other entries are ignored |
 | `endpoint_url` | Replaces the tracked endpoint for this machine |
-| `region` | SigV4 signing region |
+| `region` | SigV4 signing region; overrides `region` in `config.toml` |
 | `access_key_id` / `secret_access_key` | Static credentials |
 | `session_token` | Temporary-credential token, sent as `x-amz-security-token` |
-| `profile` | `~/.aws/credentials` section to read when no key is set here |
+| `profile` | `~/.aws/credentials` section to read when no key is set here; overrides `AWS_PROFILE` and `profile` in `config.toml` |
 | `force_path_style` | `true` for `endpoint/bucket/key`, `false` for virtual-hosted |
 
 A malformed `config.local.toml` is an error rather than a silent fallback:

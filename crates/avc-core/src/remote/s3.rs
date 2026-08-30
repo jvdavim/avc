@@ -36,9 +36,10 @@ impl S3Settings {
     /// environment.
     ///
     /// Precedence, highest first: environment variables,
-    /// `.avc/config.local.toml`, then `~/.aws/credentials`.
+    /// `.avc/config.local.toml`, the tracked `.avc/config.toml`, then
+    /// `~/.aws/config` and `~/.aws/credentials`.
     pub fn resolve(remote: &RemoteConfig, local: Option<&LocalRemoteOverride>) -> Result<Self> {
-        let region = credentials::resolve_region(local);
+        let region = credentials::resolve_region(remote, local);
         let override_endpoint = credentials::resolve_endpoint(local);
         // A custom endpoint is an S3-compatible server until told otherwise,
         // and those overwhelmingly serve path-style addressing only.
@@ -56,7 +57,7 @@ impl S3Settings {
             region,
             endpoint,
             force_path_style,
-            credentials: credentials::resolve(local)?,
+            credentials: credentials::resolve(remote, local)?,
         })
     }
 }

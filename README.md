@@ -141,6 +141,15 @@ export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
 avc push
 ```
 
+Everything after the bucket is the key prefix, so one bucket serves many
+repositories. The bucket's region and the AWS profile to authenticate with can
+be recorded alongside it — names, not secrets, so they are safe to commit:
+
+```bash
+avc remote add origin s3://my-bucket/team-a/artifacts --region sa-east-1 --profile artifacts
+avc push       # signs for sa-east-1 with the [artifacts] profile from ~/.aws
+```
+
 Then simulate a fresh clone:
 
 ```bash

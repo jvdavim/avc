@@ -89,6 +89,8 @@ fn file_backend_satisfies_the_object_store_contract() {
         bucket_or_container: directory.0.to_string_lossy().into_owned(),
         prefix: "artifacts".into(),
         endpoint_url: None,
+        region: None,
+        profile: None,
     };
     let store = remote::open(&remote, None).unwrap();
     assert_store_contract(store.as_ref(), b"file backend contract");
@@ -103,6 +105,8 @@ fn file_backend_lists_nothing_before_anything_is_pushed() {
         bucket_or_container: directory.0.to_string_lossy().into_owned(),
         prefix: String::new(),
         endpoint_url: None,
+        region: None,
+        profile: None,
     };
     let store = remote::open(&remote, None).unwrap();
     assert!(store.list().unwrap().is_empty());
@@ -119,6 +123,8 @@ fn prefixes_isolate_two_remotes_in_one_location() {
         bucket_or_container: directory.0.to_string_lossy().into_owned(),
         prefix: prefix.into(),
         endpoint_url: None,
+        region: None,
+        profile: None,
     };
     let first = remote::open(&build("team-a"), None).unwrap();
     let second = remote::open(&build("team-b"), None).unwrap();
@@ -142,6 +148,8 @@ fn unimplemented_providers_report_themselves_clearly() {
             bucket_or_container: "bucket".into(),
             prefix: String::new(),
             endpoint_url: None,
+            region: None,
+            profile: None,
         };
         let error = match remote::open(&remote, None) {
             Err(error) => error,
@@ -178,6 +186,8 @@ fn s3_backend_satisfies_the_object_store_contract() {
         // "absent object" assertions meaningful.
         prefix: format!("it-{}", std::process::id()),
         endpoint_url: Some(endpoint),
+        region: None,
+        profile: None,
     };
     let local = LocalRemoteOverride {
         name: "minio".into(),

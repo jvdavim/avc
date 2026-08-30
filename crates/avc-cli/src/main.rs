@@ -117,7 +117,22 @@ enum RemoteCommand {
 #[derive(Debug, Args)]
 struct RemoteAddArgs {
     name: String,
+    /// Object store URL. The path after the bucket, if any, becomes the key
+    /// prefix: `s3://my-bucket/artifacts/v1`.
     provider_url: String,
+    /// SigV4 signing region for S3, recorded in `.avc/config.toml`.
+    ///
+    /// `AWS_REGION` and `.avc/config.local.toml` still win over it, so a
+    /// repository can name its bucket's region without pinning anyone's
+    /// machine to it.
+    #[arg(long, value_name = "REGION")]
+    region: Option<String>,
+    /// Named profile to read from `~/.aws/config` and `~/.aws/credentials`.
+    ///
+    /// A name only — never a key. `AWS_PROFILE` and `.avc/config.local.toml`
+    /// still win over it.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +219,10 @@ pub(crate) struct Remote {
     prefix: String,
     #[serde(default)]
     endpoint_url: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 /// Contents of the gitignored `.avc/config.local.toml`.
@@ -367,6 +386,10 @@ fn remote(command: RemoteCommand) -> Result<(), Failure> {
                 bucket_or_container: parsed.bucket_or_container,
                 prefix: parsed.prefix,
                 endpoint_url: parsed.endpoint_url,
+                // An empty flag value would be recorded as a pinned choice and
+                // then resolve to nothing, so treat it as "not given".
+                region: args.region.filter(|value| !value.trim().is_empty()),
+                profile: args.profile.filter(|value| !value.trim().is_empty()),
             });
             let default = repo.config.default_remote.is_none();
             if default {
@@ -384,6 +407,12 @@ fn remote(command: RemoteCommand) -> Result<(), Failure> {
             if let Some(endpoint) = &added.endpoint_url {
                 ui::field("endpoint", endpoint);
             }
+            if let Some(region) = &added.region {
+                ui::field("region", region);
+            }
+            if let Some(profile) = &added.profile {
+                ui::field("profile", profile);
+            }
             ui::field("default", if default { "yes" } else { "no" });
         }
         RemoteCommand::List => {
@@ -392,20 +421,46 @@ fn remote(command: RemoteCommand) -> Result<(), Failure> {
                 ui::note("add one with `avc remote add origin <url>`");
                 return Ok(());
             }
-            let mut table = Table::new(vec![
+            // Region and profile are shown only when something sets one, so
+            // the common case stays a three-column table.
+            let show_region = repo
+                .config
+                .remotes
+                .iter()
+                .any(|remote| remote.region.is_some());
+            let show_profile = repo
+                .config
+                .remotes
+                .iter()
+                .any(|remote| remote.profile.is_some());
+            let mut columns = vec![
                 Column::left(""),
                 Column::left("NAME"),
                 Column::left("PROVIDER"),
                 Column::left("LOCATION"),
-            ]);
+            ];
+            if show_region {
+                columns.push(Column::left("REGION"));
+            }
+            if show_profile {
+                columns.push(Column::left("PROFILE"));
+            }
+            let mut table = Table::new(columns);
             for remote in &repo.config.remotes {
                 let default = repo.config.default_remote.as_deref() == Some(&remote.name);
-                table.row(vec![
+                let mut cells = vec![
                     Cell::new(if default { "*" } else { " " }, Style::Ok),
                     Cell::plain(remote.name.clone()),
                     Cell::plain(provider_name(&remote.provider)),
                     Cell::plain(remote_location(remote)),
-                ]);
+                ];
+                if show_region {
+                    cells.push(optional_cell(remote.region.as_deref()));
+                }
+                if show_profile {
+                    cells.push(optional_cell(remote.profile.as_deref()));
+                }
+                table.row(cells);
             }
             table.print();
             ui::summary("* marks the remote used when --remote is omitted");
@@ -421,6 +476,15 @@ fn provider_name(provider: &avc_core::Provider) -> &'static str {
         avc_core::Provider::S3 => "s3",
         avc_core::Provider::Gcs => "gcs",
         avc_core::Provider::Azure => "azure",
+    }
+}
+
+/// A configured value, or a dash where the resolver falls back to the
+/// environment and `~/.aws`.
+fn optional_cell(value: Option<&str>) -> Cell {
+    match value {
+        Some(value) => Cell::plain(value.to_owned()),
+        None => Cell::dim("-"),
     }
 }
 
@@ -1683,6 +1747,8 @@ pub(crate) fn open_store(
         bucket_or_container: remote.bucket_or_container.clone(),
         prefix: remote.prefix.clone(),
         endpoint_url: remote.endpoint_url.clone(),
+        region: remote.region.clone(),
+        profile: remote.profile.clone(),
     };
     Ok(avc_core::remote::open(&config, local.as_ref())?)
 }

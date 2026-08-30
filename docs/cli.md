@@ -6,7 +6,7 @@ honored, this page says so.
 
 ```text
 avc init
-avc remote add <name> <provider-url>
+avc remote add <name> <provider-url> [--region <region>] [--profile <name>]
 avc remote list
 avc add <path> [<path>...]
 avc list [<path>...] [--repo <git-url>] [--ref <rev>] [--remote <name>] [--porcelain]
@@ -159,12 +159,14 @@ Fails if the current directory is not inside a Git worktree.
 Register a remote by URL.
 
 ```bash
-avc remote add <name> <provider-url>
+avc remote add <name> <provider-url> [--region <region>] [--profile <name>]
 ```
 
 ```bash
 avc remote add origin file:///tmp/avc-remote
 avc remote add origin s3://my-bucket/artifacts
+avc remote add origin s3://my-bucket/artifacts/v1 --region sa-east-1
+avc remote add origin s3://my-bucket/artifacts --profile artifacts
 avc remote add minio s3+https://storage.example.com/my-bucket/artifacts
 avc remote add local s3+http://localhost:9000/my-bucket/artifacts
 ```
@@ -173,12 +175,31 @@ avc remote add local s3+http://localhost:9000/my-bucket/artifacts
 configured remote origin
   provider   s3
   location   my-bucket/artifacts
+  region     sa-east-1
+  profile    artifacts
   default    yes
 ```
 
 The URL is decomposed into provider, bucket/container, prefix, and optional
 endpoint, then written to `.avc/config.toml`. Adding a name that already exists
 **replaces** it. The first remote added becomes `default_remote`.
+
+Everything after the bucket is the key prefix, so one bucket holds several
+repositories without them seeing each other's objects:
+`s3://my-bucket/team-a/artifacts` writes under `team-a/artifacts/objects/…`.
+Omit it and objects go to the bucket root.
+
+| Flag | Meaning |
+| --- | --- |
+| `--region <region>` | SigV4 signing region, and the region the bucket is in |
+| `--profile <name>` | Section of `~/.aws/config` and `~/.aws/credentials` to authenticate with |
+
+Both are optional and both are *names*, not secrets, so they are safe in a
+committed file: a clone reaches the right bucket in the right region through the
+right profile with no local setup. `AWS_REGION` / `AWS_PROFILE` and
+`.avc/config.local.toml` still override them, so nothing here pins a machine
+that needs something else. See
+[Configuration](configuration.md#credentials).
 
 Only `file://`, `s3://`, `s3+https://`, `s3+http://`, `gs://`, and `az://` are
 accepted. A bare `https://` URL is rejected — see
@@ -196,6 +217,14 @@ avc remote list
    backup  s3        my-bucket/artifacts
 
 * marks the remote used when --remote is omitted
+```
+
+`REGION` and `PROFILE` columns appear when any remote configures one:
+
+```text
+   NAME    PROVIDER  LOCATION                  REGION     PROFILE
+*  origin  s3        my-bucket/team/artifacts  sa-east-1  artifacts
+   backup  s3        my-backup                 -          -
 ```
 
 `LOCATION` is `bucket/prefix`; it never contains credentials.

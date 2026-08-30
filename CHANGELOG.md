@@ -13,6 +13,14 @@ include a breaking format change. See
 
 ### Added
 
+- **A remote records its region and its AWS profile.** `avc remote add
+  --region <region>` pins the SigV4 signing region in the tracked
+  `.avc/config.toml`, and `--profile <name>` names the section of `~/.aws/config`
+  and `~/.aws/credentials` to authenticate with. Both are names rather than
+  secrets, so a clone reaches the right bucket in the right region through the
+  right profile with no local setup; `AWS_REGION` / `AWS_PROFILE` and
+  `.avc/config.local.toml` still override them. `avc remote list` grows `REGION`
+  and `PROFILE` columns when a remote configures one.
 - **CI/CD commands.** `avc fetch` downloads the artifacts at a path inside a
   repository, to the paths their pointers name — no clone, no `avc init`, no
   local cache, and `s3:GetObject` as its only S3 permission. `avc verify`

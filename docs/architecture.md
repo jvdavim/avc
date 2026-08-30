@@ -24,7 +24,7 @@ avc/
     │           ├── file.rs         # file:// backend
     │           ├── s3.rs           # S3 and S3-compatible REST transport
     │           ├── sigv4.rs        # AWS Signature Version 4
-    │           ├── credentials.rs  # credential, region, endpoint resolution
+    │           ├── credentials.rs  # credential, region, profile, endpoint resolution
     │           └── xml.rs          # minimal reader for S3 responses
     └── avc-cli/                # binary: the `avc` command
         ├── src/main.rs         # clap definitions and the repository workflows
@@ -128,6 +128,14 @@ digest, so payload bytes are never read twice. Its tests assert against
 `botocore`-generated vectors, so the module is checked against an independent
 implementation rather than against itself.
 
+`credentials.rs` resolves the three things a signature needs but a URL does not
+carry — keys, region, profile — from a fixed chain: environment, then
+`config.local.toml`, then the tracked `config.toml`, then `~/.aws`. Secrets only
+ever enter at the first two, so the tracked file can name a region and a profile
+without ever holding a credential. The profile is the one setting where
+`config.local.toml` outranks the environment, because a profile written into a
+repository's local file is a statement about *that* repository.
+
 `s3.rs` picks addressing style from configuration: virtual-hosted for Amazon S3,
 path-style whenever an endpoint is set. It sets `content-length` explicitly,
 because S3 rejects the chunked encoding an HTTP client would otherwise choose,
@@ -147,7 +155,8 @@ pointers, manifests, paths, and remote scheme parsing. `tests/object_store.rs`
 asserts one contract against both backends — the S3 half runs against a real
 server when `AVC_TEST_S3_ENDPOINT` is set. `crates/avc-cli/tests/directory.rs`
 drives the binary itself through the directory workflow, remote round trip
-included.
+included, and `tests/remote.rs` covers what `avc remote add` records and where a
+prefix actually puts the bytes.
 
 ## `avc-cli`
 

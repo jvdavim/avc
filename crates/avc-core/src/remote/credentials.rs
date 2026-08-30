@@ -4,17 +4,21 @@
 //!
 //! 1. Provider-standard environment variables.
 //! 2. `.avc/config.local.toml`, supplied by the caller as [`LocalRemoteOverride`].
-//! 3. `~/.aws/credentials` and `~/.aws/config`, for the active profile.
+//! 3. The tracked `.avc/config.toml`, supplied as [`RemoteConfig`].
+//! 4. `~/.aws/credentials` and `~/.aws/config`, for the active profile.
 //!
 //! Provider chains come first so AVC does not become another place a secret
 //! leaks from: a repository-local file can be overridden, never the reverse.
+//! The tracked configuration sits below the machine-local one for the same
+//! reason a shared default should never beat a deliberate local choice — and
+//! it holds names only, never a secret.
 
 use std::env;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, RemoteConfig, Result};
 
 /// Static credentials for one request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,7 +54,7 @@ pub struct LocalRemoteOverride {
 }
 
 /// Resolve credentials for `remote`, consulting the chain above.
-pub fn resolve(local: Option<&LocalRemoteOverride>) -> Result<Credentials> {
+pub fn resolve(remote: &RemoteConfig, local: Option<&LocalRemoteOverride>) -> Result<Credentials> {
     if let (Ok(access_key_id), Ok(secret_access_key)) = (
         env::var("AWS_ACCESS_KEY_ID"),
         env::var("AWS_SECRET_ACCESS_KEY"),
@@ -76,10 +80,7 @@ pub fn resolve(local: Option<&LocalRemoteOverride>) -> Result<Credentials> {
         }
     }
 
-    let profile = local
-        .and_then(|local| local.profile.clone())
-        .or_else(|| non_empty_env("AWS_PROFILE"))
-        .unwrap_or_else(|| "default".into());
+    let profile = resolve_profile(remote, local);
 
     if let Some(credentials) = from_shared_file(&profile)? {
         return Ok(credentials);
@@ -88,16 +89,29 @@ pub fn resolve(local: Option<&LocalRemoteOverride>) -> Result<Credentials> {
     Err(Error::MissingCredentials(profile))
 }
 
+/// Resolve the profile whose section of the shared AWS files to read.
+///
+/// A profile is a name, not a secret, so the tracked configuration may carry
+/// one: a team that keeps its artifacts behind a named profile can say so once
+/// in `.avc/config.toml` instead of every member exporting `AWS_PROFILE`.
+pub fn resolve_profile(remote: &RemoteConfig, local: Option<&LocalRemoteOverride>) -> String {
+    local
+        .and_then(|local| local.profile.clone())
+        .filter(|profile| !profile.is_empty())
+        .or_else(|| non_empty_env("AWS_PROFILE"))
+        .or_else(|| remote.profile.clone().filter(|profile| !profile.is_empty()))
+        .unwrap_or_else(|| "default".into())
+}
+
 /// Resolve the region, which SigV4 needs even when the server ignores it.
-pub fn resolve_region(local: Option<&LocalRemoteOverride>) -> String {
+pub fn resolve_region(remote: &RemoteConfig, local: Option<&LocalRemoteOverride>) -> String {
     non_empty_env("AWS_REGION")
         .or_else(|| non_empty_env("AWS_DEFAULT_REGION"))
         .or_else(|| local.and_then(|local| local.region.clone()))
+        .or_else(|| remote.region.clone())
+        .filter(|region| !region.is_empty())
         .or_else(|| {
-            let profile = local
-                .and_then(|local| local.profile.clone())
-                .or_else(|| non_empty_env("AWS_PROFILE"))
-                .unwrap_or_else(|| "default".into());
+            let profile = resolve_profile(remote, local);
             shared_config_file("config")
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 // `~/.aws/config` names the default profile plainly and every
@@ -229,5 +243,128 @@ aws_session_token = tok
         );
         assert_eq!(profile_field(INI, "ci", "region"), None);
         assert_eq!(profile_field(INI, "absent", "aws_access_key_id"), None);
+    }
+
+    fn remote(region: Option<&str>, profile: Option<&str>) -> RemoteConfig {
+        RemoteConfig {
+            name: "origin".into(),
+            provider: crate::Provider::S3,
+            bucket_or_container: "my-bucket".into(),
+            prefix: String::new(),
+            endpoint_url: None,
+            region: region.map(str::to_owned),
+            profile: profile.map(str::to_owned),
+        }
+    }
+
+    /// Restores every variable it touches, so the rest of the suite sees the
+    /// environment it started with.
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn clearing(names: &[&'static str]) -> Self {
+            let saved = names
+                .iter()
+                .map(|name| (*name, env::var(name).ok()))
+                .collect();
+            for name in names {
+                env::remove_var(name);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// One test rather than several: these all move the same process-wide
+    /// environment, and splitting them would let them race each other.
+    #[test]
+    fn region_and_profile_resolve_in_the_documented_order() {
+        let _guard = EnvGuard::clearing(&[
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+        ]);
+        let shared = std::env::temp_dir().join(format!("avc-aws-config-{}", std::process::id()));
+        std::fs::write(&shared, "[default]\nregion = ap-south-1\n").unwrap();
+        env::set_var("AWS_CONFIG_FILE", &shared);
+
+        let local = |region: Option<&str>, profile: Option<&str>| LocalRemoteOverride {
+            name: "origin".into(),
+            region: region.map(str::to_owned),
+            profile: profile.map(str::to_owned),
+            ..Default::default()
+        };
+
+        // The repository may name both, which is the point of putting them in
+        // the tracked configuration: a clone needs no local setup to reach the
+        // right bucket in the right region.
+        assert_eq!(
+            resolve_region(&remote(Some("sa-east-1"), None), None),
+            "sa-east-1"
+        );
+        assert_eq!(
+            resolve_profile(&remote(None, Some("artifacts")), None),
+            "artifacts"
+        );
+
+        // A tracked region beats `~/.aws/config`; with none, that file answers.
+        assert_eq!(resolve_region(&remote(None, None), None), "ap-south-1");
+
+        // `config.local.toml` overrides the tracked value on this machine.
+        let overridden = local(Some("eu-west-1"), Some("minio-dev"));
+        assert_eq!(
+            resolve_region(&remote(Some("sa-east-1"), None), Some(&overridden)),
+            "eu-west-1"
+        );
+        assert_eq!(
+            resolve_profile(&remote(None, Some("artifacts")), Some(&overridden)),
+            "minio-dev"
+        );
+
+        // And the environment overrides everything below it.
+        env::set_var("AWS_REGION", "us-west-2");
+        env::set_var("AWS_PROFILE", "from-env");
+        assert_eq!(
+            resolve_region(
+                &remote(Some("sa-east-1"), None),
+                Some(&local(Some("eu-west-1"), None))
+            ),
+            "us-west-2"
+        );
+        assert_eq!(
+            resolve_profile(&remote(None, Some("artifacts")), None),
+            "from-env"
+        );
+        // A machine-local profile is the one exception, matching the behaviour
+        // that shipped before the tracked field existed: someone who wrote a
+        // profile into `config.local.toml` meant that repository, not whatever
+        // `AWS_PROFILE` happens to hold in this shell.
+        assert_eq!(
+            resolve_profile(
+                &remote(None, Some("artifacts")),
+                Some(&local(None, Some("minio-dev")))
+            ),
+            "minio-dev"
+        );
+
+        // Nothing configured anywhere still signs, because SigV4 requires a
+        // region even where the server ignores it.
+        env::remove_var("AWS_REGION");
+        env::remove_var("AWS_CONFIG_FILE");
+        assert_eq!(resolve_region(&remote(None, None), None), "us-east-1");
+        assert_eq!(resolve_profile(&remote(None, None), None), "from-env");
+
+        let _ = std::fs::remove_file(&shared);
     }
 }
