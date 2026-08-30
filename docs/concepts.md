@@ -110,6 +110,13 @@ transport as any other. Several things follow:
   directory, another artifact, or another branch.
 - **Entry paths are relative to the tracked directory**, not to the repository,
   so moving a directory reuses every object it already had.
+- **One file can be taken out of it.** Grouping a thousand files under one
+  pointer is a *versioning* decision, not a storage one — each of them is still
+  an object of its own, and the manifest says which. So `avc fetch
+  data/nested/b.bin` downloads exactly that file, and `avc list data/nested`
+  browses that subtree. The repository-side commands (`push`, `pull`,
+  `checkout`, `commit`) still work on the whole artifact, because a manifest is
+  only consistent as a whole.
 - **Order is canonical.** Entries are sorted and unique, so the manifest never
   depends on the order the filesystem enumerated the tree in, and two machines
   agree on the hash.

@@ -11,7 +11,36 @@ include a breaking format change. See
 
 ## [Unreleased]
 
+### Changed
+
+- **`avc fetch` delivers what you named, where you asked for it.** A fetched
+  path now lands in `--output` under its own name instead of at the end of the
+  directories the repository files it under: `avc fetch --repo <url>
+  artifacts/model1 -o .` writes `./model1`, not `./artifacts/model1`. Naming no
+  path still keeps every artifact's full path, since there is no selector to
+  take a parent from, and omitting `--output` inside a checkout still restores
+  artifacts to the paths their pointers name — `avc fetch --ref v1.0.0 --force`
+  puts an old version back where it lives. `avc verify` uses the same rule, so
+  it looks where `fetch` wrote. Two paths that would write different files to
+  one destination are refused before anything is written. **Breaking** for a
+  pipeline that depended on the old layout.
+
 ### Added
+
+- **A path may name part of a tracked directory.** `avc fetch
+  data/nested/weights.bin` downloads that one file, and `avc fetch data/nested`
+  that one subdirectory, even though `data` is a single directory artifact.
+  Nothing new is stored to make this work — every file inside a tracked
+  directory has always been an object of its own — so this is available for
+  artifacts published by earlier versions. `avc verify` and `avc list` accept
+  the same paths; the commands that maintain a repository (`push`, `pull`,
+  `checkout`, `commit`, `remove`) work on whole artifacts and say so rather than
+  half-doing it.
+- **`avc add` is faster on large artifacts.** It hashes and stores in a single
+  pass over the bytes instead of reading the file once to hash it and again to
+  copy it, reads in 1 MiB chunks rather than 64 KiB, and hashes the files of a
+  directory in parallel across the machine's cores. No new dependency: the
+  workers are scoped threads over the file list.
 
 - **The documentation says the project is vibe coded.** README, the docs index,
   both contributing guides, and `SECURITY.md` now state plainly that nearly all

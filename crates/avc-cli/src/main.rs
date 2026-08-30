@@ -1,5 +1,6 @@
 mod ci;
 mod git;
+mod parallel;
 mod progress;
 mod registry;
 mod ui;
@@ -540,8 +541,7 @@ fn add_one(repo: &Repo, value: &str, require_pointer: bool) -> Result<(), Failur
 /// Hash a file, store its bytes, and describe it.
 fn track_file(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, String), Failure> {
     let source = repo.root.join(relative);
-    let hash = avc_core::hash_file(&source)?;
-    store_in_cache(repo, &source, &hash.object)?;
+    let hash = ingest(repo, &source)?;
     let pointer = avc_core::Pointer::new(relative, hash.object.clone(), hash.size, None)?;
     let detail = format!(
         "{}, {}",
@@ -560,26 +560,23 @@ fn track_file(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, String)
 /// are not copied twice.
 fn track_directory(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, String), Failure> {
     let root = repo.root.join(relative);
-    let scanned = scan_directory(&root)?;
-    if scanned.is_empty() {
+    // Names first, bytes second: both checks below are about which files are
+    // there, and answering them before anything is hashed means a refusal costs
+    // nothing and leaves no objects behind in the cache.
+    let files = files_under(&root)?;
+    if files.is_empty() {
         return Err(format!("directory contains no files to track: {relative}").into());
     }
     // Pointers are discovered by scanning the worktree for `.avc` files, so
     // one inside a tracked directory would be both content and pointer. Say so
     // now rather than leaving a repository whose `push` cannot parse itself.
-    if let Some((_, entry)) = scanned
-        .iter()
-        .find(|(_, entry)| entry.path.ends_with(".avc"))
-    {
+    if let Some((_, inner)) = files.iter().find(|(_, inner)| inner.ends_with(".avc")) {
         return Err(format!(
-            "refusing to track {relative}: it contains the pointer file {}/{}",
-            relative, entry.path
+            "refusing to track {relative}: it contains the pointer file {relative}/{inner}"
         )
         .into());
     }
-    for (source, entry) in &scanned {
-        store_in_cache(repo, source, &entry.object_id()?)?;
-    }
+    let scanned = hash_files(&files, Some(repo))?;
     let tree = avc_core::Tree::new(scanned.into_iter().map(|(_, entry)| entry).collect())?;
     let manifest = write_manifest(repo, &tree)?;
     let pointer =
@@ -599,17 +596,38 @@ fn track_directory(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, St
 /// Entry paths are relative to `root`, and ordering is left to
 /// `Tree::new`, so the manifest never depends on directory-iteration order.
 fn scan_directory(root: &Path) -> Result<Vec<(PathBuf, avc_core::TreeEntry)>, Failure> {
+    hash_files(&files_under(root)?, None)
+}
+
+/// Every regular file beneath `root`, as (absolute path, path relative to
+/// `root`), before anything has been read.
+fn files_under(root: &Path) -> Result<Vec<(PathBuf, String)>, Failure> {
     let mut files = Vec::new();
     collect_artifact_files(root, root, &mut files)?;
-    let mut scanned = Vec::with_capacity(files.len());
-    for (source, relative) in files {
-        let hash = avc_core::hash_file(&source)?;
-        scanned.push((
-            source,
+    Ok(files)
+}
+
+/// Hash each file — and, when a repository is given, store it in that
+/// repository's cache in the same pass over its bytes.
+///
+/// The files are independent of one another, so they are hashed in parallel;
+/// on a directory of any size this is the difference between one core working
+/// and all of them. Ordering is restored by [`avc_core::Tree::new`], which
+/// sorts, so the manifest never depends on how the work interleaved.
+fn hash_files(
+    files: &[(PathBuf, String)],
+    store: Option<&Repo>,
+) -> Result<Vec<(PathBuf, avc_core::TreeEntry)>, Failure> {
+    parallel::map(files, |(source, relative)| {
+        let hash = match store {
+            Some(repo) => ingest(repo, source)?,
+            None => avc_core::hash_file(source)?,
+        };
+        Ok((
+            source.clone(),
             avc_core::TreeEntry::new(relative, hash.object, hash.size)?,
-        ));
-    }
-    Ok(scanned)
+        ))
+    })
 }
 
 /// Walk `directory`, collecting regular files as (absolute path, path relative
@@ -639,13 +657,66 @@ fn collect_artifact_files(
     Ok(())
 }
 
-/// Copy an artifact's bytes into the cache unless that object is already there.
-fn store_in_cache(repo: &Repo, source: &Path, object: &avc_core::ObjectId) -> Result<(), Failure> {
-    let destination = cache_path(repo, object);
-    if !destination.exists() {
-        copy_atomic(source, &destination)?;
+/// Hash a file and put its bytes in the cache, reading it exactly once.
+///
+/// The content address is only known once the last byte has been read, so the
+/// copy goes to a temporary file and is named afterwards. Hashing first and
+/// copying second would be simpler and would read a large artifact twice — the
+/// second time from a page cache the first read has already emptied, which on a
+/// multi-gigabyte file is most of the wall clock.
+///
+/// The cost of that choice is a wasted write when the object turns out to be
+/// one the cache already holds. That is the cheaper mistake to make: it is
+/// bounded by the write, while the alternative pays a second full read on every
+/// artifact that is *new*, which is what `add` is usually being asked to do.
+fn ingest(repo: &Repo, source: &Path) -> Result<avc_core::HashResult, Failure> {
+    let cache = repo.root.join(".avc/cache");
+    fs::create_dir_all(&cache).map_err(io_error)?;
+    let temporary = cache.join(temporary_name());
+
+    let hash = match hash_into(source, &temporary) {
+        Ok(hash) => hash,
+        Err(error) => {
+            // A half-written temporary is never mistaken for a cache object,
+            // since only a complete one is ever named; removing it keeps a
+            // failed run from littering the cache directory.
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+
+    let destination = cache_path(repo, &hash.object);
+    if destination.exists() {
+        // Already stored, by an earlier run or by another worker a moment ago.
+        // The object is immutable, so what is there is what this would write.
+        let _ = fs::remove_file(&temporary);
+        return Ok(hash);
     }
-    Ok(())
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    fs::rename(&temporary, &destination).map_err(io_error)?;
+    Ok(hash)
+}
+
+/// Copy `source` to `temporary`, reporting what its bytes hashed to.
+fn hash_into(source: &Path, temporary: &Path) -> Result<avc_core::HashResult, Failure> {
+    let mut input = File::open(source).map_err(io_error)?;
+    let mut output = File::create(temporary).map_err(io_error)?;
+    let hash = avc_core::hash_copy(&mut input, &mut output)?;
+    output.sync_all().map_err(io_error)?;
+    Ok(hash)
+}
+
+/// A temporary name no other worker or process will choose.
+fn temporary_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Serialize a manifest into the cache and report the object it became.
@@ -664,7 +735,10 @@ fn write_manifest(repo: &Repo, tree: &avc_core::Tree) -> Result<avc_core::HashRe
 /// The bytes are verified against the pointer before they are parsed: a
 /// manifest decides where `checkout` writes, so it is treated as untrusted
 /// input even coming off the local disk.
-fn load_tree(repo: &Repo, pointer: &avc_core::Pointer) -> Result<avc_core::Tree, Failure> {
+pub(crate) fn load_tree(
+    repo: &Repo,
+    pointer: &avc_core::Pointer,
+) -> Result<avc_core::Tree, Failure> {
     let object = pointer.object_id()?;
     let path = cache_path(repo, &object);
     if !path.is_file() {
@@ -835,12 +909,23 @@ pub(crate) fn artifact_state(
     root: &Path,
     pointer: &avc_core::Pointer,
 ) -> Result<(State, u64), Failure> {
-    let artifact = root.join(&pointer.path);
+    artifact_state_at(&root.join(&pointer.path), pointer)
+}
+
+/// The same comparison, against a location named outright.
+///
+/// `fetch` no longer writes an artifact at its repository path — what a
+/// selector named lands at the output root — so `verify` has to be told where
+/// to look rather than deriving it from the pointer.
+pub(crate) fn artifact_state_at(
+    artifact: &Path,
+    pointer: &avc_core::Pointer,
+) -> Result<(State, u64), Failure> {
     if pointer.is_directory() {
         if !artifact.is_dir() {
             return Ok((State::Missing, 0));
         }
-        let scanned = scan_directory(&artifact)?;
+        let scanned = scan_directory(artifact)?;
         let tree = avc_core::Tree::new(scanned.into_iter().map(|(_, entry)| entry).collect())?;
         let bytes = tree.serialize_canonical()?.into_bytes();
         let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
@@ -854,8 +939,29 @@ pub(crate) fn artifact_state(
     if !artifact.exists() {
         return Ok((State::Missing, 0));
     }
-    let actual = avc_core::hash_file(&artifact)?;
+    let actual = avc_core::hash_file(artifact)?;
     let state = if actual.object != pointer.object_id()? || actual.size != pointer.object.size {
+        State::Modified
+    } else {
+        State::Ok
+    };
+    Ok((state, actual.size))
+}
+
+/// How one file compares with the manifest entry that describes it.
+///
+/// The counterpart of [`artifact_state_at`] for a selection that named part of
+/// a tracked directory: the pointer describes the directory as a whole, so the
+/// per-file truth lives in the manifest.
+pub(crate) fn file_state_at(
+    path: &Path,
+    entry: &avc_core::TreeEntry,
+) -> Result<(State, u64), Failure> {
+    if !path.exists() {
+        return Ok((State::Missing, 0));
+    }
+    let actual = avc_core::hash_file(path)?;
+    let state = if actual.size != entry.size || actual.object != entry.object_id()? {
         State::Modified
     } else {
         State::Ok
@@ -933,20 +1039,14 @@ fn list(args: &ListArgs) -> Result<(), Failure> {
     let mut total_bytes = 0;
     let mut listed_files = false;
 
-    for pointer in &selected {
-        // A path that names a tracked directory exactly is a request to look
-        // inside it, so the rows become its files rather than the one artifact
-        // they add up to. Reaching that list needs the manifest, which is
-        // metadata; artifact bytes are still never downloaded.
-        let inside = pointer.is_directory()
-            && args
-                .paths
-                .iter()
-                .map(|value| registry::normalize_selector(value))
-                .collect::<Result<Vec<String>, Failure>>()?
-                .iter()
-                .any(|value| value == &pointer.path);
-        if inside {
+    for selection in &selected {
+        let pointer = &selection.pointer;
+        // A path that names a tracked directory itself — or something inside
+        // one — is a request to look in it, so the rows become its files rather
+        // than the one artifact they add up to. Reaching that list needs the
+        // manifest, which is metadata; artifact bytes are still never
+        // downloaded.
+        if pointer.is_directory() && selection.exact {
             let Some(tree) = remote_tree(registry.repo(), store.as_ref(), pointer, &present)?
             else {
                 return Err(format!(
@@ -957,9 +1057,15 @@ fn list(args: &ListArgs) -> Result<(), Failure> {
                 .into());
             };
             listed_files = true;
-            for entry in &tree.entries {
+            let mut matched = 0;
+            for entry in tree.entries.iter().filter(|entry| {
+                // A selector that reached past the directory lists only what it
+                // named, so `avc list data/nested` browses that subdirectory.
+                selection.includes(&entry.path)
+            }) {
                 let on_remote = present.contains(&entry.hash);
                 rows += 1;
+                matched += 1;
                 available += usize::from(on_remote);
                 total_bytes += entry.size;
                 emit_row(
@@ -970,6 +1076,11 @@ fn list(args: &ListArgs) -> Result<(), Failure> {
                     &entry.object_id()?,
                     on_remote,
                 );
+            }
+            // Only a selector that reached *into* the directory can name
+            // nothing; the directory itself always has entries.
+            if matched == 0 && selection.inside.is_some() {
+                return Err(registry::missing_inside(selection).into());
             }
             continue;
         }
@@ -1771,8 +1882,8 @@ fn load_local_override(
     Ok(local.remotes.into_iter().find(|remote| remote.name == name))
 }
 
-/// The pointers a command should act on: all of them, or just the paths named.
-/// The artifacts a repository command should act on.
+/// The artifacts a repository command should act on: all of them, or just the
+/// paths named.
 ///
 /// Selection is the registry's, so one path language serves every command: an
 /// exact artifact path, a prefix naming everything beneath it, or nothing at
@@ -1783,7 +1894,34 @@ fn selected_pointers(repo: &Repo, paths: &[String]) -> Result<Vec<avc_core::Poin
     for pointer_path in pointer_files(&repo.root)? {
         artifacts.push(parse_pointer(&pointer_path)?);
     }
-    registry::select(artifacts, paths)
+    whole_artifacts(registry::select(artifacts, paths)?)
+}
+
+/// Reduce selections to whole artifacts, refusing one that named a part.
+///
+/// The commands that maintain a repository — `push`, `pull`, `checkout`,
+/// `commit`, `remove` — deal in artifacts, because an artifact is the unit a
+/// pointer describes and a manifest is only consistent as a whole. Taking one
+/// file out of a tracked directory is a *consumer's* operation, and `avc fetch`
+/// is the consumer's command.
+fn whole_artifacts(
+    selections: Vec<registry::Selection>,
+) -> Result<Vec<avc_core::Pointer>, Failure> {
+    let mut pointers = Vec::with_capacity(selections.len());
+    for selection in selections {
+        if selection.inside.is_some() {
+            return Err(format!(
+                "{} is inside the tracked directory {}, and this command works on whole \
+                 artifacts; name {} instead, or use `avc fetch` to take part of one",
+                selection.label(),
+                selection.pointer.path,
+                selection.pointer.path
+            )
+            .into());
+        }
+        pointers.push(selection.pointer);
+    }
+    Ok(pointers)
 }
 
 fn choose_remote<'a>(repo: &'a Repo, name: Option<&str>) -> Result<&'a Remote, Failure> {

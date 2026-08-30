@@ -194,7 +194,8 @@ impl Registry {
 }
 
 /// The headline case: name a repository and one path inside it, from a
-/// directory that is not a checkout, and get exactly that path's bytes.
+/// directory that is not a checkout, and get exactly that path's bytes — under
+/// the name that was asked for, in the directory that was asked for.
 #[test]
 fn fetches_one_path_out_of_a_shared_registry() {
     let registry = Registry::new("path");
@@ -213,19 +214,22 @@ fn fetches_one_path_out_of_a_shared_registry() {
     );
     assert!(output.contains("downloaded"), "{output}");
 
+    // `models/` is how the publisher files its artifacts, not part of what was
+    // asked for, so it is not recreated in the consumer's workspace.
     assert_eq!(
-        fs::read_to_string(job.join("out/models/bert/weights.bin")).unwrap(),
+        fs::read_to_string(job.join("out/bert/weights.bin")).unwrap(),
         "bert weights\n"
     );
     assert_eq!(
-        fs::read_to_string(job.join("out/models/bert/tokenizer.json")).unwrap(),
+        fs::read_to_string(job.join("out/bert/tokenizer.json")).unwrap(),
         "{}\n"
     );
-    // The rest of the registry was not fetched, which is the point.
     assert!(
-        !job.join("out/models/gpt").exists(),
-        "another project's model"
+        !job.join("out/models").exists(),
+        "the path walked to reach the artifact must not be recreated"
     );
+    // The rest of the registry was not fetched, which is the point.
+    assert!(!job.join("out/gpt").exists(), "another project's model");
     assert!(!job.join("out/data").exists(), "an unrelated dataset");
     assert_eq!(walk_files(&job.join("out")).len(), 2);
 
@@ -233,6 +237,101 @@ fn fetches_one_path_out_of_a_shared_registry() {
     assert!(!job.join(".git").exists());
     assert!(!job.join(".avc").exists());
     assert!(!job.join("out/.avc").exists());
+}
+
+/// A tracked directory is how the publisher grouped its files, not a limit on
+/// what a consumer may ask for. Every file inside one is an object of its own,
+/// so one of them can be fetched alone.
+#[test]
+fn fetches_one_file_out_of_a_tracked_directory() {
+    let registry = Registry::new("inside");
+    let job = registry.job("job");
+    let url = registry.url();
+
+    let output = run(
+        &job,
+        &[
+            "fetch",
+            "--repo",
+            &url,
+            "data/nested/b.bin",
+            "-o",
+            ".",
+            "--porcelain",
+        ],
+    );
+    assert_eq!(output, "downloaded\t1\t5\tdata/nested/b.bin\n");
+    assert_eq!(fs::read_to_string(job.join("b.bin")).unwrap(), "beta\n");
+    // One file, not the directory it lives in and not the path to it.
+    assert_eq!(walk_files(&job).len(), 1);
+
+    // A subdirectory of a tracked directory takes everything beneath it, and
+    // arrives keeping its own shape.
+    let sub = registry.job("sub");
+    run(
+        &sub,
+        &["fetch", "--repo", &url, "data/nested", "-o", "."],
+    );
+    assert_eq!(
+        fs::read_to_string(sub.join("nested/b.bin")).unwrap(),
+        "beta\n"
+    );
+    assert_eq!(
+        fs::read_to_string(sub.join("nested/dup.bin")).unwrap(),
+        "alpha\n"
+    );
+    assert!(!sub.join("a.bin").exists(), "a sibling outside the subtree");
+    assert!(!sub.join("data").exists());
+
+    // A path the directory does not contain is a typo, answered with what is.
+    let missing = avc(
+        &job,
+        &["fetch", "--repo", &url, "data/nested/absent.bin", "-o", "."],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&missing.stderr);
+    assert!(message.contains("data/nested/absent.bin"), "{message}");
+    assert!(message.contains("avc list data"), "{message}");
+}
+
+/// Dropping the path walked to an artifact is what makes `-o` predictable, and
+/// also the one way this command can be asked for something incoherent.
+#[test]
+fn refuses_to_write_two_artifacts_to_one_path() {
+    let registry = Registry::new("collide");
+    let job = registry.job("job");
+
+    // Both are named `weights.bin`; both would become `./weights.bin`.
+    let collision = avc(
+        &job,
+        &[
+            "fetch",
+            "--repo",
+            &registry.url(),
+            "models/bert/weights.bin",
+            "models/gpt/weights.bin",
+            "-o",
+            ".",
+        ],
+    );
+    assert_eq!(collision.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&collision.stderr);
+    assert!(message.contains("would both be written to"), "{message}");
+    assert!(message.contains("models/bert/weights.bin"), "{message}");
+    assert!(message.contains("models/gpt/weights.bin"), "{message}");
+    // Refused before anything was written, not halfway through.
+    assert!(walk_files(&job).is_empty(), "a refused run writes nothing");
+
+    // Naming the parent they share keeps them apart, and works.
+    run(&job, &["fetch", "--repo", &registry.url(), "models", "-o", "."]);
+    assert_eq!(
+        fs::read_to_string(job.join("models/bert/weights.bin")).unwrap(),
+        "bert weights\n"
+    );
+    assert_eq!(
+        fs::read_to_string(job.join("models/gpt/weights.bin")).unwrap(),
+        "gpt weights\n"
+    );
 }
 
 /// A consumer never names the bucket. The repository does, once.
@@ -482,7 +581,13 @@ fn selects_the_paths_a_pipeline_names() {
         ],
     );
     assert_eq!(one, "downloaded\t1\t12\tmodels/gpt/weights.bin\n");
-    assert!(!job.join("out/models/bert").exists());
+    // Reported by the path that names it in the repository, written under the
+    // name that was asked for.
+    assert_eq!(
+        fs::read_to_string(job.join("out/weights.bin")).unwrap(),
+        "gpt weights\n"
+    );
+    assert!(!job.join("out/models").exists());
 
     // A path that names nothing is a typo, not an empty selection.
     let missing = avc(
@@ -496,6 +601,83 @@ fn selects_the_paths_a_pipeline_names() {
     // one, so a pipeline can tell "retry this" from "fix your commit".
     let bad_ref = avc(&job, &["fetch", "--repo", &url, "--ref", "no-such-branch"]);
     assert_eq!(bad_ref.status.code(), Some(3));
+}
+
+/// Delivering and restoring are two jobs, and naming an output directory is
+/// what says which one this is.
+///
+/// A build agent asking for `models/bert` wants it where it asked, under that
+/// name. Someone in a checkout putting an old version back wants it where the
+/// pointer says it lives — anywhere else has not restored anything.
+#[test]
+fn a_checkout_is_restored_in_place_while_an_output_directory_is_delivered_to() {
+    let registry = Registry::new("restore");
+    let source = registry.source();
+
+    // Restoring: no output directory, so the artifact goes back to its own path.
+    fs::remove_file(source.join("models/bert/weights.bin")).unwrap();
+    run(&source, &["fetch", "models/bert"]);
+    assert_eq!(
+        fs::read_to_string(source.join("models/bert/weights.bin")).unwrap(),
+        "bert weights\n"
+    );
+
+    // Delivering: the same selector, with somewhere to put it.
+    run(&source, &["fetch", "models/bert", "-o", "delivered"]);
+    assert_eq!(
+        fs::read_to_string(source.join("delivered/bert/weights.bin")).unwrap(),
+        "bert weights\n"
+    );
+    assert!(!source.join("delivered/models").exists());
+
+    // `verify` asks the same question, so it looks where `fetch` wrote.
+    run(&source, &["verify", "models/bert"]);
+    run(&source, &["verify", "models/bert", "-o", "delivered"]);
+}
+
+/// Checking part of a tracked directory compares against the manifest, since
+/// the pointer only describes the directory as a whole.
+#[test]
+fn verifies_one_file_out_of_a_tracked_directory() {
+    let registry = Registry::new("verify-inside");
+    let source = registry.source();
+
+    assert_eq!(
+        run(&source, &["verify", "data/nested/b.bin", "--porcelain"]),
+        "ok\t5\tdata/nested/b.bin\n"
+    );
+    assert_eq!(
+        run(&source, &["verify", "data/nested", "--porcelain"]),
+        "ok\t11\tdata/nested\n"
+    );
+
+    // An edit inside the directory is caught for the file that changed, and not
+    // blamed on the one that did not.
+    write(&source.join("data/nested/b.bin"), "tampered\n");
+    let failed = avc(&source, &["verify", "data/nested/b.bin", "--porcelain"]);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&failed.stdout).contains("modified\t9\tdata/nested/b.bin"),
+        "{}",
+        String::from_utf8_lossy(&failed.stdout)
+    );
+    run(&source, &["verify", "data/nested/dup.bin"]);
+}
+
+/// The commands that maintain a repository work on whole artifacts, and say so
+/// rather than half-doing something.
+#[test]
+fn repository_commands_refuse_part_of_a_tracked_directory() {
+    let registry = Registry::new("partial");
+    let source = registry.source();
+
+    for command in ["push", "pull", "checkout"] {
+        let refused = avc(&source, &[command, "data/nested/b.bin"]);
+        assert_eq!(refused.status.code(), Some(1), "{command}");
+        let message = String::from_utf8_lossy(&refused.stderr);
+        assert!(message.contains("whole artifacts"), "{command}: {message}");
+        assert!(message.contains("avc fetch"), "{command}: {message}");
+    }
 }
 
 /// The same commands still work in a checkout, where the pointers are already
@@ -600,7 +782,7 @@ fn a_registry_can_be_read_at_any_revision() {
         ],
     );
     assert_eq!(
-        fs::read_to_string(job.join("models/gpt/weights.bin")).unwrap(),
+        fs::read_to_string(job.join("gpt/weights.bin")).unwrap(),
         "gpt weights\n"
     );
 }

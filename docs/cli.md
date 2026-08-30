@@ -80,11 +80,28 @@ repository-relative, with no `..`, no `.`, no absolute prefix, and no backslash.
 
 **Path selection.** Every command that takes artifact paths — `commit`, `push`,
 `pull`, `checkout`, `remove`, `fetch`, `verify`, `list` — uses one rule. A path
-matches an artifact exactly, or acts as a directory prefix naming every artifact
-beneath it; naming nothing selects everything. An exact match always wins over a
-prefix, a trailing `/` is optional, and a trailing `.avc` is stripped, so a
-pointer path from `git diff --name-only` names its artifact unchanged. A path
-that matches nothing is an error rather than an empty selection.
+matches in one of three ways:
+
+| The path | Selects |
+| --- | --- |
+| Equals an artifact's path | That artifact |
+| Is a directory prefix | Every artifact beneath it |
+| Continues past a tracked directory | The file or subdirectory named inside it |
+
+Naming nothing selects everything. The three are tried in that order, so an
+exact match always wins over a prefix and a real artifact always wins over a
+path that only looks like one from inside a manifest. A trailing `/` is
+optional, and a trailing `.avc` is stripped, so a pointer path from `git diff
+--name-only` names its artifact unchanged. A path that matches nothing is an
+error rather than an empty selection.
+
+The third form — reaching *into* a tracked directory — is available to `fetch`,
+`verify`, and `list`. Every file inside a tracked directory is stored as an
+object of its own, so one of them can be named on its own: `avc fetch
+data/nested/weights.bin` takes that file and nothing else. The commands that
+maintain a repository (`push`, `pull`, `checkout`, `commit`, `remove`) work on
+whole artifacts and refuse a partial path, because a manifest is only consistent
+as a whole.
 
 **Ordering.** Commands that operate on all artifacts process them in sorted path
 order, so repeated runs — and runs on different machines — print the same
@@ -695,12 +712,12 @@ fetched 2 objects (878.9 MiB) for 2 artifacts
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `<path>...` | every artifact | Paths inside the repository — an artifact, a prefix, or `-` for stdin |
+| `<path>...` | every artifact | Paths inside the repository — an artifact, a prefix, part of a tracked directory, or `-` for stdin |
 | `--repo <url>` | `$AVC_REPO`, else the checkout on disk | Git URL to read pointers from |
 | `--ref <rev>` | `$AVC_REF`, else the default branch, or the pointers on disk | Revision to read pointers at: a branch, tag, commit, or `refs/...` name |
 | `--remote <name>` | the repository's default | Named object store, when it configures several |
 | `--remote-url <url>` | the repository's own | Object store URL, overriding what the repository says |
-| `-o`, `--output <dir>` | worktree root, or `.` with `--repo` | Root the pointers' paths are resolved against |
+| `-o`, `--output <dir>` | worktree root, or `.` with `--repo` | Directory to deliver into |
 | `--cache <dir>` | `$AVC_CACHE_DIR`, else none | Read from and populate a cache directory |
 | `--force` | off | Overwrite files whose contents differ from their pointer |
 | `--dry-run` | off | Report the transfer without making it |
@@ -717,6 +734,36 @@ already configures.
 checkout is one commit deep, holds only text — artifacts are gitignored — and
 lives in a temporary directory deleted when the command ends. The commit a
 reference resolved to is printed, so a log records what a moving branch was.
+
+**Where it writes.** What a path names lands in the output directory under its
+own name. The directories walked to reach an artifact are how the publisher
+files it, not part of what was asked for, so they are not recreated:
+
+```bash
+avc fetch --repo <url> models/bert -o .          # ./bert/weights.bin
+avc fetch --repo <url> models/bert/weights.bin -o dist   # dist/weights.bin
+avc fetch --repo <url> data/nested -o .          # ./nested/…
+avc fetch --repo <url> -o .                      # every artifact, full paths
+```
+
+Naming no path keeps every artifact's full path, since there is no selector to
+take a parent from — that is how a whole worktree is restored, and flattening it
+would collide.
+
+Two selectors that would write different files to one path are refused before
+anything is written:
+
+```text
+avc: models/bert/weights.bin and models/gpt/weights.bin would both be written to
+weights.bin; fetch them in separate runs, or name a parent they share so their
+paths stay distinct
+```
+
+**Delivering versus restoring.** Naming `-o` says "deliver what I asked for
+here". Omitting it *inside a checkout* means "restore these artifacts", and they
+go back to the repository paths their pointers name — `avc fetch models/gpt
+--ref v1.0.0` puts that version back where it lives. With `--repo` there is no
+worktree to restore into, so the current directory is delivered to.
 
 **What it writes.** Only artifacts. No clone in your workspace, no cache unless
 `--cache` is given, no `.avc/` directory, no `.gitignore` edits, and a directory
@@ -740,11 +787,27 @@ the second is copied from wherever the first landed. The reported object and byt
 counts are artifact content only; reading a directory's manifest is metadata and
 is not counted.
 
-> **Limitations:** a path *inside* a tracked directory cannot be named — a
-> directory artifact is fetched whole. No resumable download: a dropped
-> connection restarts that object, though objects already written are not
-> re-fetched, so re-running resumes at object granularity. `gs://` and `az://`
-> fail with `provider adapter not implemented`.
+**Part of a tracked directory.** A path may continue past a tracked directory to
+name one file or one subdirectory inside it, and only that is downloaded:
+
+```bash
+avc fetch --repo <url> data/nested/b.bin -o .    # ./b.bin, one object
+```
+
+Nothing special is stored to make this work — every file inside a tracked
+directory is already an object of its own, and the manifest says which. The
+directory's manifest is read (metadata, never counted as a transfer) to find the
+object; a path it does not name is an error listing where to look:
+
+```text
+avc: no file at data/absent.bin inside the tracked directory data; `avc list data`
+shows what is in it
+```
+
+> **Limitations:** no resumable download — a dropped connection restarts that
+> object, though objects already written are not re-fetched, so re-running
+> resumes at object granularity. `gs://` and `az://` fail with `provider adapter
+> not implemented`.
 
 ### `avc verify`
 
@@ -772,8 +835,13 @@ missing          -  models/gpt/weights.bin
 | `<path>...` | every artifact | Same path selection as `avc fetch` |
 | `--repo <url>` | `$AVC_REPO`, else the checkout on disk | Git URL to read pointers from |
 | `--ref <rev>` | `$AVC_REF`, else the default branch, or the pointers on disk | Revision to read pointers at: a branch, tag, commit, or `refs/...` name |
-| `-o`, `--output <dir>` | worktree root, or `.` with `--repo` | Root the artifacts were written into |
+| `-o`, `--output <dir>` | worktree root, or `.` with `--repo` | Directory the artifacts were delivered into |
 | `--porcelain` | off | `<status>\t<bytes on disk>\t<path>`, no heading or summary |
+
+**Where it looks** is wherever `avc fetch` would have written, using the same
+rule: with `-o`, what each path names is expected directly in that directory;
+without it, in a checkout, at the artifacts' repository paths. So `avc fetch
+models/bert -o dist` is checked by `avc verify models/bert -o dist`.
 
 No object store is contacted and no credentials are read. Exits `1` if any
 artifact is `modified` or `missing`, which is what makes it usable as a pipeline
@@ -787,6 +855,13 @@ should name its paths explicitly.
 For a directory, `modified` covers a file edited, added, removed, or renamed
 anywhere beneath it, because the directory's identity is the hash of the manifest
 of its contents.
+
+Naming part of a tracked directory checks those files against the manifest's
+entries instead, since a pointer describes the directory as a whole and a
+workspace holding one file out of it would never match that. The manifest is an
+object, and `verify` contacts no store, so it has to already be in a local
+cache; where it is not, the command says so and points at checking the whole
+directory, which needs nothing but the pointer.
 
 This is `avc status` minus the repository and minus the cache column. Use
 `status` in a checkout; use `verify` in a job, or against a Git reference.

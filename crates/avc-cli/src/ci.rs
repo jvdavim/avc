@@ -13,9 +13,19 @@
 //! verified straight to their destination with no repository and no cache in
 //! the middle.
 //!
+//! Two consequences of "a job wants one thing" run through this module. What a
+//! path names lands in the output directory under its own name, rather than at
+//! the end of the directories the repository happens to file it under — a
+//! consumer asked for `models/bert`, not for a `models/` to be created in its
+//! workspace. And a path may reach *into* a tracked directory, naming one file
+//! or one subdirectory of it, because the publisher's decision to group a
+//! hundred files under one pointer should not force a consumer to take all of
+//! them. Both are the [`Selection`]'s doing; neither changes what is stored,
+//! since every file inside a tracked directory is already an object of its own.
+//!
 //! [`verify`] re-checks artifacts against their pointers using nothing but what
 //! is on disk, so a job can assert it built against the exact bytes a commit
-//! named.
+//! named. It looks where [`fetch`] writes, so the two agree by construction.
 
 use std::fs;
 use std::io::BufRead;
@@ -24,15 +34,19 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::progress::Progress;
-use crate::registry::Registry;
+use crate::registry::{Registry, Selection};
 use crate::ui::{self, Cell, Column, Style, Table};
 use crate::{Failure, State};
 
 #[derive(Debug, Args)]
 pub struct FetchArgs {
-    /// Paths inside the repository to fetch: one artifact, or a prefix naming
-    /// every artifact beneath it. Defaults to all of them; `-` reads
-    /// newline-separated paths from stdin.
+    /// Paths inside the repository to fetch: one artifact, a prefix naming
+    /// every artifact beneath it, or a file or subdirectory inside a tracked
+    /// directory. Defaults to all of them; `-` reads newline-separated paths
+    /// from stdin.
+    ///
+    /// What a path names lands directly in the output directory: `avc fetch
+    /// models/bert -o .` writes `./bert`, not `./models/bert`.
     #[arg(value_name = "PATH")]
     pub paths: Vec<String>,
 
@@ -55,7 +69,8 @@ pub struct FetchArgs {
     #[arg(long, value_name = "URL")]
     pub remote_url: Option<String>,
 
-    /// Directory to write artifacts into, at the paths their pointers name.
+    /// Directory to write into. What each path named lands here under its own
+    /// name; the directories walked to reach it are not recreated.
     #[arg(long, short, value_name = "DIR")]
     pub output: Option<PathBuf>,
 
@@ -80,6 +95,9 @@ pub struct FetchArgs {
 pub struct VerifyArgs {
     /// Paths inside the repository to check. Defaults to all of them; `-` reads
     /// newline-separated paths from stdin.
+    ///
+    /// Looked for where `avc fetch` would have written them: what a path names
+    /// is expected directly in the output directory.
     #[arg(value_name = "PATH")]
     pub paths: Vec<String>,
 
@@ -150,8 +168,11 @@ impl Transfer {
 struct Fetcher<'a> {
     store: Box<dyn avc_core::ObjectStore>,
     args: &'a FetchArgs,
-    /// Root the pointers' paths are resolved against.
+    /// Root the planned destinations are resolved against.
     output: PathBuf,
+    /// Whether to deliver what was named into [`Self::output`], or restore
+    /// artifacts to the repository paths they belong at. See [`relocates`].
+    relocate: bool,
     /// What the run has got through so far.
     ///
     /// Unlike `push` and `pull`, this counts every object the selection names,
@@ -185,6 +206,7 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
         store,
         args,
         output: output_root(args.output.as_ref(), &registry),
+        relocate: relocates(args.output.as_ref(), &registry),
         // Replaced below, once the plan says how much there is to get through.
         progress: Progress::off(),
         placed: std::collections::HashMap::new(),
@@ -205,12 +227,13 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
     }
 
     let plan = fetcher.plan(&selected)?;
+    reject_collisions(&plan)?;
     // `--porcelain` is a contract, and a progress line written into it is
     // corruption rather than decoration.
     if !args.porcelain {
         fetcher.progress = Progress::start(
             "fetching",
-            plan.iter().map(|item| item.files()).sum(),
+            plan.iter().map(|item| item.file_count()).sum(),
             plan.iter().map(|item| item.bytes()).sum(),
         );
     }
@@ -222,12 +245,12 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
         objects += transfer.objects;
         bytes += transfer.bytes;
         let (state, style) = transfer.state(args.dry_run);
-        let path = crate::display_path(&item.pointer);
+        let path = &item.label;
         if args.porcelain {
             println!("{state}\t{}\t{}\t{path}", transfer.objects, transfer.bytes);
             continue;
         }
-        let detail = if item.pointer.is_directory() {
+        let detail = if item.directory {
             format!(
                 "{}, {}",
                 ui::plural(transfer.files, "file"),
@@ -237,7 +260,7 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
             ui::size(transfer.total_bytes)
         };
         fetcher.progress.clear();
-        ui::action(state, style, &path, Some(&detail));
+        ui::action(state, style, path, Some(&detail));
     }
 
     if !args.porcelain {
@@ -257,29 +280,47 @@ pub fn fetch(args: &FetchArgs) -> Result<(), Failure> {
     Ok(())
 }
 
-/// One selected artifact, resolved: what it is and, for a directory, what it
-/// contains.
+/// One selection, resolved down to the individual files it is made of.
+///
+/// Resolving this far up front is what lets a directory, part of a directory,
+/// and a plain file all travel through the same loop: by the time anything is
+/// transferred there are only files, each with an object to get and a place to
+/// put it.
 struct Planned {
-    pointer: avc_core::Pointer,
-    tree: Option<avc_core::Tree>,
+    /// What the user named, for the log line.
+    label: String,
+    /// Whether the artifact behind this is a tracked directory, which decides
+    /// only how the line is worded.
+    directory: bool,
+    files: Vec<PlannedFile>,
+}
+
+/// One file to place: which object, and where it goes.
+struct PlannedFile {
+    object: avc_core::ObjectId,
+    size: u64,
+    /// The repository path of this file, for messages.
+    logical: String,
+    /// Where it lands, relative to the output root.
+    destination: PathBuf,
 }
 
 impl Planned {
-    /// Files this artifact is made of — one, or however many its manifest
-    /// names. The manifest itself is not one of them; see [`Transfer`].
-    fn files(&self) -> usize {
-        self.tree.as_ref().map_or(1, |tree| tree.entries.len())
+    /// How many files this selection is made of — one, or however many of a
+    /// manifest's entries it named. The manifest itself is not one of them;
+    /// see [`Transfer`].
+    fn file_count(&self) -> usize {
+        self.files.len()
     }
 
     fn bytes(&self) -> u64 {
-        self.tree
-            .as_ref()
-            .map_or(self.pointer.object.size, |tree| tree.total_size())
+        self.files.iter().map(|file| file.size).sum()
     }
 }
 
 impl Fetcher<'_> {
-    /// Resolve every selected artifact down to the files it is made of.
+    /// Resolve every selection down to the files it is made of, and where each
+    /// of them goes.
     ///
     /// Manifests are read here rather than in the middle of the transfer, which
     /// costs nothing — each is read exactly once either way — and buys an
@@ -287,54 +328,69 @@ impl Fetcher<'_> {
     /// per file, never artifact content, so reading one is not a transfer a
     /// pipeline should see reported, and it is read even on a dry run because
     /// it is what decides the answer a dry run gives.
-    fn plan(&self, selected: &[avc_core::Pointer]) -> Result<Vec<Planned>, Failure> {
+    fn plan(&self, selected: &[Selection]) -> Result<Vec<Planned>, Failure> {
         // Suppressed under `--porcelain` along with everything else that is not
         // a record, even though this one is transient and lands on stderr.
         let _status = (!self.args.porcelain)
             .then(|| crate::progress::Status::show("reading directory manifests"));
         selected
             .iter()
-            .map(|pointer| {
-                let tree = match pointer.is_directory() {
-                    true => Some(self.manifest(pointer)?),
-                    false => None,
-                };
+            .map(|selection| {
+                let pointer = &selection.pointer;
+                if !pointer.is_directory() {
+                    return Ok(Planned {
+                        label: selection.label(),
+                        directory: false,
+                        files: vec![PlannedFile {
+                            object: pointer.object_id()?,
+                            size: pointer.object.size,
+                            destination: destination(selection, &pointer.path, self.relocate),
+                            logical: pointer.path.clone(),
+                        }],
+                    });
+                }
+                let tree = self.manifest(pointer)?;
+                let mut files = Vec::new();
+                for entry in &tree.entries {
+                    if !selection.includes(&entry.path) {
+                        continue;
+                    }
+                    let logical = format!("{}/{}", pointer.path, entry.path);
+                    files.push(PlannedFile {
+                        object: entry.object_id()?,
+                        size: entry.size,
+                        destination: destination(selection, &logical, self.relocate),
+                        logical,
+                    });
+                }
+                if files.is_empty() {
+                    // Only a selector that reached *into* the directory can
+                    // name nothing; the directory itself always has entries.
+                    return Err(crate::registry::missing_inside(selection).into());
+                }
                 Ok(Planned {
-                    pointer: pointer.clone(),
-                    tree,
+                    label: selection.label(),
+                    directory: true,
+                    files,
                 })
             })
             .collect()
     }
 
-    /// Download one artifact: a file, or every file its manifest names.
+    /// Download one selection: a file, or every file of a manifest it named.
     fn artifact(&mut self, item: &Planned) -> Result<Transfer, Failure> {
-        let pointer = &item.pointer;
         let mut transfer = Transfer {
-            files: item.files(),
+            files: item.file_count(),
             total_bytes: item.bytes(),
             ..Transfer::default()
         };
-        let Some(tree) = &item.tree else {
-            let target = self.output.join(&pointer.path);
+        for file in &item.files {
+            let target = self.output.join(&file.destination);
             self.place(
-                &pointer.object_id()?,
-                pointer.object.size,
+                &file.object,
+                file.size,
                 &target,
-                &pointer.path,
-                &mut transfer,
-            )?;
-            return Ok(transfer);
-        };
-
-        for entry in &tree.entries {
-            let label = format!("{}/{}", pointer.path, entry.path);
-            let target = self.output.join(&pointer.path).join(&entry.path);
-            self.place(
-                &entry.object_id()?,
-                entry.size,
-                &target,
-                &label,
+                &file.logical,
                 &mut transfer,
             )?;
         }
@@ -515,6 +571,35 @@ enum Source {
     Remote,
 }
 
+/// Refuse a run in which two different files would be written to one path.
+///
+/// Dropping the directories a selector walked through is what makes `-o` mean
+/// what a caller expects, and it is also the one way this command can be asked
+/// to do something incoherent: `avc fetch a/model.bin b/model.bin` names two
+/// artifacts that would both become `./model.bin`. Silently letting the second
+/// overwrite the first would leave a workspace that passes `avc verify` for one
+/// of them and lies about the other.
+fn reject_collisions(plan: &[Planned]) -> Result<(), Failure> {
+    let mut claimed: std::collections::HashMap<&Path, &str> = std::collections::HashMap::new();
+    for item in plan {
+        for file in &item.files {
+            if let Some(other) = claimed.insert(&file.destination, &file.logical) {
+                if other != file.logical {
+                    return Err(format!(
+                        "{other} and {} would both be written to {}; \
+                         fetch them in separate runs, or name a parent they share \
+                         so their paths stay distinct",
+                        file.logical,
+                        file.destination.display()
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check artifacts on disk against their pointers.
 ///
 /// Everything needed is the pointers and the bytes: no object store is
@@ -529,6 +614,7 @@ pub fn verify(args: &VerifyArgs) -> Result<(), Failure> {
         return report_nothing_found(args.porcelain);
     }
     let output = output_root(args.output.as_ref(), &registry);
+    let relocate = relocates(args.output.as_ref(), &registry);
     if !args.porcelain {
         ui::heading(&format!(
             "verifying {} against {}",
@@ -545,12 +631,12 @@ pub fn verify(args: &VerifyArgs) -> Result<(), Failure> {
         Column::left("ARTIFACT"),
     ]);
     let mut failed = 0;
-    for pointer in &selected {
-        let (state, bytes) = crate::artifact_state(&output, pointer)?;
+    for selection in &selected {
+        let (state, bytes) = verify_one(&registry, &output, relocate, selection)?;
         if state != State::Ok {
             failed += 1;
         }
-        let path = crate::display_path(pointer);
+        let path = selection.label();
         if args.porcelain {
             println!("{}\t{bytes}\t{path}", state.label());
             continue;
@@ -585,13 +671,78 @@ pub fn verify(args: &VerifyArgs) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Check one selection where `fetch` would have put it.
+///
+/// A whole artifact is compared against its pointer, which needs nothing but
+/// the two. Part of a tracked directory is compared against its manifest
+/// entries instead — the pointer describes the directory as a whole, and a
+/// workspace holding one file out of it will never match that. The manifest is
+/// an object, and `verify` contacts no store, so it has to come from a local
+/// cache; without one, say so rather than guess.
+fn verify_one(
+    registry: &Registry,
+    output: &Path,
+    relocate: bool,
+    selection: &Selection,
+) -> Result<(State, u64), Failure> {
+    let pointer = &selection.pointer;
+    if selection.inside.is_none() {
+        let path = output.join(destination(selection, &pointer.path, relocate));
+        return crate::artifact_state_at(&path, pointer);
+    }
+
+    let tree = crate::load_tree(registry.repo(), pointer).map_err(|_| {
+        format!(
+            "checking {} needs the manifest of the tracked directory {}, which is not on \
+             this machine; `avc verify {}` checks the whole directory using nothing but \
+             the pointer",
+            selection.label(),
+            pointer.path,
+            pointer.path
+        )
+    })?;
+
+    let mut bytes = 0;
+    let mut missing = 0;
+    let mut modified = 0;
+    let mut checked = 0;
+    for entry in tree.entries.iter().filter(|entry| {
+        // Entry paths are relative to the directory; the selection knows which
+        // of them it named.
+        selection.includes(&entry.path)
+    }) {
+        let logical = format!("{}/{}", pointer.path, entry.path);
+        let path = output.join(destination(selection, &logical, relocate));
+        let (state, size) = crate::file_state_at(&path, entry)?;
+        checked += 1;
+        bytes += size;
+        match state {
+            State::Ok => {}
+            State::Missing => missing += 1,
+            State::Modified => modified += 1,
+        }
+    }
+    if checked == 0 {
+        return Err(crate::registry::missing_inside(selection).into());
+    }
+    // `missing` is reserved for nothing being there at all. A selection that is
+    // partly present is `modified`, because a workspace holding half of what was
+    // asked for is wrong in a way a gate must not pass.
+    let state = match (missing, modified) {
+        (0, 0) => State::Ok,
+        (missing, 0) if missing == checked => State::Missing,
+        _ => State::Modified,
+    };
+    Ok((state, bytes))
+}
+
 /// The artifacts a run should act on.
 ///
 /// Path selection is the registry's, so `avc fetch models/bert` means the same
 /// thing here as `avc pull models/bert` does in a checkout. `-` is expanded
 /// first, which lets a pipeline choose with the tools it already has:
 /// `git diff --name-only -- '*.avc' | avc fetch -`.
-fn select(registry: &Registry, paths: &[String]) -> Result<Vec<avc_core::Pointer>, Failure> {
+fn select(registry: &Registry, paths: &[String]) -> Result<Vec<Selection>, Failure> {
     registry.select(&expand_stdin(paths)?)
 }
 
@@ -604,6 +755,7 @@ fn select(registry: &Registry, paths: &[String]) -> Result<Vec<avc_core::Pointer
 /// pointers out of a temporary directory, but the artifacts they name still
 /// belong in the worktree. A registry named by URL has no worktree, so that
 /// case falls back to here.
+///
 fn output_root(explicit: Option<&PathBuf>, registry: &Registry) -> PathBuf {
     match explicit {
         Some(path) => path.clone(),
@@ -611,6 +763,38 @@ fn output_root(explicit: Option<&PathBuf>, registry: &Registry) -> PathBuf {
             .worktree()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
     }
+}
+
+/// Where one repository path lands beneath the output root.
+///
+/// Delivering drops the directories the selector walked through, so what was
+/// named arrives under its own name; restoring keeps the path a pointer gives,
+/// because that is where the artifact belongs in the worktree.
+fn destination(selection: &Selection, repository_path: &str, relocate: bool) -> PathBuf {
+    PathBuf::from(if relocate {
+        selection.destination(repository_path)
+    } else {
+        repository_path.to_owned()
+    })
+}
+
+/// Whether paths beneath the output root come from the selection or from the
+/// pointers.
+///
+/// These are two different jobs wearing one command. *Delivering* — a build
+/// agent asking for `models/bert` and a directory to put it in — should produce
+/// exactly what was asked for, named as it was asked for, with no `models/`
+/// invented along the way. *Restoring* — someone in a checkout running `avc
+/// fetch models/gpt --ref v1.0.0` to put an older version back — must write
+/// artifacts exactly where their pointers say they live, or it has not restored
+/// anything.
+///
+/// Naming an output directory says which of the two this is: it is a place to
+/// deliver to. Without one, a checkout is being restored, and a registry read
+/// by URL has no worktree to restore into, so it is delivering to the current
+/// directory. `verify` asks the same question so it looks where `fetch` wrote.
+fn relocates(explicit: Option<&PathBuf>, registry: &Registry) -> bool {
+    explicit.is_some() || registry.worktree().is_none()
 }
 
 /// Replace a `-` argument with the newline-separated paths on stdin.

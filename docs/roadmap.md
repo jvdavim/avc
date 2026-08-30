@@ -40,9 +40,14 @@ release.
   repository, reading pointers from a Git reference and the object store from
   the repository's own configuration, with no clone and no cache; `avc verify`
   gates a build on artifacts matching their pointers
-- Path selection shared by every command: an exact artifact path, or a prefix
-  naming everything beneath it. `avc list <path>` scopes a listing, and naming a
-  tracked directory lists the files inside it
+- Path selection shared by every command: an exact artifact path, a prefix
+  naming everything beneath it, or — for `fetch`, `verify`, and `list` — a file
+  or subdirectory *inside* a tracked directory, since every file in one is an
+  object of its own. `avc list <path>` scopes a listing, and naming a tracked
+  directory lists the files inside it
+- `fetch` delivers what a path named into `--output` under its own name, rather
+  than recreating the directories above it; with no `--output`, a checkout is
+  restored to the artifacts' own paths instead
 - `--porcelain` output for `status`, `list`, `fetch`, and `verify`
 - Aligned ASCII output with terminal-aware color (`--color`, `AVC_COLOR`,
   `NO_COLOR`, `CLICOLOR_FORCE`)

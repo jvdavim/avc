@@ -21,10 +21,12 @@ git add model.bin.avc  # commit the pointer, not the 4 GB
 avc push               # send the bytes to your object store
 ```
 
-In CI, name the repository and the path you need — never a bucket:
+In CI, name the repository and the path you need — never a bucket. What you name
+lands where you asked for it, under its own name:
 
 ```bash
-avc fetch --repo https://github.com/acme/artifacts models/bert -o .
+avc fetch --repo https://github.com/acme/artifacts models/bert -o .   # ./bert/…
+avc fetch --repo https://github.com/acme/artifacts data/raw/2024.csv -o .  # ./2024.csv
 ```
 
 ## Highlights
@@ -35,8 +37,9 @@ avc fetch --repo https://github.com/acme/artifacts models/bert -o .
   read checks size *and* digest, so silent corruption is detected, not served.
 - 🪶 **Nothing special required from your Git server.** No LFS batch API, no
   server hooks, no `git lfs install` on every clone. Just the binary.
-- 🧠 **Bounded memory.** Hashing streams in 64 KiB chunks. A 100 GB artifact
-  costs the same memory as a 100 byte one.
+- 🧠 **Bounded memory.** Hashing streams in fixed-size chunks. A 100 GB artifact
+  costs the same memory as a 100 byte one, and `avc add` hashes and stores in a
+  single pass over the bytes rather than reading the file twice.
 - 🛡️ **Refuses to lose your data.** Atomic writes everywhere. Modified files are
   never overwritten without `--force`. No command deletes remote data.
 - 🕵️ **No path leakage.** Object keys contain hashes only — a shared bucket never
@@ -50,11 +53,15 @@ avc fetch --repo https://github.com/acme/artifacts models/bert -o .
   appear in ten paths, ten branches, or twice inside one tracked directory.
 - 📁 **Directories are one artifact.** `avc add data/` tracks a whole tree behind
   a single pointer; editing one file in a thousand re-versions the directory
-  without re-storing the other 999.
+  without re-storing the other 999. Every file in it is still an object of its
+  own, so a consumer can fetch just one of them.
 - 🏗️ **An artifact registry, not just a repository.** One repository holds many
   projects' artifacts; `avc fetch --repo <git-url> models/bert` takes just that
   path, with no clone, no `avc init`, and no cache. The object store is read
   from the repository's own config, so consumers never name a bucket.
+- 🎁 **Delivers what you asked for.** A fetched path arrives in your output
+  directory under its own name — no `models/` recreated around it — and two
+  paths that would collide are refused rather than one overwriting the other.
 - 🦀 **Small dependency tree.** Nine direct dependencies, no async runtime. S3
   is spoken over plain HTTP with a hand-written SigV4 signer rather than a
   cloud SDK. A tool guarding your artifacts should not be a supply-chain
@@ -274,12 +281,20 @@ reference — a shallow, text-only read; artifacts are gitignored — and learns
 object store from the repository's own `.avc/config.toml`. Move the bucket and
 consumers do not change, because they never named it.
 
+A job gets what it asked for and nothing around it. `models/bert` arrives as
+`./bert`, not `./models/bert`: the directories above an artifact are how the
+registry files it, not part of the request. And a path may reach *into* a
+tracked directory — `avc fetch data/raw/2024.csv` downloads one file out of a
+thousand-file dataset, because every file in a tracked directory is stored as an
+object of its own.
+
 Nothing is written but the artifacts: no clone in the workspace, no `.avc/`
-directory, no cache. Objects are streamed and verified straight to the paths
-their pointers name, `fetch` only ever issues `GetObject` so a consuming job can
-hold a read-only policy, and a re-run is cheap because a file already hashing to
-what its pointer claims is left alone. `avc verify` re-checks a directory
-against a tag without contacting the store at all, which makes it a gate.
+directory, no cache. Objects are streamed and verified straight to where they
+were asked for, `fetch` only ever issues `GetObject` so a consuming job can hold
+a read-only policy, and a re-run is cheap because a file already hashing to what
+its pointer claims is left alone. `avc verify` looks where `fetch` wrote and
+re-checks it against a tag without contacting the store at all, which makes it a
+gate.
 
 See [CI/CD](docs/ci-cd.md) for GitHub Actions, GitLab CI, Docker, and Kubernetes
 workflows, caching between jobs, and least-privilege policies.

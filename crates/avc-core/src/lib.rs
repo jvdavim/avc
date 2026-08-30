@@ -9,7 +9,7 @@ pub mod remote;
 mod tree;
 
 pub use config::{Provider, RemoteConfig};
-pub use hashing::{hash_file, hash_reader, HashResult, StreamHasher};
+pub use hashing::{hash_copy, hash_file, hash_reader, HashResult, StreamHasher};
 pub use object::{ObjectId, ALGORITHM};
 pub use path::{normalize_repo_path, pointer_path, validate_repo_path};
 pub use pointer::{Artifact, ArtifactKind, ObjectMetadata, Pointer, POINTER_VERSION};
@@ -77,6 +77,36 @@ mod tests {
         assert_eq!(
             result.object.hash(),
             "b44ffb72fcc259676bd80495fef1b44b808ca8f1ffe1b1706a4d7911b0e31f11"
+        );
+    }
+
+    /// Storing an artifact needs its address *and* a copy of its bytes. One
+    /// pass produces both, which is what keeps `avc add` from reading a
+    /// multi-gigabyte file twice.
+    #[test]
+    fn copying_and_hashing_are_one_pass_over_the_bytes() {
+        // Larger than the read buffer, so the loop runs more than once and a
+        // copy that dropped or repeated a chunk would show up.
+        let bytes = vec![b'a'; 3 * 1024 * 1024 + 7];
+        let mut copied = Vec::new();
+        let result = hash_copy(&mut Cursor::new(bytes.clone()), &mut copied).unwrap();
+
+        assert_eq!(copied, bytes, "every byte read must reach the writer");
+        assert_eq!(result.size, bytes.len() as u64);
+        // The same address a plain hash of those bytes produces.
+        assert_eq!(
+            result.object,
+            hash_reader(&mut Cursor::new(bytes)).unwrap().object
+        );
+
+        // An empty file is a legitimate artifact, and hashes to the empty digest.
+        let mut nothing = Vec::new();
+        let empty = hash_copy(&mut Cursor::new(Vec::new()), &mut nothing).unwrap();
+        assert_eq!(empty.size, 0);
+        assert!(nothing.is_empty());
+        assert_eq!(
+            empty.object.hash(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 

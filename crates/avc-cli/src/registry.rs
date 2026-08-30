@@ -146,7 +146,7 @@ impl Registry {
     }
 
     /// The artifacts `paths` names, or all of them when nothing is named.
-    pub(crate) fn select(&self, paths: &[String]) -> Result<Vec<avc_core::Pointer>, Failure> {
+    pub(crate) fn select(&self, paths: &[String]) -> Result<Vec<Selection>, Failure> {
         select(self.artifacts()?, paths)
     }
 
@@ -176,13 +176,83 @@ impl Registry {
     }
 }
 
+/// One artifact a selector matched, and how that selector narrowed it.
+///
+/// A selection is not just "which artifact": it also carries *how it was
+/// named*, because that decides two things a bare pointer cannot. Which files
+/// of a tracked directory are wanted, and where they belong under an output
+/// root.
+#[derive(Clone, Debug)]
+pub(crate) struct Selection {
+    pub(crate) pointer: avc_core::Pointer,
+    /// The part of the selector that continued past a tracked directory:
+    /// `Some("weights.bin")` for one file inside it, `Some("sub")` for a
+    /// subdirectory of it, `None` for the whole artifact.
+    pub(crate) inside: Option<String>,
+    /// Whether the selector named this artifact itself rather than reaching it
+    /// as a prefix. `avc list data` looks *inside* the directory it names;
+    /// `avc list models` lists the artifacts beneath it.
+    pub(crate) exact: bool,
+    /// Leading repository path dropped when placing this beneath an output
+    /// root: everything above the last segment the selector named.
+    strip: String,
+}
+
+impl Selection {
+    /// The path the user named, which is what output should call this.
+    pub(crate) fn label(&self) -> String {
+        match &self.inside {
+            Some(inner) => format!("{}/{inner}", self.pointer.path),
+            None => crate::display_path(&self.pointer),
+        }
+    }
+
+    /// Where a repository path lands beneath an output root.
+    ///
+    /// What was *named* is what appears in the output directory, not the
+    /// repository's path to it: `avc fetch models/bert -o .` writes `./bert`,
+    /// and `avc fetch models/bert/weights.bin -o .` writes `./weights.bin`.
+    /// The parent directories a selector walked through are scaffolding for
+    /// finding the artifact, not part of the artifact's identity, and
+    /// reproducing them in a pipeline's workspace only makes every consumer
+    /// write a `mv` afterwards.
+    ///
+    /// Naming nothing at all keeps every path in full, since there is no
+    /// selector to take a parent from — and collapsing a whole repository into
+    /// one directory would be a name collision waiting to happen.
+    pub(crate) fn destination(&self, repository_path: &str) -> String {
+        repository_path
+            .strip_prefix(&self.strip)
+            .unwrap_or(repository_path)
+            .to_owned()
+    }
+
+    /// Whether a manifest entry belongs to this selection.
+    ///
+    /// Entry paths are relative to the tracked directory, and so is `inside`.
+    pub(crate) fn includes(&self, entry: &str) -> bool {
+        match &self.inside {
+            None => true,
+            // An exact file, or everything beneath a subdirectory of the
+            // artifact. `sub` must not match `submarine.bin`.
+            Some(inner) => entry == inner || entry.starts_with(&format!("{inner}/")),
+        }
+    }
+}
+
 /// Resolve path selectors against a set of artifacts.
 ///
-/// A selector is a path inside the repository and matches in one of two ways:
-/// exactly, naming one artifact, or as a directory prefix, naming every
-/// artifact beneath it. That is what makes a shared registry usable — `avc
+/// A selector is a path inside the repository and matches in one of three ways:
+/// exactly, naming one artifact; as a directory prefix, naming every artifact
+/// beneath it; or by continuing *past* a tracked directory, naming a file or a
+/// subdirectory inside one. That is what makes a shared registry usable — `avc
 /// fetch models/bert` pulls one project's artifacts out of a repository holding
-/// a hundred, without the caller knowing what is in it.
+/// a hundred, and `avc fetch models/bert/weights.bin` pulls one file out of a
+/// tracked directory, without the caller knowing how the publisher chose to
+/// group things.
+///
+/// The three are tried in that order, so a real artifact always wins over a
+/// path that merely looks like one from inside a directory's manifest.
 ///
 /// A trailing `/` is optional, and a trailing `.avc` is accepted and stripped,
 /// so a pointer path piped from `git diff --name-only` names its artifact
@@ -190,38 +260,111 @@ impl Registry {
 pub(crate) fn select(
     artifacts: Vec<avc_core::Pointer>,
     paths: &[String],
-) -> Result<Vec<avc_core::Pointer>, Failure> {
+) -> Result<Vec<Selection>, Failure> {
     if paths.is_empty() {
-        return Ok(artifacts);
+        return Ok(artifacts
+            .into_iter()
+            .map(|pointer| Selection {
+                pointer,
+                inside: None,
+                exact: false,
+                strip: String::new(),
+            })
+            .collect());
     }
-    let mut selected: Vec<avc_core::Pointer> = Vec::new();
+    let mut selected: Vec<Selection> = Vec::new();
     for value in paths {
         let wanted = normalize_selector(value)?;
+        let strip = parent_of(&wanted);
         let prefix = format!("{wanted}/");
-        let matched: Vec<&avc_core::Pointer> = artifacts
+        let mut matched: Vec<Selection> = Vec::new();
+
+        // An exact match wins outright: a tracked directory named `data` is one
+        // artifact, not a prefix over the artifacts beneath it.
+        for pointer in artifacts.iter().filter(|pointer| pointer.path == wanted) {
+            matched.push(Selection {
+                pointer: pointer.clone(),
+                inside: None,
+                exact: true,
+                strip: strip.clone(),
+            });
+        }
+        for pointer in artifacts
             .iter()
-            // An exact match wins outright: a tracked directory named `data`
-            // is one artifact, not a prefix over the artifacts beneath it.
-            .filter(|pointer| pointer.path == wanted)
-            .chain(
-                artifacts
-                    .iter()
-                    .filter(|pointer| pointer.path.starts_with(&prefix)),
-            )
-            .collect();
+            .filter(|pointer| pointer.path.starts_with(&prefix))
+        {
+            matched.push(Selection {
+                pointer: pointer.clone(),
+                inside: None,
+                exact: false,
+                strip: strip.clone(),
+            });
+        }
+
+        if matched.is_empty() {
+            // Nothing is tracked at this path, but a tracked directory above it
+            // may hold it. Its manifest lists every file it contains, each
+            // stored as an ordinary object, so one of them can be named on its
+            // own — the grouping the publisher chose is not a wall.
+            if let Some(pointer) = artifacts
+                .iter()
+                .filter(|pointer| pointer.is_directory())
+                .filter(|pointer| wanted.starts_with(&format!("{}/", pointer.path)))
+                // The innermost tracked directory owns the path, if directories
+                // are ever allowed to nest.
+                .max_by_key(|pointer| pointer.path.len())
+            {
+                matched.push(Selection {
+                    inside: Some(wanted[pointer.path.len() + 1..].to_owned()),
+                    pointer: pointer.clone(),
+                    exact: true,
+                    strip,
+                });
+            }
+        }
+
         if matched.is_empty() {
             // A path that names nothing is a typo, and a typo in a pipeline
             // should fail rather than quietly select nothing.
             return Err(format!("no artifact at {wanted}").into());
         }
-        for pointer in matched {
-            if !selected.iter().any(|kept| kept.path == pointer.path) {
-                selected.push(pointer.clone());
+        for selection in matched {
+            if !selected.iter().any(|kept| {
+                kept.pointer.path == selection.pointer.path && kept.inside == selection.inside
+            }) {
+                selected.push(selection);
             }
         }
     }
-    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    selected.sort_by(|left, right| {
+        (&left.pointer.path, &left.inside).cmp(&(&right.pointer.path, &right.inside))
+    });
     Ok(selected)
+}
+
+/// What to say when a selector named something a tracked directory turned out
+/// not to contain.
+///
+/// Whether the path exists is only knowable once the manifest has been read,
+/// which happens well after selection, so this is reported by whoever read it.
+pub(crate) fn missing_inside(selection: &Selection) -> String {
+    format!(
+        "no file at {} inside the tracked directory {}; \
+         `avc list {}` shows what is in it",
+        selection.label(),
+        selection.pointer.path,
+        selection.pointer.path
+    )
+}
+
+/// Everything above the last segment of a selector, including the separator.
+///
+/// `models/bert` yields `models/`, and `model.bin` yields nothing at all.
+fn parent_of(selector: &str) -> String {
+    match selector.rfind('/') {
+        Some(index) => selector[..=index].to_owned(),
+        None => String::new(),
+    }
 }
 
 /// Normalize one path selector to the form a pointer's `path` field uses.
@@ -257,8 +400,19 @@ mod tests {
         ]
     }
 
-    fn paths(selected: &[avc_core::Pointer]) -> Vec<&str> {
-        selected.iter().map(|p| p.path.as_str()).collect()
+    fn paths(selected: &[Selection]) -> Vec<&str> {
+        selected
+            .iter()
+            .map(|selection| selection.pointer.path.as_str())
+            .collect()
+    }
+
+    /// Where each selected artifact would be written beneath `-o`.
+    fn destinations(selected: &[Selection]) -> Vec<String> {
+        selected
+            .iter()
+            .map(|selection| selection.destination(&selection.pointer.path))
+            .collect()
     }
 
     #[test]
@@ -273,6 +427,79 @@ mod tests {
             paths(&select(registry(), &["models/bert/".into()]).unwrap()),
             paths(&selected)
         );
+    }
+
+    /// What was named lands in the output directory; the path walked to reach
+    /// it does not come along.
+    #[test]
+    fn a_selector_puts_what_it_named_at_the_output_root() {
+        assert_eq!(
+            destinations(&select(registry(), &["models/bert".into()]).unwrap()),
+            ["bert/tokenizer.json", "bert/weights.bin"]
+        );
+        assert_eq!(
+            destinations(&select(registry(), &["models/gpt/weights.bin".into()]).unwrap()),
+            ["weights.bin"]
+        );
+        assert_eq!(
+            destinations(&select(registry(), &["data".into()]).unwrap()),
+            ["data"]
+        );
+        // A top-level selector has no parent to drop.
+        assert_eq!(
+            destinations(&select(registry(), &["models".into()]).unwrap()),
+            [
+                "models/bert/tokenizer.json",
+                "models/bert/weights.bin",
+                "models/gpt/weights.bin"
+            ]
+        );
+        // Naming nothing keeps every path in full: there is no selector to
+        // take a parent from, and flattening a whole registry would collide.
+        assert_eq!(
+            destinations(&select(registry(), &[]).unwrap()),
+            paths(&select(registry(), &[]).unwrap())
+        );
+    }
+
+    /// A tracked directory is a grouping, not a wall: each file inside it is an
+    /// ordinary object and can be named on its own.
+    #[test]
+    fn a_path_inside_a_tracked_directory_names_what_is_in_it() {
+        let selected = select(registry(), &["data/nested/b.bin".into()]).unwrap();
+        assert_eq!(paths(&selected), ["data"]);
+        assert_eq!(selected[0].inside.as_deref(), Some("nested/b.bin"));
+        assert_eq!(selected[0].label(), "data/nested/b.bin");
+        // Only that file, and it lands under its own name.
+        assert!(selected[0].includes("nested/b.bin"));
+        assert!(!selected[0].includes("nested/other.bin"));
+        assert_eq!(
+            selected[0].destination("data/nested/b.bin"),
+            "b.bin".to_owned()
+        );
+
+        // A subdirectory of a tracked directory takes everything beneath it,
+        // and keeps its own shape.
+        let subdirectory = select(registry(), &["data/nested".into()]).unwrap();
+        assert_eq!(subdirectory[0].inside.as_deref(), Some("nested"));
+        assert!(subdirectory[0].includes("nested/b.bin"));
+        assert!(!subdirectory[0].includes("nested-other/b.bin"));
+        assert!(!subdirectory[0].includes("a.bin"));
+        assert_eq!(
+            subdirectory[0].destination("data/nested/b.bin"),
+            "nested/b.bin".to_owned()
+        );
+    }
+
+    /// A real artifact always wins over a path that only looks like one from
+    /// inside a manifest.
+    #[test]
+    fn an_artifact_of_its_own_beats_a_file_inside_a_directory() {
+        let mut artifacts = registry();
+        artifacts.push(artifact("data/nested/b.bin", false));
+        let selected = select(artifacts, &["data/nested/b.bin".into()]).unwrap();
+        assert_eq!(paths(&selected), ["data/nested/b.bin"]);
+        assert_eq!(selected[0].inside, None);
     }
 
     #[test]
@@ -311,5 +538,25 @@ mod tests {
         assert!(select(registry(), &["models/absent".into()]).is_err());
         // Escaping the repository is refused before anything is matched.
         assert!(select(registry(), &["../secrets".into()]).is_err());
+        // A path under something that is *not* a tracked directory has no
+        // manifest to look in, so it names nothing either.
+        assert!(select(registry(), &["models/gpt/weights.bin/more".into()]).is_err());
+    }
+
+    #[test]
+    fn selecting_the_same_file_inside_a_directory_twice_yields_one_copy() {
+        let selected = select(
+            registry(),
+            &["data/a.bin".into(), "data/a.bin".into(), "data".into()],
+        )
+        .unwrap();
+        assert_eq!(paths(&selected), ["data", "data"]);
+        // The whole directory and one file inside it are different requests,
+        // and both survive; the repeat does not.
+        let inside: Vec<Option<&str>> = selected
+            .iter()
+            .map(|selection| selection.inside.as_deref())
+            .collect();
+        assert_eq!(inside, [None, Some("a.bin")]);
     }
 }

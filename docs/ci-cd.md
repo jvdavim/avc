@@ -39,8 +39,17 @@ fetched 2 objects (878.9 MiB) for 2 artifacts
 Notice what is *not* in that command: a bucket, a prefix, an endpoint, or a list
 of files. AVC reads the pointers at that Git reference, learns the object store
 from the repository's own `.avc/config.toml`, and downloads exactly the objects
-the pointers under `models/bert` name — verifying each as it streams, straight to
-the path the pointer says.
+the pointers under `models/bert` name — verifying each as it streams, straight
+into `--output`.
+
+That job asked for `models/bert`, so it gets a `bert/` directory. The `models/`
+above it is how the registry files its artifacts, not something the job asked
+for, and it is not recreated in the workspace:
+
+```text
+./bert/tokenizer.json
+./bert/weights.bin
+```
 
 ---
 
@@ -186,15 +195,26 @@ Positional arguments are paths **inside the repository**:
 | `models/bert` | every artifact beneath it |
 | `models/bert/weights.bin.avc` | the same artifact; the `.avc` is stripped |
 | `data` (a tracked directory) | that directory artifact, whole |
+| `data/nested/b.bin` | one file inside that tracked directory |
+| `data/nested` | one subdirectory of it, with everything beneath |
 | `-` | newline-separated paths read from stdin |
 
 A trailing `/` is optional everywhere. An exact match always wins over a prefix,
 so a directory artifact named `data` is one artifact rather than a prefix over
-anything that happens to start with those letters.
+anything that happens to start with those letters — and a real artifact always
+wins over a path that only looks like one from inside a manifest.
 
-This is the same path language `avc push`, `avc pull`, and `avc checkout` use in
-a checkout, so `avc push models/bert` and `avc fetch models/bert` mean the same
-thing on either side of the pipeline.
+The last two rows are what makes a publisher's grouping stop being a wall. A
+tracked directory is one pointer, but every file beneath it is stored as an
+object of its own, so a job that needs one file out of a hundred-file dataset
+downloads one file. No extra publishing step makes this work; it is what `avc
+add data/` has always stored.
+
+The whole-artifact rows are the same path language `avc push`, `avc pull`, and
+`avc checkout` use in a checkout, so `avc push models/bert` and `avc fetch
+models/bert` name the same thing on either side of the pipeline. Those commands
+maintain a repository and work on whole artifacts, so they refuse a path that
+reaches into a directory rather than half-doing it.
 
 Stdin lets a job select with the tools it already has:
 
@@ -206,21 +226,39 @@ git diff --name-only HEAD~1 -- '*.avc' | avc fetch -
 Naming a path that matches nothing is an error, not an empty selection — a typo
 in a pipeline should fail the job rather than silently fetch nothing.
 
-> **Not yet supported:** naming a path *inside* a tracked directory. `avc fetch
-> data/raw` works only if `data/raw` is itself a tracked artifact; a directory
-> artifact is fetched whole. See the [roadmap](roadmap.md).
-
 ### Where files land
 
-`--output` (`-o`) is the root the pointers' paths are resolved against. A pointer
-for `models/bert/weights.bin` fetched with `-o /srv/app` lands at
-`/srv/app/models/bert/weights.bin`; parent directories are created as needed. The
-layout inside the repository is preserved, which is what makes a fetch into a
-checkout land exactly where `avc pull` would have put it.
+**What you name lands in `--output`, under its own name.** The directories above
+it are how the registry files that artifact; they are not part of what the job
+asked for, and are not recreated:
 
-With `--repo`, `--output` defaults to the current directory. Without it — when
-pointers come from a checkout — it defaults to that repository's root, so a
-command run from a subdirectory still puts artifacts where their paths say.
+```bash
+avc fetch --repo <url> models/bert -o .            # ./bert/weights.bin
+avc fetch --repo <url> models/bert/weights.bin -o dist  # dist/weights.bin
+avc fetch --repo <url> data/nested -o .            # ./nested/b.bin
+avc fetch --repo <url> data -o /srv/app            # /srv/app/data/…
+```
+
+Parent directories are created as needed. Naming **no** path keeps every
+artifact's full repository path, because there is no selector to take a parent
+from — that is how a whole worktree is restored, and flattening a registry into
+one directory would collide.
+
+Two paths that would write different files to the same place are refused before
+anything is written, rather than one silently overwriting the other:
+
+```text
+avc: models/bert/weights.bin and models/gpt/weights.bin would both be written to
+weights.bin; fetch them in separate runs, or name a parent they share so their
+paths stay distinct
+```
+
+**Delivering versus restoring.** Passing `--output` says "deliver what I asked
+for, here" — the pipeline case. Omitting it inside a checkout means "restore
+these artifacts", and they go back to the repository paths their pointers name,
+which is what makes `avc fetch --ref v1.0.0 --force` put an old version back
+where it lives. With `--repo` there is no worktree to restore into, so `--output`
+defaults to the current directory and delivers there.
 
 A directory artifact materializes as its files and nothing else; the manifest
 naming them stays in AVC's bookkeeping and is never written into the output.
@@ -300,7 +338,10 @@ up-to-date	0	0	models/bert/tokenizer.json
 | 1 | `downloaded`, `from-cache`, `up-to-date`, or `would-fetch` |
 | 2 | objects transferred |
 | 3 | bytes transferred |
-| 4 | artifact path, with a trailing `/` for a directory |
+| 4 | the path as named in the repository, with a trailing `/` for a whole directory |
+
+Column 4 identifies the artifact inside the registry, not where the file landed
+on disk — a job that logs what it fetched should log what it asked for.
 
 Unlike the human output above, this format is stable — script against it rather
 than against the table.
@@ -354,10 +395,12 @@ project owns without reading the whole registry:
 avc list --repo https://github.com/acme/artifacts models/bert
 ```
 
-**With a tracked directory named exactly**, the files stored inside it:
+**With a tracked directory named exactly**, the files stored inside it — which
+is how you find out what you can fetch out of one:
 
 ```bash
 avc list --repo https://github.com/acme/artifacts data
+avc list --repo https://github.com/acme/artifacts data/raw   # just that subtree
 ```
 
 ```text
@@ -415,6 +458,21 @@ missing          -  models/gpt/weights.bin
 For a directory, `modified` covers a file edited, added, removed, or renamed
 anywhere beneath it: the directory's identity is the hash of the manifest of its
 contents, so any of those changes it.
+
+It looks wherever `avc fetch` would have written, using the same rule — so a job
+that fetched with `-o dist` verifies with `-o dist`, and the paths it names are
+the ones it fetched:
+
+```bash
+avc fetch  --repo "$AVC_REPO" models/bert -o dist
+avc verify --repo "$AVC_REPO" models/bert -o dist
+```
+
+Naming part of a tracked directory checks those files against the manifest
+rather than against the directory pointer. The manifest is an object and
+`verify` contacts no store, so this needs the manifest to be in a local cache
+already — in a fresh job, verify the whole directory, which needs only the
+pointer.
 
 Because it takes `--repo`, it answers a question a checksum file cannot: *does
 this deployed directory still match commit `a4f21c0` of the registry?*
