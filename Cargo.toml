@@ -20,7 +20,7 @@ md-5 = "0.10"
 sha2 = "0.10"
 thiserror = "1"
 toml = "0.8"
-ureq = { version = "~3.2", default-features = false, features = [
+ureq = { version = "~3.4", default-features = false, features = [
     "rustls",
     # Lets a machine's own trust store be used instead of the built-in Mozilla
     # roots, which is what a TLS-intercepting corporate proxy needs.
