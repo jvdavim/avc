@@ -45,7 +45,14 @@ because it drives filesystem writes:
 - `version` must equal `1`.
 - `path` must be repository-relative: no leading `/`, no `..`, no `.`, no
   backslashes, no Windows drive prefixes.
-- `algorithm` must equal `sha256`.
+- `algorithm` must be `sha256` or `md5`, and the digest must be the width that
+  algorithm defines — 64 hexadecimal characters for `sha256`, 32 for `md5`.
+  `sha256` is the only one AVC creates; `md5` appears only on artifacts brought
+  in by [`avc migrate dvc`](migrating-from-dvc.md), which preserves the
+  identities those objects already had so that migrating them does not mean
+  reading every byte of every version. An object's algorithm is part of its
+  identity, so everything that re-hashes an artifact — `status`, `checkout`,
+  `doctor`, `verify` — uses the algorithm its pointer names.
 - `hash` must be exactly 64 hexadecimal characters.
 - `size` must be present and fit in a `u64`.
 - **Unknown fields are rejected.** Before the format is frozen, an unrecognized
@@ -138,7 +145,7 @@ An object is the immutable content of one artifact version, identified by the
 SHA-256 of its exact bytes. Its logical key is:
 
 ```text
-objects/sha256/<first-two-hash-characters>/<full-hash>
+objects/<algorithm>/<first-two-hash-characters>/<full-hash>
 ```
 
 Three properties follow from this:

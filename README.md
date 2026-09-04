@@ -62,7 +62,13 @@ avc fetch --repo https://github.com/acme/artifacts data/raw/2024.csv -o .  # ./2
 - 🎁 **Delivers what you asked for.** A fetched path arrives in your output
   directory under its own name — no `models/` recreated around it — and two
   paths that would collide are refused rather than one overwriting the other.
-- 🦀 **Small dependency tree.** Nine direct dependencies, no async runtime. S3
+- 🚚 **Migrates from DVC without moving the bytes.** `avc migrate dvc` replays
+  a DVC project's whole history — every branch, tag, and merge — with its `.dvc`
+  files rewritten as pointers. Migrated objects keep the MD5 identity DVC gave
+  them, so pointing the migration at the DVC remote's own bucket makes it a
+  server-side copy: no artifact bytes cross the network. Interrupted runs
+  resume.
+- 🦀 **Small dependency tree.** Ten direct dependencies, no async runtime. S3
   is spoken over plain HTTP with a hand-written SigV4 signer rather than a
   cloud SDK. A tool guarding your artifacts should not be a supply-chain
   liability.

@@ -16,7 +16,8 @@ release.
 ### Implemented
 
 - File-only artifact tracking
-- SHA-256 content addressing, streamed in bounded memory
+- SHA-256 content addressing, streamed in bounded memory, with the algorithm
+  recorded per object so an imported artifact can keep the identity it arrived with
 - Sibling pointer files (`model.bin` → `model.bin.avc`)
 - Canonical, byte-stable pointer serialization
 - Strict pointer validation with unknown-field rejection
@@ -51,13 +52,19 @@ release.
 - `--porcelain` output for `status`, `list`, `fetch`, and `verify`
 - Aligned ASCII output with terminal-aware color (`--color`, `AVC_COLOR`,
   `NO_COLOR`, `CLICOLOR_FORCE`)
+- `avc migrate dvc` — replays a DVC project's whole history, branch for branch,
+  rewriting `.dvc` files as `.avc` pointers and moving every object the history
+  references. Migrated objects keep their MD5 identity, so a destination on the
+  same S3 service is a server-side copy with no artifact bytes on the network;
+  `--rehash` buys SHA-256 identities instead. Interrupted runs resume
 
 ### Not implemented
 
 - GCS and Azure transport — `gs://` and `az://` URLs configure but do not transfer
 - IAM instance roles, ECS task roles, SSO, and `assume-role`
 - Git revision selection (`--rev`, checkout of an artifact as of an old commit)
-- Concurrent or resumable transfers (no multipart upload; a push restarts on failure)
+- Concurrent or resumable transfers (no multipart upload; a push restarts on
+  failure — `avc migrate dvc` resumes per object, but `push` and `pull` do not)
 - JSON output (`--porcelain` covers tab-separated records; there is no
   `--format json` yet)
 - Remote garbage collection

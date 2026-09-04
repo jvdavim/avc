@@ -676,6 +676,73 @@ Fails on the first corrupt object with `corrupt cache object for <path>`.
 
 ---
 
+## `avc migrate dvc`
+
+Migrate a DVC project — its history and its stored data — into AVC.
+
+```
+avc migrate dvc <DVC_REPO> <DVC_REMOTE> --into <DIR> --to <URL> [options]
+```
+
+```bash
+avc migrate dvc \
+  https://github.com/acme/ml-project \
+  s3://acme-dvc-storage \
+  --into ./ml-project-avc \
+  --to s3://acme-dvc-storage/avc
+```
+
+Replays every branch and tag of the DVC repository with its `.dvc` files
+rewritten as `.avc` pointers, and moves every object those commits reference —
+not only the ones the tip happens to name. The DVC repository and remote are
+read, never written.
+
+**If your DVC remote is large, name its own bucket in `--to`.** Migrated
+objects keep the MD5 identity DVC gave them, which means they never have to be
+read to work out where they belong; when the destination is on the same S3
+service, the storage service copies each object itself and no artifact bytes
+travel through your machine at all. Pointing `--to` somewhere else streams
+everything through this process instead, which is correct and as slow as the
+transfer is large. AVC's keys (`objects/md5/…`, `objects/sha256/…`) collide with
+no DVC layout, so both tools keep working out of one bucket during a cutover.
+
+| Flag | Effect |
+| --- | --- |
+| `--into <DIR>` | Where the AVC repository is written. Created if absent. Required. |
+| `--to <URL>` | Object store the migrated repository will use. Required. |
+| `--rehash` | Re-address every object with SHA-256 instead of keeping DVC's MD5. Reads every byte of every version. |
+| `--keep-dvc-files` | Leave `.dvc` files, `.dvc/`, `.dvcignore` and `dvc.lock` in the rewritten history. |
+| `--branch-prefix <P>` | Prefix for migrated refs when the destination already has commits. Default `dvc-`. |
+| `--remote-name <N>` | Name to record the remote under. Default `origin`. |
+| `--dvc-layout <L>` | `auto`, `files-md5` (DVC 3), or `legacy` (DVC 2 and earlier). Default `auto`. |
+| `--from-region`, `--from-profile` | SigV4 region and `~/.aws` profile for the DVC remote. |
+| `--to-region`, `--to-profile` | The same for the destination remote. |
+| `--restart` | Discard recorded progress and migrate from the beginning. |
+
+Where the history lands depends on the destination. A directory that is new or
+has no commits *becomes* the DVC project, so its branches keep their names. A
+repository that already has commits gets the migrated refs under a prefix, and
+nothing already in it — branches, tags, or working tree — is touched:
+
+```
+DVC   AVC
+dev   dvc-dev
+main  dvc-main
+```
+
+Interrupted runs resume. Progress is recorded in `.avc/state/migrate/` inside
+the destination as each unit of work finishes; re-running the same command skips
+the remote listing, the objects already transferred, and the commits already
+rewritten. A journal recording different arguments is refused rather than
+resumed — `--restart` discards it.
+
+Not preserved: GPG signatures (they sign content that no longer exists),
+annotated tag objects (they become lightweight tags at the rewritten commit),
+and outs DVC never cached or that were not addressed by MD5. Every one of those
+is reported by name when the run finishes.
+
+See [Migrating from DVC](migrating-from-dvc.md) for the full guide.
+
 ## CI/CD commands
 
 `avc fetch` and `avc verify` are built for a build agent rather than a

@@ -24,6 +24,7 @@ local content-addressed cache and synchronizes them with an object store.
 | Understand pointers, objects, and the cache | [Concepts](concepts.md) |
 | Look up a command, flag, or exit code | [CLI Reference](cli.md) |
 | Use AVC in a build pipeline | [CI/CD](ci-cd.md) |
+| Move an existing DVC project over | [Migrating from DVC](migrating-from-dvc.md) |
 | Configure remotes and credentials | [Configuration](configuration.md) |
 | Learn how the crates fit together | [Architecture](architecture.md) |
 | Contribute code, docs, or bug reports | [Contributing](contributing.md) |

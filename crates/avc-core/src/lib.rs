@@ -10,10 +10,12 @@ mod tree;
 
 pub use config::{Provider, RemoteConfig};
 pub use hashing::{hash_copy, hash_file, hash_reader, HashResult, StreamHasher};
-pub use object::{ObjectId, ALGORITHM};
+pub use object::{Algorithm, ObjectId, ALGORITHM};
 pub use path::{normalize_repo_path, pointer_path, validate_repo_path};
 pub use pointer::{Artifact, ArtifactKind, ObjectMetadata, Pointer, POINTER_VERSION};
-pub use remote::{Credentials, LocalRemoteOverride, ObjectStore, RemoteObject, TrustRoots};
+pub use remote::{
+    CopySource, Credentials, KeyStore, LocalRemoteOverride, ObjectStore, RemoteObject, TrustRoots,
+};
 pub use tree::{Tree, TreeEntry, TREE_MEDIA_TYPE, TREE_VERSION};
 
 /// Errors returned by core validation and serialization operations.
@@ -27,6 +29,8 @@ pub enum Error {
     InvalidRemote(String),
     #[error("unsupported pointer version: {0}")]
     UnsupportedPointerVersion(u32),
+    #[error("unsupported hash algorithm: {0}")]
+    UnsupportedAlgorithm(String),
     #[error("unsupported directory manifest version: {0}")]
     UnsupportedTreeVersion(u32),
     #[error("invalid directory manifest: {0}")]
@@ -72,7 +76,7 @@ mod tests {
     #[test]
     fn hashes_stream_without_loading_all_bytes() {
         let mut input = Cursor::new(vec![b'a'; 128 * 1024]);
-        let result = hash_reader(&mut input).unwrap();
+        let result = hash_reader(&mut input, Algorithm::Sha256).unwrap();
         assert_eq!(result.size, 128 * 1024);
         assert_eq!(
             result.object.hash(),
@@ -89,19 +93,31 @@ mod tests {
         // copy that dropped or repeated a chunk would show up.
         let bytes = vec![b'a'; 3 * 1024 * 1024 + 7];
         let mut copied = Vec::new();
-        let result = hash_copy(&mut Cursor::new(bytes.clone()), &mut copied).unwrap();
+        let result = hash_copy(
+            &mut Cursor::new(bytes.clone()),
+            &mut copied,
+            Algorithm::Sha256,
+        )
+        .unwrap();
 
         assert_eq!(copied, bytes, "every byte read must reach the writer");
         assert_eq!(result.size, bytes.len() as u64);
         // The same address a plain hash of those bytes produces.
         assert_eq!(
             result.object,
-            hash_reader(&mut Cursor::new(bytes)).unwrap().object
+            hash_reader(&mut Cursor::new(bytes), Algorithm::Sha256)
+                .unwrap()
+                .object
         );
 
         // An empty file is a legitimate artifact, and hashes to the empty digest.
         let mut nothing = Vec::new();
-        let empty = hash_copy(&mut Cursor::new(Vec::new()), &mut nothing).unwrap();
+        let empty = hash_copy(
+            &mut Cursor::new(Vec::new()),
+            &mut nothing,
+            Algorithm::Sha256,
+        )
+        .unwrap();
         assert_eq!(empty.size, 0);
         assert!(nothing.is_empty());
         assert_eq!(
@@ -113,7 +129,7 @@ mod tests {
     #[test]
     fn pointer_serialization_is_stable_and_round_trips() {
         let object =
-            ObjectId::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            ObjectId::sha256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
                 .unwrap();
         let pointer = Pointer::new(
             "data/model.bin",
@@ -131,7 +147,7 @@ mod tests {
     fn rejects_invalid_pointer_data() {
         let invalid = "version: 1\npath: ../secret\nobject:\n  algorithm: sha256\n  hash: bad\n  size: 1\nextra: true\n";
         assert!(Pointer::parse(invalid).is_err());
-        assert!(ObjectId::new("not-a-hash").is_err());
+        assert!(ObjectId::sha256("not-a-hash").is_err());
         assert!(validate_repo_path("../secret").is_err());
         assert!(validate_repo_path("/absolute").is_err());
         assert!(validate_repo_path("a\\b").is_err());
@@ -140,7 +156,7 @@ mod tests {
     #[test]
     fn supports_unicode_repository_paths() {
         let object =
-            ObjectId::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            ObjectId::sha256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
                 .unwrap();
         let pointer = Pointer::new("données/模型.bin", object, 1, None).unwrap();
         assert_eq!(pointer.path, "données/模型.bin");
@@ -153,7 +169,7 @@ mod tests {
     #[test]
     fn directory_pointer_names_its_manifest_and_files_stay_unchanged() {
         let manifest =
-            ObjectId::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            ObjectId::sha256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
                 .unwrap();
         let pointer = Pointer::new_directory("data", manifest.clone(), 387).unwrap();
         assert!(pointer.is_directory());
@@ -175,7 +191,7 @@ mod tests {
     #[test]
     fn manifest_order_is_canonical_so_a_directory_has_one_identity() {
         let object = |byte: char| {
-            ObjectId::new(std::iter::repeat(byte).take(64).collect::<String>()).unwrap()
+            ObjectId::sha256(std::iter::repeat(byte).take(64).collect::<String>()).unwrap()
         };
         let entry = |path: &str, byte: char| TreeEntry::new(path, object(byte), 1).unwrap();
 

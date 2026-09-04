@@ -38,7 +38,11 @@ impl Drop for TempDir {
 }
 
 fn object_for(bytes: &[u8]) -> (ObjectId, Vec<u8>) {
-    let result = avc_core::hash_reader(&mut Cursor::new(bytes.to_vec())).unwrap();
+    let result = avc_core::hash_reader(
+        &mut Cursor::new(bytes.to_vec()),
+        avc_core::Algorithm::Sha256,
+    )
+    .unwrap();
     (result.object, bytes.to_vec())
 }
 

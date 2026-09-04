@@ -268,10 +268,7 @@ fn fetches_one_file_out_of_a_tracked_directory() {
     // A subdirectory of a tracked directory takes everything beneath it, and
     // arrives keeping its own shape.
     let sub = registry.job("sub");
-    run(
-        &sub,
-        &["fetch", "--repo", &url, "data/nested", "-o", "."],
-    );
+    run(&sub, &["fetch", "--repo", &url, "data/nested", "-o", "."]);
     assert_eq!(
         fs::read_to_string(sub.join("nested/b.bin")).unwrap(),
         "beta\n"
@@ -323,7 +320,10 @@ fn refuses_to_write_two_artifacts_to_one_path() {
     assert!(walk_files(&job).is_empty(), "a refused run writes nothing");
 
     // Naming the parent they share keeps them apart, and works.
-    run(&job, &["fetch", "--repo", &registry.url(), "models", "-o", "."]);
+    run(
+        &job,
+        &["fetch", "--repo", &registry.url(), "models", "-o", "."],
+    );
     assert_eq!(
         fs::read_to_string(job.join("models/bert/weights.bin")).unwrap(),
         "bert weights\n"

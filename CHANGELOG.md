@@ -11,7 +11,59 @@ include a breaking format change. See
 
 ## [Unreleased]
 
+### Added
+
+- **`avc migrate dvc` — move a DVC project into AVC, history and data.**
+  Replays the whole Git graph, branch for branch and merge for merge, with
+  `.dvc` files and `dvc.lock` outputs rewritten as `.avc` pointers, and moves
+  every object the history references rather than only the ones the tip names.
+  Authors, dates, and messages are preserved exactly.
+
+  The expensive part of such a migration is normally re-addressing every object,
+  because AVC addresses by SHA-256 and DVC by MD5 — and a history's worth of
+  artifact versions is a download measured in terabytes. It no longer is.
+  Migrated objects keep the identity DVC gave them, so nothing has to be read to
+  know where it belongs, and when `--to` names a bucket on the same S3 service
+  the objects are moved by a server-side copy with no artifact bytes crossing
+  the network at all. `--rehash` buys SHA-256 identities instead, at the price
+  of reading everything.
+
+  Interrupted runs resume: each phase and each transferred object is recorded in
+  `.avc/state/migrate/` as it finishes, and re-running the same command skips
+  the remote listing, the objects already moved, and the commits already
+  rewritten. A journal recording different arguments is refused rather than
+  resumed.
+
+  A destination with no commits becomes the DVC project and keeps its branch
+  names; one that already has commits gets the migrated refs under a `dvc-`
+  prefix, with its own branches, tags, and working tree untouched. See
+  [Migrating from DVC](docs/migrating-from-dvc.md).
+
 ### Changed
+
+- **An object's hash algorithm is part of its identity.** Pointers and manifest
+  entries have always recorded an `algorithm`, but it was required to be
+  `sha256` and everything that re-hashed content assumed so. It is now read: a
+  digest is validated against the width its algorithm defines, object keys are
+  `objects/<algorithm>/<first-two>/<full>`, one listing of `objects/` enumerates
+  every algorithm, and `status`, `checkout`, `doctor`, `verify`, and download
+  verification each hash with the algorithm their pointer names.
+
+  `sha256` remains the only algorithm AVC creates. `md5` is readable so that a
+  migrated repository can keep the identities its objects already have, and
+  carries weaker guarantees than the rest of the format: MD5 collisions are
+  generatable in seconds, and in a content-addressed store that means two
+  different files can claim one address. Deduplication does not span algorithms.
+
+  Existing repositories are unaffected — a pointer written before this change
+  says `algorithm: sha256` and is read exactly as it was.
+
+- **Uploads of objects not addressed by SHA-256 are sent with
+  `UNSIGNED-PAYLOAD`.** SigV4 needs a payload digest, and for a SHA-256 object
+  that is the object's own hash — which is what keeps an upload to one read of
+  the bytes. An object addressed otherwise has no such digest to present;
+  declaring one would be rejected as a malformed signature rather than as the
+  mismatch it is.
 
 - **`avc fetch` delivers what you named, where you asked for it.** A fetched
   path now lands in `--output` under its own name instead of at the end of the

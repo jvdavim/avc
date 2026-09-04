@@ -171,7 +171,7 @@ Both configure and store correctly, but no adapter transfers bytes yet: `push`,
 A remote mirrors the cache layout. The full key is:
 
 ```text
-<prefix>/objects/sha256/<first-two-hash-characters>/<full-hash>
+<prefix>/objects/<algorithm>/<first-two-hash-characters>/<full-hash>
 ```
 
 For `s3://my-bucket/artifacts` and hash `1dfc4d10…`:

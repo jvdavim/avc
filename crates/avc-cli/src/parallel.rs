@@ -100,7 +100,10 @@ mod tests {
     fn results_come_back_in_input_order() {
         let items: Vec<usize> = (0..1000).collect();
         let doubled = map(&items, |value| Ok(value * 2)).unwrap();
-        assert_eq!(doubled, items.iter().map(|value| value * 2).collect::<Vec<_>>());
+        assert_eq!(
+            doubled,
+            items.iter().map(|value| value * 2).collect::<Vec<_>>()
+        );
     }
 
     #[test]

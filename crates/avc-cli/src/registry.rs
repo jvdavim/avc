@@ -379,7 +379,7 @@ mod tests {
     use super::*;
 
     fn artifact(path: &str, directory: bool) -> avc_core::Pointer {
-        let object = avc_core::ObjectId::new(
+        let object = avc_core::ObjectId::sha256(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
         .unwrap();

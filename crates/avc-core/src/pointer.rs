@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{normalize_repo_path, Error, ObjectId, Result, ALGORITHM, TREE_MEDIA_TYPE};
+use crate::{normalize_repo_path, Algorithm, Error, ObjectId, Result, TREE_MEDIA_TYPE};
 
 pub const POINTER_VERSION: u32 = 1;
 
@@ -37,7 +37,7 @@ pub struct Pointer {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectMetadata {
-    pub algorithm: String,
+    pub algorithm: Algorithm,
     pub hash: String,
     pub size: u64,
     #[serde(default)]
@@ -58,7 +58,10 @@ impl Pointer {
             path: normalize_repo_path(path)?,
             kind: ArtifactKind::File,
             object: ObjectMetadata {
-                algorithm: ALGORITHM.into(),
+                // The algorithm belongs to the object, not to this build of
+                // AVC: a pointer written for a migrated artifact records the
+                // algorithm that artifact is addressed with.
+                algorithm: object.algorithm(),
                 hash: object.hash().into(),
                 size,
                 media_type,
@@ -102,14 +105,20 @@ impl Pointer {
             return Err(Error::UnsupportedPointerVersion(self.version));
         }
         normalize_repo_path(&self.path)?;
-        if self.object.algorithm != ALGORITHM {
-            return Err(Error::InvalidObjectId(self.object.algorithm.clone()));
-        }
-        ObjectId::new(self.object.hash.clone())?;
+        // Width is checked against the named algorithm, so a pointer
+        // claiming `md5` with a 64-character digest is rejected rather than
+        // silently addressing an object that does not exist.
+        ObjectId::new(self.object.algorithm, self.object.hash.clone())?;
         Ok(())
     }
 
     pub fn object_id(&self) -> Result<ObjectId> {
-        ObjectId::new(self.object.hash.clone())
+        ObjectId::new(self.object.algorithm, self.object.hash.clone())
+    }
+
+    /// The algorithm this artifact is addressed with, which is what any
+    /// re-hashing of it on disk has to use.
+    pub fn algorithm(&self) -> Algorithm {
+        self.object.algorithm
     }
 }

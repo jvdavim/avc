@@ -1,5 +1,6 @@
 mod ci;
 mod git;
+mod migrate;
 mod parallel;
 mod progress;
 mod registry;
@@ -88,6 +89,11 @@ enum Command {
     Gc(GcArgs),
     /// Verify repository integrity: pointers, manifests, and cached objects.
     Doctor,
+    /// Import a project from another version-control tool.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
 
     /// [CI/CD] Download one path out of a repository: no clone, no cache.
     ///
@@ -105,6 +111,26 @@ enum Command {
     /// any artifact is missing or differs, which makes it a gate a pipeline can
     /// fail on. See docs/ci-cd.md.
     Verify(ci::VerifyArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrateCommand {
+    /// Migrate a DVC project - its history and its stored data - into AVC.
+    ///
+    /// Replays every branch and tag of the DVC repository with its `.dvc`
+    /// files rewritten as `.avc` pointers, and moves every object those
+    /// commits reference, not only the ones the tip happens to name.
+    ///
+    /// Migrated objects keep the MD5 identity DVC gave them, which is what
+    /// lets them be moved without being read. Naming the DVC remote's own
+    /// bucket in `--to` therefore costs no network transfer at all: the
+    /// storage service copies each object itself. That is the recommended
+    /// setup for a remote too large to pull across a network - and for a very
+    /// large one it is the difference between minutes and days.
+    ///
+    /// Interrupted runs resume. Re-run the same command and it continues from
+    /// the last thing it finished. See docs/migrating-from-dvc.md.
+    Dvc(migrate::MigrateArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -348,6 +374,9 @@ fn run(command: Command) -> Result<(), Failure> {
         Command::Remove(args) => remove(&args.paths),
         Command::Gc(args) => gc(args.remote.as_deref(), args.dry_run),
         Command::Doctor => doctor(),
+        Command::Migrate { command } => match command {
+            MigrateCommand::Dvc(args) => migrate::migrate(args),
+        },
         Command::Fetch(args) => ci::fetch(&args),
         Command::Verify(args) => ci::verify(&args),
     }
@@ -541,7 +570,7 @@ fn add_one(repo: &Repo, value: &str, require_pointer: bool) -> Result<(), Failur
 /// Hash a file, store its bytes, and describe it.
 fn track_file(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, String), Failure> {
     let source = repo.root.join(relative);
-    let hash = ingest(repo, &source)?;
+    let hash = ingest(repo, &source, avc_core::Algorithm::default())?;
     let pointer = avc_core::Pointer::new(relative, hash.object.clone(), hash.size, None)?;
     let detail = format!(
         "{}, {}",
@@ -576,9 +605,9 @@ fn track_directory(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, St
         )
         .into());
     }
-    let scanned = hash_files(&files, Some(repo))?;
+    let scanned = hash_files(&files, Some(repo), avc_core::Algorithm::default())?;
     let tree = avc_core::Tree::new(scanned.into_iter().map(|(_, entry)| entry).collect())?;
-    let manifest = write_manifest(repo, &tree)?;
+    let manifest = write_manifest(repo, &tree, avc_core::Algorithm::default())?;
     let pointer =
         avc_core::Pointer::new_directory(relative, manifest.object.clone(), manifest.size)?;
     let detail = format!(
@@ -595,8 +624,11 @@ fn track_directory(repo: &Repo, relative: &str) -> Result<(avc_core::Pointer, St
 ///
 /// Entry paths are relative to `root`, and ordering is left to
 /// `Tree::new`, so the manifest never depends on directory-iteration order.
-fn scan_directory(root: &Path) -> Result<Vec<(PathBuf, avc_core::TreeEntry)>, Failure> {
-    hash_files(&files_under(root)?, None)
+fn scan_directory(
+    root: &Path,
+    algorithm: avc_core::Algorithm,
+) -> Result<Vec<(PathBuf, avc_core::TreeEntry)>, Failure> {
+    hash_files(&files_under(root)?, None, algorithm)
 }
 
 /// Every regular file beneath `root`, as (absolute path, path relative to
@@ -617,11 +649,12 @@ fn files_under(root: &Path) -> Result<Vec<(PathBuf, String)>, Failure> {
 fn hash_files(
     files: &[(PathBuf, String)],
     store: Option<&Repo>,
+    algorithm: avc_core::Algorithm,
 ) -> Result<Vec<(PathBuf, avc_core::TreeEntry)>, Failure> {
     parallel::map(files, |(source, relative)| {
         let hash = match store {
-            Some(repo) => ingest(repo, source)?,
-            None => avc_core::hash_file(source)?,
+            Some(repo) => ingest(repo, source, algorithm)?,
+            None => avc_core::hash_file(source, algorithm)?,
         };
         Ok((
             source.clone(),
@@ -669,12 +702,16 @@ fn collect_artifact_files(
 /// one the cache already holds. That is the cheaper mistake to make: it is
 /// bounded by the write, while the alternative pays a second full read on every
 /// artifact that is *new*, which is what `add` is usually being asked to do.
-fn ingest(repo: &Repo, source: &Path) -> Result<avc_core::HashResult, Failure> {
+fn ingest(
+    repo: &Repo,
+    source: &Path,
+    algorithm: avc_core::Algorithm,
+) -> Result<avc_core::HashResult, Failure> {
     let cache = repo.root.join(".avc/cache");
     fs::create_dir_all(&cache).map_err(io_error)?;
     let temporary = cache.join(temporary_name());
 
-    let hash = match hash_into(source, &temporary) {
+    let hash = match hash_into(source, &temporary, algorithm) {
         Ok(hash) => hash,
         Err(error) => {
             // A half-written temporary is never mistaken for a cache object,
@@ -700,10 +737,14 @@ fn ingest(repo: &Repo, source: &Path) -> Result<avc_core::HashResult, Failure> {
 }
 
 /// Copy `source` to `temporary`, reporting what its bytes hashed to.
-fn hash_into(source: &Path, temporary: &Path) -> Result<avc_core::HashResult, Failure> {
+fn hash_into(
+    source: &Path,
+    temporary: &Path,
+    algorithm: avc_core::Algorithm,
+) -> Result<avc_core::HashResult, Failure> {
     let mut input = File::open(source).map_err(io_error)?;
     let mut output = File::create(temporary).map_err(io_error)?;
-    let hash = avc_core::hash_copy(&mut input, &mut output)?;
+    let hash = avc_core::hash_copy(&mut input, &mut output, algorithm)?;
     output.sync_all().map_err(io_error)?;
     Ok(hash)
 }
@@ -720,9 +761,13 @@ fn temporary_name() -> String {
 }
 
 /// Serialize a manifest into the cache and report the object it became.
-fn write_manifest(repo: &Repo, tree: &avc_core::Tree) -> Result<avc_core::HashResult, Failure> {
+pub(crate) fn write_manifest(
+    repo: &Repo,
+    tree: &avc_core::Tree,
+    algorithm: avc_core::Algorithm,
+) -> Result<avc_core::HashResult, Failure> {
     let bytes = tree.serialize_canonical()?.into_bytes();
-    let manifest = avc_core::hash_reader(&mut bytes.as_slice())?;
+    let manifest = avc_core::hash_reader(&mut bytes.as_slice(), algorithm)?;
     let destination = cache_path(repo, &manifest.object);
     if !destination.exists() {
         write_atomic(&destination, &bytes)?;
@@ -749,7 +794,7 @@ pub(crate) fn load_tree(
         .into());
     }
     let bytes = fs::read(&path).map_err(io_error)?;
-    let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
+    let actual = avc_core::hash_reader(&mut bytes.as_slice(), pointer.algorithm())?;
     if actual.size != pointer.object.size || actual.object != object {
         return Err(format!("corrupt cache object for {}", pointer.path).into());
     }
@@ -925,10 +970,12 @@ pub(crate) fn artifact_state_at(
         if !artifact.is_dir() {
             return Ok((State::Missing, 0));
         }
-        let scanned = scan_directory(artifact)?;
+        // Re-hashed with the algorithm the pointer names, so a migrated
+        // artifact is compared against the identity it actually has.
+        let scanned = scan_directory(artifact, pointer.algorithm())?;
         let tree = avc_core::Tree::new(scanned.into_iter().map(|(_, entry)| entry).collect())?;
         let bytes = tree.serialize_canonical()?.into_bytes();
-        let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
+        let actual = avc_core::hash_reader(&mut bytes.as_slice(), pointer.algorithm())?;
         let state = if actual.object.hash() == pointer.object.hash {
             State::Ok
         } else {
@@ -939,7 +986,7 @@ pub(crate) fn artifact_state_at(
     if !artifact.exists() {
         return Ok((State::Missing, 0));
     }
-    let actual = avc_core::hash_file(artifact)?;
+    let actual = avc_core::hash_file(artifact, pointer.algorithm())?;
     let state = if actual.object != pointer.object_id()? || actual.size != pointer.object.size {
         State::Modified
     } else {
@@ -960,7 +1007,7 @@ pub(crate) fn file_state_at(
     if !path.exists() {
         return Ok((State::Missing, 0));
     }
-    let actual = avc_core::hash_file(path)?;
+    let actual = avc_core::hash_file(path, entry.algorithm)?;
     let state = if actual.size != entry.size || actual.object != entry.object_id()? {
         State::Modified
     } else {
@@ -1176,7 +1223,7 @@ fn remote_tree(
     }
     let mut bytes = Vec::new();
     std::io::copy(&mut store.get(&object)?, &mut bytes).map_err(io_error)?;
-    let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
+    let actual = avc_core::hash_reader(&mut bytes.as_slice(), pointer.algorithm())?;
     if actual.size != pointer.object.size || actual.object != object {
         return Err(format!(
             "remote object for {} does not match its pointer",
@@ -1264,7 +1311,7 @@ fn materialize(
         return Err(format!("cache object missing for {label}").into());
     }
     if target.exists() && !force {
-        let actual = avc_core::hash_file(target)?;
+        let actual = avc_core::hash_file(target, object.algorithm())?;
         if actual.object.hash() != expected_hash {
             return Err(format!("refusing to replace modified file {label}; use --force").into());
         }
@@ -1590,7 +1637,7 @@ pub(crate) fn download_verified(
     let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
     let outcome = (|| -> Result<avc_core::HashResult, String> {
         let mut file = File::create(&temporary).map_err(io_error)?;
-        let mut hasher = avc_core::StreamHasher::new();
+        let mut hasher = avc_core::StreamHasher::new(expected.algorithm());
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             let read = body.read(&mut buffer).map_err(io_error)?;
@@ -1742,7 +1789,7 @@ fn verify_cached(
     if !path.exists() {
         return Ok(false);
     }
-    let actual = avc_core::hash_file(&path)?;
+    let actual = avc_core::hash_file(&path, object.algorithm())?;
     if actual.size != size || actual.object != *object {
         return Err(format!("corrupt cache object for {label}").into());
     }
@@ -1779,6 +1826,27 @@ fn save_config(repo: &Repo) -> Result<(), Failure> {
     let text = toml::to_string_pretty(&repo.config).map_err(io_error)?;
     write_atomic(&path, text.as_bytes())
 }
+/// Render `.avc/config.toml` naming one remote.
+///
+/// Used where the configuration is being written into a commit rather than
+/// onto the disk, so it goes through the same serialization the working-tree
+/// file does and cannot drift from it.
+pub(crate) fn render_remote_config(remote: &avc_core::RemoteConfig) -> Result<String, Failure> {
+    let config = Config {
+        default_remote: Some(remote.name.clone()),
+        remotes: vec![Remote {
+            name: remote.name.clone(),
+            provider: remote.provider.clone(),
+            bucket_or_container: remote.bucket_or_container.clone(),
+            prefix: remote.prefix.clone(),
+            endpoint_url: remote.endpoint_url.clone(),
+            region: remote.region.clone(),
+            profile: remote.profile.clone(),
+        }],
+    };
+    toml::to_string_pretty(&config).map_err(|error| io_error(error).into())
+}
+
 fn append_ignore(root: &Path) -> Result<(), Failure> {
     let path = root.join(".gitignore");
     let old = fs::read_to_string(&path).unwrap_or_default();
@@ -1872,7 +1940,15 @@ fn load_local_override(
     repo: &Repo,
     name: &str,
 ) -> Result<Option<avc_core::LocalRemoteOverride>, Failure> {
-    let path = repo.root.join(".avc/config.local.toml");
+    load_local_override_at(&repo.root, name)
+}
+
+/// The same, for a command holding a directory rather than a repository.
+pub(crate) fn load_local_override_at(
+    root: &Path,
+    name: &str,
+) -> Result<Option<avc_core::LocalRemoteOverride>, Failure> {
+    let path = root.join(".avc/config.local.toml");
     if !path.exists() {
         return Ok(None);
     }

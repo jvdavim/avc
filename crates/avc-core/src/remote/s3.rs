@@ -14,12 +14,27 @@ use url::Url;
 use super::credentials::{self, Credentials, LocalRemoteOverride};
 use super::sigv4::{format_amz_date, CanonicalRequest, SigningContext, EMPTY_PAYLOAD_SHA256};
 use super::tls::{self, TrustRoots};
-use super::{object_from_key, object_key, xml, ObjectStore, RemoteObject};
+use super::{
+    object_from_key, object_key, objects_prefix, xml, CopySource, KeyStore, ObjectStore,
+    RemoteObject,
+};
 use crate::{Error, ObjectId, RemoteConfig, Result};
 
 /// One page of `ListObjectsV2`. The protocol maximum; fewer round trips for a
 /// large bucket, and irrelevant for a small one.
 const LIST_PAGE_SIZE: &str = "1000";
+
+/// The largest object a single `PUT`-with-copy-source will move.
+///
+/// S3 caps a one-request server-side copy at 5 GiB; past that the API wants a
+/// multipart copy. Rather than implement one, an object over the line is
+/// reported as un-copyable so the caller streams it instead — slower, but it
+/// always works.
+const MAX_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// What SigV4 accepts in place of a payload digest when the sender cannot
+/// compute one without buffering the whole request body.
+const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
 /// Everything the transport needs, with every override already applied.
 pub struct S3Settings {
@@ -258,6 +273,105 @@ impl S3Store {
     fn describe_key(&self, path: &str) -> String {
         format!("{}{path}", self.settings.endpoint)
     }
+
+    /// Every key beneath `search_prefix`, paged to the end, with sizes.
+    ///
+    /// Literal keys rather than object identities: `list` interprets them as
+    /// AVC objects, and an import interprets them as another tool's layout.
+    fn list_raw(&self, search_prefix: &str) -> Result<Vec<(String, u64)>> {
+        let path = self.request_path("");
+        let mut found = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut query = vec![
+                ("list-type".to_string(), "2".to_string()),
+                ("max-keys".to_string(), LIST_PAGE_SIZE.to_string()),
+                ("prefix".to_string(), search_prefix.to_string()),
+            ];
+            if let Some(token) = &continuation {
+                query.push(("continuation-token".to_string(), token.clone()));
+            }
+            let mut response =
+                self.request("GET", &path, &query, EMPTY_PAYLOAD_SHA256, &[], None)?;
+            if !response.status().is_success() {
+                return Err(provider_error("list objects", response));
+            }
+            let body = response
+                .body_mut()
+                .read_to_string()
+                .map_err(|error| Error::Provider(error.to_string()))?;
+            for contents in xml::elements(&body, "Contents") {
+                let Some(key) = xml::element(contents, "Key").map(xml::decode) else {
+                    continue;
+                };
+                let size = xml::element(contents, "Size")
+                    .and_then(|size| size.trim().parse().ok())
+                    .unwrap_or(0);
+                found.push((key, size));
+            }
+            if xml::element(&body, "IsTruncated").map(str::trim) != Some("true") {
+                break;
+            }
+            let Some(token) = xml::element(&body, "NextContinuationToken").map(xml::decode) else {
+                break;
+            };
+            continuation = Some(token);
+        }
+        Ok(found)
+    }
+
+    /// Prepend the configured prefix to a caller-supplied key.
+    fn prefixed(&self, key: &str) -> String {
+        let prefix = self.settings.prefix.trim_matches('/');
+        if prefix.is_empty() {
+            key.trim_start_matches('/').to_owned()
+        } else {
+            format!("{prefix}/{}", key.trim_start_matches('/'))
+        }
+    }
+}
+
+impl KeyStore for S3Store {
+    fn describe(&self) -> String {
+        format!("{}/{}", self.settings.endpoint, self.settings.bucket)
+    }
+
+    fn get_key(&self, key: &str) -> Result<Box<dyn Read>> {
+        let key = self.prefixed(key);
+        let path = self.request_path(&key);
+        let response = self.request("GET", &path, &[], EMPTY_PAYLOAD_SHA256, &[], None)?;
+        let status = response.status();
+        if status == 404 {
+            return Err(Error::ObjectNotFound(key));
+        }
+        if !status.is_success() {
+            return Err(provider_error(&format!("download {key}"), response));
+        }
+        Ok(Box::new(response.into_body().into_reader()))
+    }
+
+    fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let full = self.prefixed(prefix);
+        let strip = self.prefixed("");
+        Ok(self
+            .list_raw(&full)?
+            .into_iter()
+            // Reported relative to the configured prefix, so a caller works in
+            // the same key space it asked in.
+            .map(|(key, size)| match key.strip_prefix(&strip) {
+                Some(rest) => (rest.to_owned(), size),
+                None => (key, size),
+            })
+            .collect())
+    }
+
+    fn copy_source(&self, key: &str) -> CopySource {
+        CopySource::S3 {
+            endpoint: self.settings.endpoint.clone(),
+            bucket: self.settings.bucket.clone(),
+            key: self.prefixed(key),
+        }
+    }
 }
 
 /// Turn a non-2xx response into an error carrying S3's own explanation.
@@ -286,13 +400,24 @@ impl ObjectStore for S3Store {
     fn put(&self, object: &ObjectId, size: u64, body: &mut dyn Read) -> Result<()> {
         let key = object_key(&self.settings.prefix, object);
         let path = self.request_path(&key);
-        // Content addressing pays off here: the payload hash SigV4 demands is
-        // the object's own hash, so the bytes are read exactly once.
+        // Content addressing pays off here: for a SHA-256 object the payload
+        // hash SigV4 demands is the object's own hash, already known, so the
+        // bytes are read exactly once. An object addressed by any other
+        // algorithm has no such digest to offer, and declaring one that is not
+        // a SHA-256 would be rejected as a malformed signature rather than as
+        // the mismatch it is — so those uploads are sent unsigned-payload,
+        // which TLS already protects in transit and which the caller's own
+        // verification catches on the way back out.
+        let payload_hash = if object.algorithm() == crate::Algorithm::Sha256 {
+            object.hash()
+        } else {
+            UNSIGNED_PAYLOAD
+        };
         let response = self.request(
             "PUT",
             &path,
             &[],
-            object.hash(),
+            payload_hash,
             &[(
                 "content-type".to_string(),
                 "application/octet-stream".to_string(),
@@ -303,6 +428,55 @@ impl ObjectStore for S3Store {
             return Err(provider_error(&format!("upload {key}"), response));
         }
         Ok(())
+    }
+
+    fn put_copy(&self, source: &CopySource, object: &ObjectId, size: u64) -> Result<bool> {
+        let CopySource::S3 {
+            endpoint,
+            bucket,
+            key: from,
+        } = source
+        else {
+            return Ok(false);
+        };
+        // A server can only copy from storage it is itself serving. Comparing
+        // the configured endpoints is conservative — two names for one service
+        // read as different — which errs towards a slower transfer that works.
+        if endpoint != &self.settings.endpoint || size > MAX_COPY_BYTES {
+            return Ok(false);
+        }
+        let key = object_key(&self.settings.prefix, object);
+        let path = self.request_path(&key);
+        // The source is named in a header, not a body, so this request carries
+        // no payload at all: the bytes move inside the service.
+        let mut response = self.request(
+            "PUT",
+            &path,
+            &[],
+            EMPTY_PAYLOAD_SHA256,
+            &[(
+                "x-amz-copy-source".to_string(),
+                super::sigv4::encode_path(&format!("/{bucket}/{from}")),
+            )],
+            None,
+        )?;
+        if !response.status().is_success() {
+            return Err(provider_error(&format!("copy {from} to {key}"), response));
+        }
+        // A copy can fail *after* the 200 has been sent, which is why the
+        // status alone is not enough: S3 documents an error inside the body of
+        // an otherwise successful response, and treating that as a success
+        // would leave a key that reads as an object and is not one.
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| Error::Provider(error.to_string()))?;
+        if let Some(code) = xml::element(&body, "Code").map(xml::decode) {
+            return Err(Error::Provider(format!(
+                "copy {from} to {key} failed after the response began: {code}"
+            )));
+        }
+        Ok(true)
     }
 
     fn get(&self, object: &ObjectId) -> Result<Box<dyn Read>> {
@@ -334,60 +508,21 @@ impl ObjectStore for S3Store {
     }
 
     fn list(&self) -> Result<Vec<RemoteObject>> {
-        // Every object we write lives under this one directory, so a single
-        // prefixed listing sees all of them and nothing else.
-        let search_prefix = {
-            let prefix = self.settings.prefix.trim_matches('/');
-            if prefix.is_empty() {
-                format!("objects/{}/", crate::ALGORITHM)
-            } else {
-                format!("{prefix}/objects/{}/", crate::ALGORITHM)
-            }
-        };
-        let path = self.request_path("");
-        let mut found = Vec::new();
-        let mut continuation: Option<String> = None;
-        loop {
-            let mut query = vec![
-                ("list-type".to_string(), "2".to_string()),
-                ("max-keys".to_string(), LIST_PAGE_SIZE.to_string()),
-                ("prefix".to_string(), search_prefix.clone()),
-            ];
-            if let Some(token) = &continuation {
-                query.push(("continuation-token".to_string(), token.clone()));
-            }
-            let mut response =
-                self.request("GET", &path, &query, EMPTY_PAYLOAD_SHA256, &[], None)?;
-            if !response.status().is_success() {
-                return Err(provider_error("list objects", response));
-            }
-            let body = response
-                .body_mut()
-                .read_to_string()
-                .map_err(|error| Error::Provider(error.to_string()))?;
-            for contents in xml::elements(&body, "Contents") {
-                let Some(key) = xml::element(contents, "Key").map(xml::decode) else {
-                    continue;
-                };
-                // Keys we did not write share the bucket; skip them silently
-                // rather than failing a listing someone else's data broke.
-                let Some(object) = object_from_key(&key) else {
-                    continue;
-                };
-                let size = xml::element(contents, "Size")
-                    .and_then(|size| size.trim().parse().ok())
-                    .unwrap_or(0);
-                found.push(RemoteObject { object, size });
-            }
-            if xml::element(&body, "IsTruncated").map(str::trim) != Some("true") {
-                break;
-            }
-            let Some(token) = xml::element(&body, "NextContinuationToken").map(xml::decode) else {
-                break;
-            };
-            continuation = Some(token);
-        }
-        Ok(found)
+        // Every object we write lives under this one directory, whatever
+        // algorithm addresses it, so a single prefixed listing sees all of
+        // them and nothing else.
+        let found = self.list_raw(&objects_prefix(&self.settings.prefix))?;
+        Ok(found
+            .into_iter()
+            // Keys we did not write share the bucket; skip them silently
+            // rather than failing a listing someone else's data broke.
+            .filter_map(|(key, size)| {
+                Some(RemoteObject {
+                    object: object_from_key(&key)?,
+                    size,
+                })
+            })
+            .collect())
     }
 }
 
@@ -413,7 +548,8 @@ mod tests {
     }
 
     fn object() -> ObjectId {
-        ObjectId::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap()
+        ObjectId::sha256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .unwrap()
     }
 
     #[test]

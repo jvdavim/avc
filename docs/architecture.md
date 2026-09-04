@@ -14,7 +14,7 @@ avc/
     │   └── src/
     │       ├── lib.rs          # re-exports, Error enum, unit tests
     │       ├── config.rs       # Provider, RemoteConfig, URL parsing
-    │       ├── hashing.rs      # streaming SHA-256
+    │       ├── hashing.rs      # streaming SHA-256 and MD5
     │       ├── object.rs       # ObjectId, cache key derivation
     │       ├── path.rs         # repository path validation and normalization
     │       ├── pointer.rs      # Pointer, ObjectMetadata, canonical YAML
@@ -48,11 +48,11 @@ is reading bytes to hash them.
 
 ### `object.rs` — content addresses
 
-`ObjectId` wraps a validated SHA-256 digest. Construction is the only way in, and
+`ObjectId` wraps a validated digest and the algorithm that produced it. Construction is the only way in, and
 it enforces 64 hex characters, lowercasing on the way through, so an invalid
 digest cannot exist as an `ObjectId` anywhere in the program.
 
-`cache_key()` derives `objects/sha256/<first-two>/<full>`. Both the local cache
+`cache_key()` derives `objects/<algorithm>/<first-two>/<full>`. Both the local cache
 and every remote use this one function, which is what keeps the two layouts
 identical by construction rather than by convention.
 
@@ -354,6 +354,7 @@ is a supply-chain liability for the repositories it guards.
 | `serde_yaml` | Pointer serialization |
 | `toml` | Config serialization |
 | `sha2` | SHA-256 |
+| `md-5` | MD5, for reading identities preserved from an imported project |
 | `thiserror` | Error enum |
 | `url` | Remote URL parsing |
 

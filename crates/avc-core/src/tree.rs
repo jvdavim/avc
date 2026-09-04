@@ -13,7 +13,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{normalize_repo_path, validate_repo_path, Error, ObjectId, Result, ALGORITHM};
+use crate::{normalize_repo_path, validate_repo_path, Algorithm, Error, ObjectId, Result};
 
 pub const TREE_VERSION: u32 = 1;
 
@@ -35,7 +35,7 @@ pub struct Tree {
 pub struct TreeEntry {
     /// Path relative to the tracked directory, never to the repository root.
     pub path: String,
-    pub algorithm: String,
+    pub algorithm: Algorithm,
     pub hash: String,
     pub size: u64,
 }
@@ -44,24 +44,21 @@ impl TreeEntry {
     pub fn new(path: impl AsRef<Path>, object: ObjectId, size: u64) -> Result<Self> {
         Ok(Self {
             path: normalize_repo_path(path)?,
-            algorithm: object.algorithm().into(),
+            algorithm: object.algorithm(),
             hash: object.hash().into(),
             size,
         })
     }
 
     pub fn object_id(&self) -> Result<ObjectId> {
-        ObjectId::new(self.hash.clone())
+        ObjectId::new(self.algorithm, self.hash.clone())
     }
 
     fn validate(&self) -> Result<()> {
         // A manifest drives filesystem writes on checkout, so its paths are
         // untrusted input held to the same rules as a pointer's own path.
         validate_repo_path(&self.path)?;
-        if self.algorithm != ALGORITHM {
-            return Err(Error::InvalidObjectId(self.algorithm.clone()));
-        }
-        ObjectId::new(self.hash.clone())?;
+        ObjectId::new(self.algorithm, self.hash.clone())?;
         Ok(())
     }
 }

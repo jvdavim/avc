@@ -423,7 +423,7 @@ impl Fetcher<'_> {
 
         // Verified whichever side it came from: a manifest decides where
         // `fetch` writes, so it is untrusted input even off a local disk.
-        let actual = avc_core::hash_reader(&mut bytes.as_slice())?;
+        let actual = avc_core::hash_reader(&mut bytes.as_slice(), pointer.algorithm())?;
         if actual.size != pointer.object.size || actual.object != object {
             return Err(format!(
                 "directory manifest for {} does not match its pointer",
@@ -454,7 +454,7 @@ impl Fetcher<'_> {
     ) -> Result<(), Failure> {
         self.progress.item(label);
         if target.exists() {
-            let actual = avc_core::hash_file(target)?;
+            let actual = avc_core::hash_file(target, object.algorithm())?;
             if actual.size == size && actual.object == *object {
                 // Already correct, and proving it cost a full read of the file.
                 self.progress.done(size);
@@ -542,7 +542,7 @@ impl Fetcher<'_> {
         }
         // A cache is a saving only if reading it beats the network, and safe
         // only if it is verified; re-hashing locally is both.
-        let actual = avc_core::hash_file(&cached)?;
+        let actual = avc_core::hash_file(&cached, object.algorithm())?;
         if actual.size == size && actual.object == *object {
             return Ok(Source::Copy(cached));
         }
