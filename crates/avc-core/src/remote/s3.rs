@@ -271,7 +271,12 @@ impl S3Store {
     }
 
     fn describe_key(&self, path: &str) -> String {
-        format!("{}{path}", self.settings.endpoint)
+        self.url(path, &[])
+    }
+
+    fn describe_store(&self) -> String {
+        let prefix = self.settings.prefix.trim_matches('/');
+        self.url(&self.request_path(prefix), &[])
     }
 
     /// Every key beneath `search_prefix`, paged to the end, with sizes.
@@ -333,7 +338,7 @@ impl S3Store {
 
 impl KeyStore for S3Store {
     fn describe(&self) -> String {
-        format!("{}/{}", self.settings.endpoint, self.settings.bucket)
+        self.describe_store()
     }
 
     fn get_key(&self, key: &str) -> Result<Box<dyn Read>> {
@@ -394,7 +399,7 @@ fn provider_error(context: &str, mut response: ureq::http::Response<ureq::Body>)
 
 impl ObjectStore for S3Store {
     fn describe(&self) -> String {
-        format!("{}/{}", self.settings.endpoint, self.settings.bucket)
+        self.describe_store()
     }
 
     fn put(&self, object: &ObjectId, size: u64, body: &mut dyn Read) -> Result<()> {
@@ -561,6 +566,10 @@ mod tests {
             "http://localhost:9000/my-bucket/artifacts/objects/sha256/01/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(store.host_header(), "localhost:9000");
+        assert_eq!(
+            ObjectStore::describe(&store),
+            "http://localhost:9000/my-bucket/artifacts"
+        );
     }
 
     #[test]
@@ -572,6 +581,24 @@ mod tests {
             "https://my-bucket.s3.us-east-1.amazonaws.com/artifacts/objects/sha256/01/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(store.host_header(), "my-bucket.s3.us-east-1.amazonaws.com");
+        assert_eq!(
+            ObjectStore::describe(&store),
+            "https://my-bucket.s3.us-east-1.amazonaws.com/artifacts"
+        );
+        assert_eq!(
+            store.describe_key(&store.request_path(&key)),
+            "https://my-bucket.s3.us-east-1.amazonaws.com/artifacts/objects/sha256/01/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn path_style_errors_describe_the_bucket_and_prefix() {
+        let store = S3Store::new(settings("http://localhost:9000", true)).unwrap();
+        let key = object_key(&store.settings.prefix, &object());
+        assert_eq!(
+            store.describe_key(&store.request_path(&key)),
+            "http://localhost:9000/my-bucket/artifacts/objects/sha256/01/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]
