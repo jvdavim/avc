@@ -2,6 +2,7 @@
 
 mod config;
 mod hashing;
+mod hex;
 mod object;
 mod path;
 mod pointer;
