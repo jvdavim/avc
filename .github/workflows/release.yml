@@ -1,0 +1,177 @@
+name: Release
+
+# A release is cut by pushing an annotated `vX.Y.Z` tag. Everything that
+# identifies the release -- the version, the notes -- is read back out of the
+# repository at that tag, so the tag is the only thing a human has to get right.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # Builds the artifacts for a tag without publishing anything, so the matrix
+  # can be exercised before a version number is spent on it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (no release is published)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Check the tag against the workspace version
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          # Scoped to [workspace.package] so a dependency's own version line
+          # cannot be mistaken for the workspace's.
+          declared=$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ "$version" != "$declared" ]; then
+            echo "::error::tag $tag wants version $version, but Cargo.toml declares $declared"
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section"
+            exit 1
+          fi
+          # Anything with a hyphen after the version -- v1.0.0-rc.1 -- is a
+          # pre-release, per semver.
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (prerelease=$prerelease)"
+
+      - name: Extract the release notes
+        run: |
+          set -euo pipefail
+          awk -v want="${{ steps.tag.outputs.version }}" '
+            # The link-reference block at the foot of the file belongs to no
+            # section, and would otherwise trail the last one.
+            /^\[[^]]+\]: / { inside = 0 }
+            /^## \[/ { inside = ($0 ~ "^## \\[" want "\\]"); next }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "::error::empty release notes"; exit 1; }
+          cat notes.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: notes.md
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # --locked: the binaries people download are built from the dependency
+      # versions CI tested, not from whatever resolved that morning.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --package avc-cli
+
+      - name: Smoke-test the binary
+        # A cross-compiled binary cannot run on the builder, so only check the
+        # ones whose target matches the host.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          set -euo pipefail
+          got=$(./target/${{ matrix.target }}/release/avc --version)
+          echo "$got"
+          case "$got" in
+            *"${{ needs.verify.outputs.version }}"*) ;;
+            *) echo "::error::avc --version reported '$got'"; exit 1 ;;
+          esac
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          name="avc-${{ needs.verify.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/avc" "dist/$name/"
+          cp README.md LICENSE CHANGELOG.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          shasum -a 256 "dist/$name.tar.gz"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [verify, build]
+    # A manual run builds and verifies; only a tag push publishes.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Collect the assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
+          cp artifacts/release-notes/notes.md .
+          (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.verify.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ needs.verify.outputs.tag }}" \
+            --notes-file notes.md \
+            ${{ needs.verify.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            dist/*.tar.gz dist/SHA256SUMS

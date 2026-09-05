@@ -7,7 +7,7 @@ Status: Iteration 0 prototype contract. Formats remain provisional until clone, 
 - Artifact model: regular files and directories. A directory is tracked as a single artifact whose object is a manifest of the files beneath it.
 - Pointer placement: sibling file with `.avc` appended. `model.bin` uses `model.bin.avc` and `data/` uses `data.avc`; the artifact path itself remains ignored by Git.
 - Hash: SHA-256 over exact file bytes, streamed in bounded memory. SHA-256 is the only algorithm AVC mints. MD5 is readable but never chosen; see *Hash Algorithms*.
-- Minimum Rust: 1.75. Minimum Git: 2.30. Intended OSes: macOS, Linux, and Windows.
+- Minimum Rust: 1.88. Minimum Git: 2.30. Intended OSes: macOS, Linux, and Windows.
 - Remote providers: explicit `s3://`, `s3+https://`, `s3+http://`, `gs://`, and `az://` schemes. `file://` is supported as an offline development remote. Provider is never inferred from arbitrary hostnames.
 
 ## Pointer Format

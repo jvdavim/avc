@@ -7,8 +7,10 @@
 //!
 //! Reference: <https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html>
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+
+use crate::hex::encode as hex;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -111,14 +113,6 @@ fn sign(key: &[u8], message: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(message);
     mac.finalize().into_bytes().to_vec()
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }
 
 /// Percent-encode a path, preserving `/` as a segment separator.

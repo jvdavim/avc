@@ -5,6 +5,7 @@ use std::path::Path;
 use md5::Md5;
 use sha2::{Digest, Sha256};
 
+use crate::hex;
 use crate::{Algorithm, ObjectId, Result};
 
 /// Bytes moved per read.
@@ -67,8 +68,8 @@ impl StreamHasher {
     /// Consume the hasher and report what it saw.
     pub fn finish(self) -> Result<HashResult> {
         let (algorithm, hash) = match self.digester {
-            Digester::Sha256(hasher) => (Algorithm::Sha256, format!("{:x}", hasher.finalize())),
-            Digester::Md5(hasher) => (Algorithm::Md5, format!("{:x}", hasher.finalize())),
+            Digester::Sha256(hasher) => (Algorithm::Sha256, hex::encode(&hasher.finalize())),
+            Digester::Md5(hasher) => (Algorithm::Md5, hex::encode(&hasher.finalize())),
         };
         Ok(HashResult {
             object: ObjectId::new(algorithm, hash)?,

@@ -9,13 +9,19 @@ equivalent.
 
 | Tool | Minimum | Why |
 | --- | --- | --- |
-| Rust | 1.75 | Workspace MSRV, declared in `Cargo.toml` |
+| Rust | 1.88 | Workspace MSRV, declared in `Cargo.toml`. Only to build from source |
 | Git | 2.30 | AVC discovers the repository root by walking up to `.git` |
 | OS | macOS, Linux, or Windows | Atomic rename semantics differ but are handled |
 
-AVC is not yet published to crates.io, so install from source.
-
 ## Install
+
+The quickest route is a prebuilt binary. Every release publishes `avc` for Linux
+and macOS on x86-64 and ARM64 at
+[Releases](https://github.com/jvdavim/avc/releases): download the archive for
+your platform, check it against the release's `SHA256SUMS`, and unpack it. The
+README has [the exact commands](../README.md#a-prebuilt-binary).
+
+AVC is not yet published to crates.io, so the alternative is building it:
 
 ```bash
 git clone https://github.com/jvdavim/avc.git

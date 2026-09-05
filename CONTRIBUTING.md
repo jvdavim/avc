@@ -47,6 +47,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | --- | --- |
 | Full contribution guide | [`docs/contributing.md`](docs/contributing.md) |
 | Dev environment and debugging | [`docs/development.md`](docs/development.md) |
+| Cutting a release | [`docs/releasing.md`](docs/releasing.md) |
 | How the code is organized | [`docs/architecture.md`](docs/architecture.md) |
 | What needs doing | [`docs/roadmap.md`](docs/roadmap.md) |
 | Format and safety contract | [`SPEC.md`](SPEC.md) |
