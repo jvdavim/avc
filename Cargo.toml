@@ -13,7 +13,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-hmac = "0.12"
+hmac = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 md-5 = "0.10"
