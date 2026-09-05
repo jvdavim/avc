@@ -11,7 +11,35 @@ include a breaking format change. See
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-05
+
+First release. Iteration 0 — the on-disk formats are provisional.
+
+AVC was built in the open well before it was tagged, so this section is the
+whole of what `v0.1.0` ships rather than a delta. The *Changed* entries record
+how behavior moved during that development, against earlier untagged states of
+`main`, because repositories written against those states exist.
+
+Building from source needs Rust 1.88 or newer. A prebuilt binary needs nothing.
+
 ### Added
+
+- `avc init` — initialize AVC in a Git worktree
+- `avc remote add` / `avc remote list` — configure object store remotes
+- `avc add` — track a file, hash it, cache it, and write a pointer
+- `avc commit` — record a new version of an already-tracked artifact
+- `avc status` — report working-tree and cache state
+- `avc list` — show tracked artifacts and remote availability without downloading
+- `avc push` / `avc pull` — transfer objects to and from a remote
+- `avc checkout` — materialize artifacts from the cache
+- `avc remove` — stop tracking an artifact
+- `avc gc` — delete unreferenced cache objects
+- `avc doctor` — verify repository, pointer, and cache integrity
+- SHA-256 content addressing, streamed in bounded memory
+- Canonical, byte-stable YAML pointer serialization with strict validation
+- Local content-addressed cache with atomic writes and verified reads
+- Explicit remote URL schemes: `file://`, `s3://`, `s3+https://`, `gs://`, `az://`
+- Automatic `.gitignore` management
 
 - **`avc migrate dvc` — move a DVC project into AVC, history and data.**
   Replays the whole Git graph, branch for branch and merge for merge, with
@@ -38,46 +66,6 @@ include a breaking format change. See
   names; one that already has commits gets the migrated refs under a `dvc-`
   prefix, with its own branches, tags, and working tree untouched. See
   [Migrating from DVC](docs/migrating-from-dvc.md).
-
-### Changed
-
-- **An object's hash algorithm is part of its identity.** Pointers and manifest
-  entries have always recorded an `algorithm`, but it was required to be
-  `sha256` and everything that re-hashed content assumed so. It is now read: a
-  digest is validated against the width its algorithm defines, object keys are
-  `objects/<algorithm>/<first-two>/<full>`, one listing of `objects/` enumerates
-  every algorithm, and `status`, `checkout`, `doctor`, `verify`, and download
-  verification each hash with the algorithm their pointer names.
-
-  `sha256` remains the only algorithm AVC creates. `md5` is readable so that a
-  migrated repository can keep the identities its objects already have, and
-  carries weaker guarantees than the rest of the format: MD5 collisions are
-  generatable in seconds, and in a content-addressed store that means two
-  different files can claim one address. Deduplication does not span algorithms.
-
-  Existing repositories are unaffected — a pointer written before this change
-  says `algorithm: sha256` and is read exactly as it was.
-
-- **Uploads of objects not addressed by SHA-256 are sent with
-  `UNSIGNED-PAYLOAD`.** SigV4 needs a payload digest, and for a SHA-256 object
-  that is the object's own hash — which is what keeps an upload to one read of
-  the bytes. An object addressed otherwise has no such digest to present;
-  declaring one would be rejected as a malformed signature rather than as the
-  mismatch it is.
-
-- **`avc fetch` delivers what you named, where you asked for it.** A fetched
-  path now lands in `--output` under its own name instead of at the end of the
-  directories the repository files it under: `avc fetch --repo <url>
-  artifacts/model1 -o .` writes `./model1`, not `./artifacts/model1`. Naming no
-  path still keeps every artifact's full path, since there is no selector to
-  take a parent from, and omitting `--output` inside a checkout still restores
-  artifacts to the paths their pointers name — `avc fetch --ref v1.0.0 --force`
-  puts an old version back where it lives. `avc verify` uses the same rule, so
-  it looks where `fetch` wrote. Two paths that would write different files to
-  one destination are refused before anything is written. **Breaking** for a
-  pipeline that depended on the old layout.
-
-### Added
 
 - **A path may name part of a tracked directory.** `avc fetch
   data/nested/weights.bin` downloads that one file, and `avc fetch data/nested`
@@ -236,9 +224,50 @@ include a breaking format change. See
   `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CHANGELOG.md`, and `.editorconfig`.
 - GitHub CI workflow running fmt, clippy, tests on Linux/macOS/Windows, an MSRV
   check, and a doc build.
+- **Prebuilt binaries.** Pushing a `vX.Y.Z` tag publishes `avc` for Linux and
+  macOS on x86-64 and ARM64, with SHA-256 sums and with these notes as the
+  release body. The tag is checked against the workspace version and this file
+  before anything is built, and the binaries are built `--locked`, from the
+  exact dependency versions CI tested. See [Releasing](docs/releasing.md).
 - Issue and pull request templates, and Dependabot configuration.
 
 ### Changed
+
+- **An object's hash algorithm is part of its identity.** Pointers and manifest
+  entries have always recorded an `algorithm`, but it was required to be
+  `sha256` and everything that re-hashed content assumed so. It is now read: a
+  digest is validated against the width its algorithm defines, object keys are
+  `objects/<algorithm>/<first-two>/<full>`, one listing of `objects/` enumerates
+  every algorithm, and `status`, `checkout`, `doctor`, `verify`, and download
+  verification each hash with the algorithm their pointer names.
+
+  `sha256` remains the only algorithm AVC creates. `md5` is readable so that a
+  migrated repository can keep the identities its objects already have, and
+  carries weaker guarantees than the rest of the format: MD5 collisions are
+  generatable in seconds, and in a content-addressed store that means two
+  different files can claim one address. Deduplication does not span algorithms.
+
+  Existing repositories are unaffected — a pointer written before this change
+  says `algorithm: sha256` and is read exactly as it was.
+
+- **Uploads of objects not addressed by SHA-256 are sent with
+  `UNSIGNED-PAYLOAD`.** SigV4 needs a payload digest, and for a SHA-256 object
+  that is the object's own hash — which is what keeps an upload to one read of
+  the bytes. An object addressed otherwise has no such digest to present;
+  declaring one would be rejected as a malformed signature rather than as the
+  mismatch it is.
+
+- **`avc fetch` delivers what you named, where you asked for it.** A fetched
+  path now lands in `--output` under its own name instead of at the end of the
+  directories the repository files it under: `avc fetch --repo <url>
+  artifacts/model1 -o .` writes `./model1`, not `./artifacts/model1`. Naming no
+  path still keeps every artifact's full path, since there is no selector to
+  take a parent from, and omitting `--output` inside a checkout still restores
+  artifacts to the paths their pointers name — `avc fetch --ref v1.0.0 --force`
+  puts an old version back where it lives. `avc verify` uses the same rule, so
+  it looks where `fetch` wrote. Two paths that would write different files to
+  one destination are refused before anything is written. **Breaking** for a
+  pipeline that depended on the old layout.
 
 - **Command output is reformatted.** Aligned ASCII tables for `status`, `list`,
   `verify`, and `remote list`; a fixed verb column for the per-artifact lines of
@@ -261,41 +290,15 @@ include a breaking format change. See
 - `avc checkout` now reports a named path with no pointer as an error rather
   than ignoring it, matching `push` and `pull`.
 
-## [0.1.0]
-
-Initial prototype release. Iteration 0 — formats are provisional.
-
-### Added
-
-- `avc init` — initialize AVC in a Git worktree
-- `avc remote add` / `avc remote list` — configure object store remotes
-- `avc add` — track a file, hash it, cache it, and write a pointer
-- `avc commit` — record a new version of an already-tracked artifact
-- `avc status` — report working-tree and cache state
-- `avc list` — show tracked artifacts and remote availability without downloading
-- `avc push` / `avc pull` — transfer objects to and from a remote
-- `avc checkout` — materialize artifacts from the cache
-- `avc remove` — stop tracking an artifact
-- `avc gc` — delete unreferenced cache objects
-- `avc doctor` — verify repository, pointer, and cache integrity
-- SHA-256 content addressing, streamed in bounded memory
-- Canonical, byte-stable YAML pointer serialization with strict validation
-- Local content-addressed cache with atomic writes and verified reads
-- Explicit remote URL schemes: `file://`, `s3://`, `s3+https://`, `gs://`, `az://`
-- Automatic `.gitignore` management
-
 ### Known limitations
 
-- Only `file://` remotes transfer bytes; cloud adapters return an explicit
-  unsupported-adapter error. *(Resolved for S3 in Unreleased.)*
+- `gs://` and `az://` remotes parse and store correctly, but a transfer returns
+  an explicit unsupported-provider error. Only `file://` and the S3 schemes move
+  bytes.
 - `avc gc` computes reachability from worktree pointers only, so objects
   referenced solely by another branch or by history are treated as unreachable.
 - `avc gc --remote` is accepted but ignored.
-- `avc list` requires a `file://` remote. *(Resolved for S3 in Unreleased.)*
-- Directories cannot be tracked; only regular files. *(Resolved in Unreleased.)*
 - `avc status` re-hashes every artifact on each run.
-- Exit code `3` is reserved by `SPEC.md` but not yet emitted.
-  *(Resolved in Unreleased.)*
 
 [Unreleased]: https://github.com/jvdavim/avc/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/jvdavim/avc/releases/tag/v0.1.0

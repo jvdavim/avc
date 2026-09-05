@@ -64,7 +64,7 @@ jobs:
       - name: Read the MSRV from Cargo.toml
         id: msrv
         run: |
-          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           test -n "$version" || { echo "no rust-version in Cargo.toml"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "MSRV is $version"

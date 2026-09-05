@@ -39,7 +39,9 @@ jobs:
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
           version="${tag#v}"
-          declared=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          # Scoped to [workspace.package] so a dependency's own version line
+          # cannot be mistaken for the workspace's.
+          declared=$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)
           if [ "$version" != "$declared" ]; then
             echo "::error::tag $tag wants version $version, but Cargo.toml declares $declared"
             exit 1
@@ -62,6 +64,9 @@ jobs:
         run: |
           set -euo pipefail
           awk -v want="${{ steps.tag.outputs.version }}" '
+            # The link-reference block at the foot of the file belongs to no
+            # section, and would otherwise trail the last one.
+            /^\[[^]]+\]: / { inside = 0 }
             /^## \[/ { inside = ($0 ~ "^## \\[" want "\\]"); next }
             inside { print }
           ' CHANGELOG.md > notes.md
@@ -129,16 +134,13 @@ jobs:
           cp "target/${{ matrix.target }}/release/avc" "dist/$name/"
           cp README.md LICENSE CHANGELOG.md "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
-          shasum -a 256 "dist/$name.tar.gz" | sed "s| dist/| |" > "dist/$name.tar.gz.sha256"
-          cat "dist/$name.tar.gz.sha256"
+          shasum -a 256 "dist/$name.tar.gz"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.name }}
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   publish:

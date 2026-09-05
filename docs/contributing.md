@@ -84,7 +84,12 @@ design rather than style.
 4. **Update the docs.** If you change behavior, update the page in `docs/` that
    describes it. If you change a format rule, update `SPEC.md` in the same pull
    request.
-5. **Run the checks.** All four, above.
+5. **Add a changelog entry.** Anything a user would notice goes under
+   `## [Unreleased]` in [`CHANGELOG.md`](../CHANGELOG.md), under `Added`,
+   `Changed`, `Fixed`, or `Removed`. That section is what becomes the release
+   notes, unedited — see [Releasing](releasing.md). A change nobody outside the
+   repository can observe needs no entry.
+6. **Run the checks.** All four, above.
 
 ### Testing conventions
 

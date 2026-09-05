@@ -100,7 +100,35 @@ avc fetch --repo https://github.com/acme/artifacts data/raw/2024.csv -o .  # ./2
 
 ## Installation
 
-AVC is not yet on crates.io. Install from source with Rust 1.88 or newer:
+### A prebuilt binary
+
+Every release publishes `avc` for Linux and macOS, on x86-64 and ARM64, at
+[Releases](https://github.com/jvdavim/avc/releases). Pick the archive for your
+platform, check it against the release's `SHA256SUMS`, and put the binary on
+your `PATH`:
+
+```bash
+VERSION=v0.1.0
+TARGET=x86_64-unknown-linux-gnu   # aarch64-unknown-linux-gnu on ARM Linux,
+                                  # aarch64-apple-darwin on Apple Silicon,
+                                  # x86_64-apple-darwin on Intel Macs
+BASE=https://github.com/jvdavim/avc/releases/download/$VERSION
+
+curl -sSfLO "$BASE/avc-$VERSION-$TARGET.tar.gz"
+curl -sSfLO "$BASE/SHA256SUMS"
+shasum -a 256 --check --ignore-missing SHA256SUMS
+
+tar -xzf "avc-$VERSION-$TARGET.tar.gz"
+install -m 755 "avc-$VERSION-$TARGET/avc" ~/.local/bin/avc
+avc --version
+```
+
+Windows is supported and tested, but no Windows binary is published yet — build
+it from source.
+
+### From source
+
+AVC is not yet on crates.io. Build it with Rust 1.88 or newer:
 
 ```bash
 git clone https://github.com/jvdavim/avc.git
@@ -128,6 +156,7 @@ Full documentation lives in [`docs/`](docs/README.md).
 - [Configuration](docs/configuration.md) — remote URLs and credentials
 - [Architecture](docs/architecture.md) — how the crates fit together
 - [Roadmap](docs/roadmap.md) — what is built, what is not, what is next
+- [Releasing](docs/releasing.md) — how a version becomes a tag and binaries
 - [`SPEC.md`](SPEC.md) — the normative format and safety contract
 
 ## Getting started

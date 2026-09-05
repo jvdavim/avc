@@ -30,6 +30,7 @@ local content-addressed cache and synchronizes them with an object store.
 | Contribute code, docs, or bug reports | [Contributing](contributing.md) |
 | Set up a dev environment and run the checks | [Development](development.md) |
 | See what is planned and what is missing | [Roadmap](roadmap.md) |
+| Cut a release and publish binaries | [Releasing](releasing.md) |
 
 ## What AVC is
 
