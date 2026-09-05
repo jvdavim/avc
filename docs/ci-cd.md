@@ -706,7 +706,7 @@ reference actually moves.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-FROM rust:1.75 AS avc
+FROM rust:1.88 AS avc
 RUN cargo install --git https://github.com/jvdavim/avc avc-cli
 
 FROM debian:bookworm-slim AS artifacts

@@ -9,7 +9,7 @@ equivalent.
 
 | Tool | Minimum | Why |
 | --- | --- | --- |
-| Rust | 1.75 | Workspace MSRV, declared in `Cargo.toml` |
+| Rust | 1.88 | Workspace MSRV, declared in `Cargo.toml` |
 | Git | 2.30 | AVC discovers the repository root by walking up to `.git` |
 | OS | macOS, Linux, or Windows | Atomic rename semantics differ but are handled |
 

@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn manifest_order_is_canonical_so_a_directory_has_one_identity() {
         let object = |byte: char| {
-            ObjectId::sha256(std::iter::repeat(byte).take(64).collect::<String>()).unwrap()
+            ObjectId::sha256(std::iter::repeat_n(byte, 64).collect::<String>()).unwrap()
         };
         let entry = |path: &str, byte: char| TreeEntry::new(path, object(byte), 1).unwrap();
 

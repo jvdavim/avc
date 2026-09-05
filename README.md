@@ -3,7 +3,7 @@
 <p align="center">
   <a href="https://github.com/jvdavim/avc/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jvdavim/avc/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/jvdavim/avc/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <img alt="Rust 1.75+" src="https://img.shields.io/badge/rust-1.75%2B-orange.svg">
+  <img alt="Rust 1.88+" src="https://img.shields.io/badge/rust-1.88%2B-orange.svg">
   <img alt="Status: prototype" src="https://img.shields.io/badge/status-prototype-yellow.svg">
 </p>
 
@@ -100,7 +100,7 @@ avc fetch --repo https://github.com/acme/artifacts data/raw/2024.csv -o .  # ./2
 
 ## Installation
 
-AVC is not yet on crates.io. Install from source with Rust 1.75 or newer:
+AVC is not yet on crates.io. Install from source with Rust 1.88 or newer:
 
 ```bash
 git clone https://github.com/jvdavim/avc.git
@@ -115,7 +115,7 @@ cargo build --release
 ./target/release/avc --version
 ```
 
-Requirements: Rust 1.75+, Git 2.30+, on macOS, Linux, or Windows.
+Requirements: Rust 1.88+, Git 2.30+, on macOS, Linux, or Windows.
 
 ## Documentation
 

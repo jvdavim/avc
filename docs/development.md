@@ -9,7 +9,7 @@ For contribution process — issues, pull requests, review — see
 
 | Tool | Minimum | Notes |
 | --- | --- | --- |
-| Rust | 1.75 | Workspace MSRV. CI verifies builds on it. |
+| Rust | 1.88 | Workspace MSRV. CI verifies builds on it. |
 | Git | 2.30 | Required at runtime; AVC discovers the worktree root |
 
 Install Rust via [rustup](https://rustup.rs):
@@ -71,12 +71,12 @@ cargo fmt --all -- --check && \
 
 ## Verifying the MSRV
 
-The workspace declares `rust-version = "1.75"`. A change that needs a newer
+The workspace declares `rust-version = "1.88"`. A change that needs a newer
 feature will fail on the MSRV job in CI. To check locally:
 
 ```bash
-rustup toolchain install 1.75
-cargo +1.75 check --workspace
+rustup toolchain install 1.88
+cargo +1.88 check --workspace
 ```
 
 Raising the MSRV is a deliberate decision — open an issue rather than bumping it

@@ -406,12 +406,12 @@ fn an_interrupted_migration_resumes_where_it_stopped() {
     let store = root.join("avcstore");
 
     // A destination that cannot be written to, so the transfer phase fails
-    // after the phases before it have succeeded.
-    fs::create_dir_all(store.join("objects")).unwrap();
-    let mut permissions = fs::metadata(store.join("objects")).unwrap().permissions();
-    let readable = permissions.clone();
-    set_readonly(&mut permissions);
-    fs::set_permissions(store.join("objects"), permissions).unwrap();
+    // after the phases before it have succeeded. A regular file where the
+    // object directory belongs is the portable way to arrange that: every OS
+    // refuses to create a directory underneath a file, whereas a read-only
+    // directory stops nothing on Windows.
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("objects"), "not a directory\n").unwrap();
 
     let failed = avc(
         &root.0,
@@ -434,7 +434,7 @@ fn an_interrupted_migration_resumes_where_it_stopped() {
     let message = String::from_utf8_lossy(&failed.stderr);
     assert!(message.contains("while moving DVC object"), "{message}");
 
-    fs::set_permissions(store.join("objects"), readable).unwrap();
+    fs::remove_file(store.join("objects")).unwrap();
     let report = migrate(&dvc, &into, &store, &[]);
     // The expensive phases are not repeated.
     assert!(report.contains("already taken"), "{report}");
@@ -490,15 +490,4 @@ fn a_journal_from_a_different_migration_is_not_resumed() {
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr);
     assert!(message.contains("--restart"), "{message}");
-}
-
-#[cfg(unix)]
-fn set_readonly(permissions: &mut fs::Permissions) {
-    use std::os::unix::fs::PermissionsExt;
-    permissions.set_mode(0o500);
-}
-
-#[cfg(not(unix))]
-fn set_readonly(permissions: &mut fs::Permissions) {
-    permissions.set_readonly(true);
 }
