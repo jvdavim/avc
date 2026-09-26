@@ -57,8 +57,14 @@ fn run(directory: &Path, arguments: &[&str]) {
 }
 
 fn git(directory: &Path, arguments: &[&str]) {
+    // An identity of its own, because an annotated tag needs a committer and
+    // a CI runner has none configured.
     let output = Command::new("git")
         .args(arguments)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .current_dir(directory)
         .output()
         .expect("these tests need the git command");
