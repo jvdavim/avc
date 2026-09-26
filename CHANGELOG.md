@@ -11,6 +11,8 @@ include a breaking format change. See
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-26
+
 ### Changed
 
 - `avc serve`: the history panel can be resized by dragging its edge (or with
@@ -327,6 +329,7 @@ Building from source needs Rust 1.88 or newer. A prebuilt binary needs nothing.
 - `avc gc --remote` is accepted but ignored.
 - `avc status` re-hashes every artifact on each run.
 
-[Unreleased]: https://github.com/jvdavim/avc/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jvdavim/avc/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/jvdavim/avc/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jvdavim/avc/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jvdavim/avc/releases/tag/v0.1.0
