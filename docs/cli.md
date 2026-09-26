@@ -1,6 +1,6 @@
 # CLI Reference
 
-Everything `avc` can do in `0.1.0`. Behavior described here reflects the current
+Everything `avc` can do in `0.2.0`. Behavior described here reflects the current
 implementation, including its gaps — where a flag is accepted but not yet
 honored, this page says so.
 
@@ -18,6 +18,8 @@ avc checkout [<path>...] [--force]
 avc remove <path> [<path>...]
 avc gc [--remote <name>] [--dry-run]
 avc doctor
+avc serve [--repo <git-url>] [--ref <rev>] [--remote <name>] [--remote-url <url>]
+          [--bind <addr>] [--port <port>]
 
 # built for CI/CD -- see docs/ci-cd.md
 avc fetch [<path>...] [--repo <git-url>] [--ref <rev>]
@@ -742,6 +744,130 @@ and outs DVC never cached or that were not addressed by MD5. Every one of those
 is reported by name when the run finishes.
 
 See [Migrating from DVC](migrating-from-dvc.md) for the full guide.
+
+## `avc serve`
+
+Host a web page for browsing a repository's artifacts and downloading them.
+
+```bash
+avc serve [--repo <git-url>] [--ref <rev>] [--remote <name>] [--remote-url <url>]
+          [--bind <addr>] [--port <port>]
+```
+
+```text
+serving /home/me/artifacts
+  objects    https://s3.eu-west-1.amazonaws.com/my-bucket
+  url        http://127.0.0.1:8080/
+note: press Ctrl-C to stop
+
+served       models/bert (2 files, 438.1 MiB)
+```
+
+The repository is chosen exactly as for [`avc list`](#avc-list): the checkout
+you are standing in, or `--repo <git-url>` for one read over Git with no clone.
+
+### Versions
+
+The left side of the page is the repository's **history**, drawn as a vertical
+commit graph: newest first, one lane per line of development, merges joined
+back into the lane they merged into. Branch heads and tags are labelled on the
+commits they point at, with the default branch in bold. When the server runs in
+a checkout, a *Working tree* entry sits on top, joined to the checked-out commit.
+
+- **Click a commit** to browse that exact commit.
+- **Click a tag or a branch label** to browse that name. A branch keeps
+  following its branch as it moves; a commit stays put.
+- **Type into *Go to branch, tag, or commit…*** for anything older than the
+  graph shows — it holds the newest 500 commits.
+
+Choosing a version reloads the catalog from the pointers committed at that
+revision, and every download then serves the objects *those* pointers name — so
+picking `v1.0.0` and downloading `models/bert` gets the bytes that were
+published as `v1.0.0`, whatever `main` holds now. The choice is kept in the page
+URL (`?ref=v1.0.0`), so a link to a version can be shared, and the browser's
+back button steps back through the versions you looked at. *Refresh* re-reads
+the graph for new commits, branches, and tags.
+
+What the page shows before anything is picked:
+
+| Started as | Default version |
+| --- | --- |
+| `avc serve` in a checkout | the working tree, re-read on every request, so a pointer added while the server runs shows up on the next reload |
+| `avc serve --ref <rev>` | that revision |
+| `avc serve --repo <git-url>` | the repository's default branch (`--ref` overrides it) |
+
+History is read from the checkout itself, or — for `--repo` — from a bare copy
+of the repository that `avc serve` makes when it starts and updates at most
+every 20 seconds while someone is looking. A pointer registry is text, so that
+copy is small, and it makes every commit a visitor clicks a local checkout
+rather than a round trip to the Git server.
+
+Each revision's pointers are checked out once and reused. The server keeps up to 16 of them. A branch
+is identified by the commit it points at, and branches and tags are re-listed at
+most every 20 seconds, so a branch that moves is served at its new commit within
+that window. A tag is served at the commit it names, even when it is an
+annotated tag. Viewing a revision of a checkout still reads bytes from that
+checkout's cache when it has them, and from the object store the revision's own
+`.avc/config.toml` names otherwise.
+
+Only names the repository advertises, the server's own default, and commit ids
+(4 to 40 hex characters) are accepted as a version; anything else is a `404`.
+That matters because the name is passed to Git.
+
+The page lists what the repository tracks as a tree of paths. A tracked
+directory can be opened to see the files inside it — its manifest is fetched
+from the remote when it is not cached, and remembered for as long as the server
+runs. Each row shows its size, object, and whether its bytes can be served.
+
+| Download of | Arrives as |
+| --- | --- |
+| one file artifact | that file |
+| one file inside a tracked directory | that file |
+| a tracked directory, a subdirectory of one, or a prefix | `<name>.tar` |
+
+An archive is laid out the way `avc fetch <path> -o .` would lay it out: what was
+named sits at the top, so `models/bert` downloads `bert.tar` holding `bert/…`.
+Paths longer than the classic tar header allows use PAX headers, which every
+current `tar` reads.
+
+Bytes are read from the local cache when it holds them and from the object store
+otherwise. A repository with no remote configured serves from the cache alone.
+Every object is hashed as it streams and its final chunk is withheld until the
+digest matches the pointer, so a corrupt object ends the response short of its
+`Content-Length` — the browser or `curl` reports a failed download rather than
+saving the wrong file — and the server logs which object it was.
+
+The JSON behind the page is available to scripts too:
+
+| Request | Answers |
+| --- | --- |
+| `GET /api/history` | the newest 500 commits with their parents, author, time, and subject, the branches and tags at each, and the working tree's commit when there is one |
+| `GET /api/refs` | the branches and tags, with the commit each names, the default branch, and the server's default version |
+| `GET /api/catalog?ref=<rev>` | every artifact at that version |
+| `GET /api/tree?path=<dir>&ref=<rev>` | the files inside a tracked directory at that version |
+| `GET /download?path=<path>&ref=<rev>` | the download itself |
+
+`ref` is optional everywhere and means the default version when left out.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--ref <rev>` | see above | Version shown before a visitor picks one. |
+| `--bind <addr>` | `127.0.0.1` | Address to listen on. |
+| `--port`, `-p <port>` | `8080` | Port to listen on; `0` picks a free one. |
+| `--remote <name>` | the default remote | Object store to serve from. |
+| `--remote-url <url>` | | Object store URL, overriding the configured one. |
+
+> **Security.** The server has no authentication, and it serves with whatever
+> credentials the machine running it holds. On loopback it refuses requests
+> whose `Host` header names anything but this machine, which stops a web page
+> from reading the catalog through DNS rebinding. Binding to another address,
+> such as `--bind 0.0.0.0`, shares every artifact with anyone who can reach the
+> port, and the command prints a warning when it does.
+
+> **Limitation:** interrupting the server with Ctrl-C leaves the pointer
+> checkouts of any versions it had opened, and for `--repo` its copy of the
+> repository, behind in the system temporary directory. They hold pointer files
+> and Git history only, never artifact bytes.
 
 ## CI/CD commands
 

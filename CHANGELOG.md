@@ -11,6 +11,26 @@ include a breaking format change. See
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
+### Added
+
+- `avc serve` hosts a small web catalog of a repository's artifacts: browse its
+  paths, look inside tracked directories, and download a file, a tracked
+  directory, or a whole prefix — at any version. A commit graph down the side
+  of the page shows every branch head and tag; clicking a commit, branch, or
+  tag switches the catalog to that version, and each download serves the
+  objects that version's pointers name. Anything beyond one file downloads as a `.tar`
+  laid out the way `avc fetch` lays it out. Objects are verified while they
+  stream, and a corrupt one ends its response short of `Content-Length` so the
+  download fails rather than saving the wrong bytes. Built on `std::net`, so it
+  adds no dependencies.
+
+### Changed
+
+- Dependencies: `clap` 4.6.7, `toml` 1.1.6, and `ureq` 3.4.2, all patch
+  releases with no change in AVC's behavior.
+
 ## [0.1.0] - 2026-09-05
 
 First release. Iteration 0 — the on-disk formats are provisional.
@@ -300,5 +320,6 @@ Building from source needs Rust 1.88 or newer. A prebuilt binary needs nothing.
 - `avc gc --remote` is accepted but ignored.
 - `avc status` re-hashes every artifact on each run.
 
-[Unreleased]: https://github.com/jvdavim/avc/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jvdavim/avc/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jvdavim/avc/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jvdavim/avc/releases/tag/v0.1.0

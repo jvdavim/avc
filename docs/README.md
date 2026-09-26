@@ -4,7 +4,7 @@ AVC (Artifact Version Control) tracks large files alongside Git without requirin
 Git LFS. Git stores small YAML pointer files; AVC stores the artifact bytes in a
 local content-addressed cache and synchronizes them with an object store.
 
-> **Status:** `0.1.0` prototype. The on-disk formats are an *Iteration 0 contract*
+> **Status:** `0.2.0` prototype. The on-disk formats are an *Iteration 0 contract*
 > and remain provisional. See [`../SPEC.md`](../SPEC.md) for the normative rules
 > and [Roadmap](roadmap.md) for what is not built yet.
 

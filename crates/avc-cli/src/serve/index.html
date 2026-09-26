@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AVC catalog</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --line: #e4e4df; --hover: #f1f1ec; --accent: #2f6fdf; --accent-text: #ffffff;
+    --ok: #1f7a4d; --ok-bg: #e3f3ea; --bad: #a33b2b; --bad-bg: #f8e6e2;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --selected: #e8f0fd; --tag: #8a5a00; --tag-bg: #fdf1d8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1d1d1b; --text: #ecece8; --muted: #9a9a93;
+      --line: #2e2e2b; --hover: #252523; --accent: #6b9cf5; --accent-text: #0e1420;
+      --ok: #6fd3a0; --ok-bg: #173226; --bad: #f09a8a; --bad-bg: #3a1f1a;
+      --selected: #1e2a40; --tag: #f2c46b; --tag-bg: #3a2f17;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .layout { display: grid; grid-template-columns: 400px minmax(0, 1fr); min-height: 100vh; }
+  aside {
+    position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column;
+    background: var(--panel); border-right: 1px solid var(--line);
+  }
+  .aside-head { padding: 16px 16px 10px; border-bottom: 1px solid var(--line); }
+  .aside-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .aside-title b { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .icon-button {
+    border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 6px;
+    font: inherit; font-size: 13px; padding: 2px 8px; cursor: pointer;
+  }
+  .icon-button:hover { color: var(--text); background: var(--hover); }
+  .goto { display: flex; gap: 6px; }
+  .goto input { flex: 1; min-width: 0; }
+  .graph-scroll { flex: 1; overflow: auto; }
+  .graph { position: relative; }
+  .graph svg { position: absolute; left: 0; top: 0; z-index: 1; pointer-events: none; }
+  .commit {
+    position: relative; display: flex; flex-direction: column; justify-content: center;
+    height: 44px; padding-right: 12px; cursor: pointer; border-left: 3px solid transparent;
+  }
+  .commit:hover { background: var(--hover); }
+  .commit:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .commit[aria-current=true] { background: var(--selected); border-left-color: var(--accent); }
+  .commit .line1 { display: flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
+  .commit .subject { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .commit .line2 { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .commit .line2 code { font-family: var(--mono); }
+  .commit.worktree .subject { font-style: italic; color: var(--muted); }
+  .ref {
+    flex: none; font: inherit; font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: 4px;
+    cursor: pointer; border: 1px solid var(--accent); color: var(--accent); background: transparent;
+    max-width: 150px; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ref.tag { border-color: transparent; color: var(--tag); background: var(--tag-bg); }
+  .ref.default { font-weight: 700; }
+  .ref:hover { filter: brightness(1.15); text-decoration: underline; }
+  .history-note { padding: 10px 16px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
+  .history-note:empty { display: none; }
+  .viewing { margin-top: 6px; font-size: 13px; }
+  .viewing code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  header { padding: 20px 24px 12px; max-width: 1100px; margin: 0 auto; }
+  .brand { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .brand b { font-size: 18px; letter-spacing: .02em; }
+  .brand span { color: var(--muted); font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 4px; font-family: var(--mono); word-break: break-all; }
+  main { max-width: 1100px; margin: 0 auto; padding: 0 24px 40px; }
+  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 8px 0 12px; }
+  nav { flex: 1 1 320px; display: flex; flex-wrap: wrap; align-items: center; gap: 2px; font-size: 14px; min-width: 0; }
+  nav a { color: var(--accent); text-decoration: none; padding: 2px 4px; border-radius: 4px; word-break: break-all; }
+  nav a:hover { background: var(--hover); }
+  nav .sep { color: var(--muted); }
+  nav .here { padding: 2px 4px; font-weight: 600; word-break: break-all; }
+  input[type=search], input[type=text] {
+    flex: 0 1 280px; min-width: 0; width: 100%; padding: 7px 10px; font: inherit; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  }
+  input[type=search]:focus, input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--hover); }
+  td.name { white-space: normal; word-break: break-all; width: 100%; }
+  td.name a { color: var(--text); text-decoration: none; }
+  td.name a:hover { color: var(--accent); text-decoration: underline; }
+  .icon { display: inline-block; width: 1.4em; color: var(--muted); }
+  .kind { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .hash { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); }
+  .pill.bad { color: var(--bad); background: var(--bad-bg); }
+  a.button {
+    display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 12px; text-decoration: none;
+    background: var(--accent); color: var(--accent-text); font-weight: 600;
+  }
+  a.button:hover { filter: brightness(1.08); }
+  a.button[aria-disabled=true] { background: var(--line); color: var(--muted); pointer-events: none; }
+  .summary { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .empty, .error { padding: 28px; text-align: center; color: var(--muted); }
+  .error { color: var(--bad); }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: minmax(0, 1fr); }
+    aside { position: static; height: auto; max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+  @media (max-width: 640px) {
+    header, main { padding-left: 16px; padding-right: 16px; }
+    .hide-sm { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside aria-label="Versions">
+  <div class="aside-head">
+    <div class="aside-title"><b>History</b>
+      <button class="icon-button" id="refresh" type="button" title="Look for new commits, branches, and tags">↻ Refresh</button>
+    </div>
+    <form class="goto" id="goto">
+      <input type="text" id="goto-ref" placeholder="Go to branch, tag, or commit…" aria-label="Go to branch, tag, or commit" autocomplete="off" spellcheck="false">
+    </form>
+  </div>
+  <div class="graph-scroll" id="graph-scroll"><div class="graph" id="graph"><div class="empty">Loading history…</div></div></div>
+  <div class="history-note" id="history-note"></div>
+</aside>
+<div>
+<header>
+  <div class="brand"><b>AVC catalog</b><span id="repository"></span></div>
+  <div class="meta" id="store"></div>
+  <div class="viewing" id="viewing"></div>
+</header>
+<main>
+  <div class="toolbar">
+    <nav id="crumbs" aria-label="Location"></nav>
+    <input type="search" id="search" placeholder="Filter artifacts…" aria-label="Filter artifacts">
+  </div>
+  <div class="panel" id="panel"><div class="empty">Loading…</div></div>
+  <div class="summary" id="summary"></div>
+</main>
+</div>
+</div>
+<script>
+"use strict";
+const state = { catalog: null, history: null, trees: new Map(), query: "" };
+const WORKTREE = "\u0000worktree";
+const SVG = "http://www.w3.org/2000/svg";
+const $ = (id) => document.getElementById(id);
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (value === undefined || value === null) continue;
+    if (key === "class") node.className = value; else node.setAttribute(key, value);
+  }
+  for (const child of children) node.append(child);
+  return node;
+}
+
+function size(bytes) {
+  if (bytes === null || bytes === undefined) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+const plural = (n, noun) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+const shortHash = (object) => (object || "").split(":").pop().slice(0, 12);
+
+function here() {
+  return decodeURIComponent(location.hash.replace(/^#\/?/, "")).replace(/\/+$/, "");
+}
+/** The version being browsed, from the page URL; empty means the default. */
+function currentRef() { return new URLSearchParams(location.search).get("ref") || ""; }
+function api(endpoint, params) {
+  const query = new URLSearchParams(params || {});
+  if (currentRef()) query.set("ref", currentRef());
+  const text = query.toString();
+  return endpoint + (text ? "?" + text : "");
+}
+function downloadUrl(path) { return api("download", { path }); }
+
+async function getJson(url) {
+  const response = await fetch(url);
+  const body = await response.json().catch(() => ({ error: response.statusText }));
+  if (!response.ok) throw new Error(body.error || response.statusText);
+  return body;
+}
+
+async function tree(path) {
+  if (!state.trees.has(path)) {
+    state.trees.set(path, getJson(api("api/tree", { path })));
+  }
+  try { return await state.trees.get(path); }
+  catch (error) { state.trees.delete(path); throw error; }
+}
+
+/** The tracked directory that `path` is, or is inside of. */
+function owningDirectory(path) {
+  return state.catalog.artifacts.find((a) => a.kind === "directory" &&
+    (path === a.path || path.startsWith(a.path + "/")));
+}
+
+/** Group rows below `prefix` by their next path segment. */
+function group(items, prefix, leaf) {
+  const folders = new Map(), files = [];
+  for (const item of items) {
+    const rest = prefix ? item.path.slice(prefix.length + 1) : item.path;
+    const slash = rest.indexOf("/");
+    if (slash < 0) { files.push(leaf(item, rest)); continue; }
+    const name = rest.slice(0, slash);
+    const folder = folders.get(name) || { name, path: (prefix ? prefix + "/" : "") + name,
+      kind: "folder", size: 0, count: 0, available: true, unknown: false };
+    folder.count += item.files || 1;
+    if (item.size === null) folder.unknown = true; else folder.size += item.size;
+    folder.available = folder.available && item.available;
+    folders.set(name, folder);
+  }
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  return [...[...folders.values()].sort(byName), ...files.sort(byName)];
+}
+
+async function rows(at) {
+  const artifacts = state.catalog.artifacts;
+  if (state.query) {
+    const q = state.query.toLowerCase();
+    return artifacts.filter((a) => a.path.toLowerCase().includes(q))
+      .map((a) => ({ ...a, name: a.path }));
+  }
+  const directory = at && owningDirectory(at);
+  if (directory) {
+    const listing = await tree(directory.path);
+    const inner = at === directory.path ? "" : at.slice(directory.path.length + 1);
+    const entries = listing.entries
+      .filter((e) => !inner || e.path.startsWith(inner + "/"))
+      .map((e) => ({ ...e, path: directory.path + "/" + e.path }));
+    return group(entries, at, (e, name) => ({ ...e, name, kind: "file" }));
+  }
+  const below = at ? artifacts.filter((a) => a.path.startsWith(at + "/")) : artifacts;
+  return group(below, at, (a, name) => ({ ...a, name }));
+}
+
+function crumbs(at) {
+  const nav = $("crumbs");
+  nav.replaceChildren();
+  const parts = at ? at.split("/") : [];
+  const root = el("a", { href: "#/" }, "root");
+  nav.append(parts.length ? root : el("span", { class: "here" }, "root"));
+  parts.forEach((part, index) => {
+    nav.append(el("span", { class: "sep" }, "/"));
+    nav.append(index === parts.length - 1
+      ? el("span", { class: "here" }, part)
+      : el("a", { href: "#/" + parts.slice(0, index + 1).map(encodeURIComponent).join("/") }, part));
+  });
+}
+
+function row(item) {
+  const browsable = item.kind !== "file";
+  const icon = el("span", { class: "icon", "aria-hidden": "true" }, browsable ? "▸" : "·");
+  const name = browsable
+    ? el("a", { href: "#/" + item.path.split("/").map(encodeURIComponent).join("/") }, item.name + "/")
+    : document.createTextNode(item.name);
+  const cell = el("td", { class: "name" }, icon, name);
+  if (item.kind === "directory") cell.append(el("span", { class: "kind" }, "tracked directory"));
+  const count = item.kind === "folder" ? plural(item.count, "file")
+    : item.kind === "directory" && item.files !== null ? plural(item.files, "file") : "";
+  const bytes = item.kind === "folder" && item.unknown ? null : item.size;
+  const status = el("span", { class: "pill " + (item.available ? "ok" : "bad") },
+    item.available ? "available" : "missing");
+  const label = item.kind === "file" ? "Download" : "Download .tar";
+  const button = el("a", {
+    class: "button", href: downloadUrl(item.path), download: "",
+    "aria-disabled": item.available ? null : "true",
+    title: item.available ? null : "Some bytes are on neither the object store nor this machine",
+  }, label);
+  return el("tr", {},
+    cell,
+    el("td", { class: "num hide-sm" }, count),
+    el("td", { class: "num" }, size(bytes)),
+    el("td", { class: "hash hide-sm", title: item.object || "" }, item.object ? shortHash(item.object) : ""),
+    el("td", {}, status),
+    el("td", {}, button));
+}
+
+let renderToken = 0;
+async function render() {
+  if (!state.catalog) return;
+  const token = ++renderToken;
+  const at = here();
+  crumbs(state.query ? "" : at);
+  const panel = $("panel");
+  let items;
+  try { items = await rows(at); }
+  catch (error) {
+    if (token !== renderToken) return;
+    panel.replaceChildren(el("div", { class: "error" }, error.message));
+    $("summary").textContent = "";
+    return;
+  }
+  if (token !== renderToken) return;
+  if (!items.length) {
+    panel.replaceChildren(el("div", { class: "empty" },
+      state.query ? "No artifact matches that filter." :
+      state.catalog.artifacts.length ? "Nothing here." : "This repository tracks no artifacts yet."));
+    $("summary").textContent = "";
+    return;
+  }
+  const head = el("tr", {}, el("th", {}, "Name"), el("th", { class: "num hide-sm" }, "Files"),
+    el("th", { class: "num" }, "Size"), el("th", { class: "hide-sm" }, "Object"),
+    el("th", {}, "Status"), el("th", {}, ""));
+  panel.replaceChildren(el("table", {}, el("thead", {}, head), el("tbody", {}, ...items.map(row))));
+  const total = items.reduce((sum, item) => sum + (item.size || 0), 0);
+  const available = items.filter((item) => item.available).length;
+  $("summary").textContent = `${plural(items.length, "item")}, ${size(total)}: ` +
+    `${available} available, ${items.length - available} missing`;
+}
+
+/* ---------- history graph ---------- */
+
+const ROW = 44, LANE = 14, PAD = 14;
+const COLORS = ["#2f6fdf", "#d9480f", "#2b8a3e", "#9c36b5", "#e67700", "#0c8599", "#c2255c", "#5c7cfa"];
+const laneX = (lane) => PAD + lane * LANE;
+const rowY = (row) => row * ROW + ROW / 2;
+const color = (lane) => COLORS[lane % COLORS.length];
+
+/**
+ * Give each commit a lane, and each parent edge the lane it travels down.
+ * Commits arrive children-first, so a lane holds the commit it is waiting for
+ * until that commit's row is reached.
+ */
+function layout(commits) {
+  const lanes = [], rows = [], edges = [];
+  const free = () => { const i = lanes.indexOf(null); return i < 0 ? lanes.push(null) - 1 : i; };
+  commits.forEach((commit, row) => {
+    let col = lanes.indexOf(commit.hash);
+    if (col < 0) col = free();
+    // Every lane that was waiting for this commit ends here.
+    for (let lane = 0; lane < lanes.length; lane++) if (lanes[lane] === commit.hash) lanes[lane] = null;
+    rows.push({ col });
+    commit.parents.forEach((parent, index) => {
+      let lane;
+      if (index === 0) { lane = col; lanes[col] = parent; }
+      else { lane = lanes.indexOf(parent); if (lane < 0) { lane = free(); lanes[lane] = parent; } }
+      edges.push({ from: row, fromCol: col, lane, parent });
+    });
+    while (lanes.length && lanes[lanes.length - 1] === null) lanes.pop();
+  });
+  const index = new Map(commits.map((commit, row) => [commit.hash, row]));
+  let width = 1;
+  for (const row of rows) width = Math.max(width, row.col + 1);
+  for (const edge of edges) { edge.to = index.get(edge.parent); width = Math.max(width, edge.lane + 1); }
+  return { rows, edges, width };
+}
+
+function curve(x1, y1, x2, y2) {
+  const middle = (y1 + y2) / 2;
+  return ` C${x1},${middle} ${x2},${middle} ${x2},${y2}`;
+}
+
+function edgePath(edge, rows, bottom) {
+  const x1 = laneX(edge.fromCol), y1 = rowY(edge.from), xl = laneX(edge.lane);
+  let d = `M${x1},${y1}`;
+  if (edge.to === undefined) {
+    // The parent is older than the history shown: run off the bottom.
+    if (edge.lane !== edge.fromCol) d += curve(x1, y1, xl, y1 + ROW);
+    return d + ` L${xl},${bottom}`;
+  }
+  const x2 = laneX(rows[edge.to].col), y2 = rowY(edge.to);
+  if (edge.to === edge.from + 1) return d + curve(x1, y1, x2, y2);
+  if (edge.lane !== edge.fromCol) d += curve(x1, y1, xl, y1 + ROW);
+  d += ` L${xl},${y2 - ROW}`;
+  return d + (xl === x2 ? ` L${x2},${y2}` : curve(xl, y2 - ROW, x2, y2));
+}
+
+function svg(tag, attrs) {
+  const node = document.createElementNS(SVG, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  return node;
+}
+
+function ago(seconds) {
+  const delta = Date.now() / 1000 - seconds;
+  const units = [["year", 31536000], ["month", 2592000], ["day", 86400], ["hour", 3600], ["minute", 60]];
+  for (const [unit, size] of units) {
+    const n = Math.floor(delta / size);
+    if (n >= 1) return `${n} ${unit}${n === 1 ? "" : "s"} ago`;
+  }
+  return "just now";
+}
+
+/** The commits to draw, with the working tree on top when it is served. */
+function graphCommits() {
+  const history = state.history;
+  if (!history) return [];
+  const commits = history.commits;
+  if (!history.worktree) return commits;
+  const head = history.worktree.head;
+  return [{ hash: WORKTREE, worktree: true, parents: head ? [head] : [], branches: [], tags: [],
+    subject: "Working tree", author: "", time: null }, ...commits];
+}
+
+/** The row the page is showing, as best it can be told. */
+function selectedHash() {
+  const history = state.history;
+  if (!history) return null;
+  const ref = currentRef();
+  if (!ref && history.worktree) return WORKTREE;
+  // Once the catalog is in, it says exactly which commit it was read at.
+  if (state.catalog && state.catalog.commit) {
+    const exact = history.commits.find((c) => c.hash.startsWith(state.catalog.commit));
+    if (exact) return exact.hash;
+  }
+  let wanted = ref || history.default;
+  if (wanted === "HEAD") wanted = history.head;
+  if (!wanted) return null;
+  const bare = wanted.replace(/^refs\/(heads|tags)\//, "");
+  const hex = /^[0-9a-f]{4,40}$/i.test(wanted);
+  const found = history.commits.find((c) => c.branches.includes(bare) || c.tags.includes(bare) ||
+    (hex && c.hash.startsWith(wanted.toLowerCase())));
+  return found ? found.hash : null;
+}
+
+function refBadge(kind, name, isDefault) {
+  const badge = el("button", {
+    type: "button", class: "ref " + kind + (isDefault ? " default" : ""),
+    title: `${kind === "tag" ? "Tag" : "Branch"} ${name}${isDefault ? " (default branch)" : ""} — show this version`,
+  }, (kind === "tag" ? "◆ " : "⎇ ") + name);
+  badge.addEventListener("click", (event) => { event.stopPropagation(); chooseVersion(name); });
+  badge.addEventListener("keydown", (event) => event.stopPropagation());
+  return badge;
+}
+
+let scrolledTo = null;
+function renderGraph() {
+  const graph = $("graph");
+  const commits = graphCommits();
+  if (!state.history) return;
+  if (!commits.length) {
+    graph.replaceChildren(el("div", { class: "empty" }, "No commits yet."));
+    return;
+  }
+  const { rows, edges, width } = layout(commits);
+  const height = commits.length * ROW;
+  const graphWidth = PAD * 2 + (width - 1) * LANE;
+  const picture = svg("svg", { width: graphWidth, height, "aria-hidden": "true" });
+  for (const edge of edges) {
+    const attrs = { d: edgePath(edge, rows, height), fill: "none", stroke: color(edge.lane), "stroke-width": 2 };
+    if (commits[edge.from].worktree) attrs["stroke-dasharray"] = "3 3";
+    picture.append(svg("path", attrs));
+  }
+  const selected = selectedHash();
+  commits.forEach((commit, row) => {
+    const x = laneX(rows[row].col), y = rowY(row);
+    const decorated = commit.tags.length || commit.branches.length;
+    const dot = svg("circle", {
+      cx: x, cy: y, r: commit.hash === selected ? 6 : decorated ? 5 : 4,
+      fill: commit.worktree ? "var(--panel)" : color(rows[row].col),
+      stroke: commit.worktree ? "var(--muted)" : "var(--panel)", "stroke-width": 2,
+    });
+    if (commit.worktree) dot.setAttribute("stroke-dasharray", "2 2");
+    picture.append(dot);
+    if (commit.hash === selected) {
+      picture.append(svg("circle", { cx: x, cy: y, r: 9, fill: "none", stroke: color(rows[row].col), "stroke-width": 2 }));
+    }
+  });
+
+  const list = el("div", { role: "list" });
+  commits.forEach((commit) => {
+    const line1 = el("div", { class: "line1" });
+    for (const branch of commit.branches) line1.append(refBadge("branch", branch, branch === state.history.head));
+    for (const tag of commit.tags) line1.append(refBadge("tag", tag, false));
+    line1.append(el("span", { class: "subject" }, commit.subject || "(no message)"));
+    const line2 = commit.worktree
+      ? el("div", { class: "line2" }, "pointers on disk, including uncommitted ones")
+      : el("div", { class: "line2" }, el("code", {}, commit.hash.slice(0, 10)),
+          ` · ${commit.author} · ${ago(commit.time)}`);
+    const item = el("div", {
+      class: "commit" + (commit.worktree ? " worktree" : ""), role: "listitem", tabindex: "0",
+      "aria-current": commit.hash === selected ? "true" : null,
+      title: commit.worktree ? "Show the working tree" :
+        `${commit.hash}\n${commit.author}, ${new Date(commit.time * 1000).toLocaleString()}\n\n${commit.subject}`,
+    }, line1, line2);
+    item.style.paddingLeft = graphWidth + "px";
+    const pick = () => chooseVersion(commit.worktree ? "" : commit.hash);
+    item.addEventListener("click", pick);
+    item.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); pick(); }
+    });
+    list.append(item);
+  });
+  graph.replaceChildren(picture, list);
+  graph.style.height = height + "px";
+
+  $("history-note").textContent = state.history.truncated
+    ? `Showing the newest ${state.history.commits.length} commits. Older versions can be opened by commit id above.`
+    : "";
+  // Bring the selection into view once, not on every re-render.
+  const current = list.querySelector("[aria-current=true]");
+  if (current && scrolledTo !== selected) { current.scrollIntoView({ block: "nearest" }); scrolledTo = selected; }
+}
+
+/** Say which version the catalog on the right is showing. */
+function renderViewing() {
+  const viewing = $("viewing");
+  const ref = currentRef();
+  const catalog = state.catalog;
+  if (!ref && state.history && state.history.worktree) {
+    viewing.replaceChildren("Viewing ", el("b", {}, "the working tree"));
+    return;
+  }
+  const label = ref || (state.history ? state.history.default : "") || "HEAD";
+  const commit = state.history && state.history.commits.find((c) => c.hash === selectedHash());
+  const parts = ["Viewing ", el("b", {}, /^[0-9a-f]{40}$/i.test(label) ? label.slice(0, 10) : label)];
+  if (catalog && catalog.commit) parts.push(" · ", el("code", {}, catalog.commit));
+  if (commit && commit.subject) parts.push(" · ", commit.subject);
+  viewing.replaceChildren(...parts);
+}
+
+function chooseVersion(value) {
+  const url = new URL(location.href);
+  if (value) url.searchParams.set("ref", value); else url.searchParams.delete("ref");
+  if (url.href !== location.href) history.pushState(null, "", url);
+  load();
+}
+
+async function loadHistory() {
+  try { state.history = await getJson("api/history"); }
+  catch (error) {
+    $("graph").replaceChildren(el("div", { class: "error" }, "Could not read the history: " + error.message));
+    return;
+  }
+  renderGraph();
+  renderViewing();
+}
+
+let loadToken = 0;
+async function load() {
+  const token = ++loadToken;
+  state.catalog = null;
+  renderGraph();
+  renderViewing();
+  state.trees.clear();
+  $("summary").textContent = "";
+  $("panel").replaceChildren(el("div", { class: "empty" },
+    currentRef() ? `Loading ${currentRef()}…` : "Loading…"));
+  let catalog;
+  try { catalog = await getJson(api("api/catalog")); }
+  catch (error) {
+    if (token !== loadToken) return;
+    $("panel").replaceChildren(el("div", { class: "error" }, "Could not load this version: " + error.message));
+    return;
+  }
+  if (token !== loadToken) return;
+  state.catalog = catalog;
+  $("repository").textContent = catalog.repository;
+  $("store").textContent = "objects: " + (catalog.store || "local cache only");
+  document.title = "AVC catalog · " + (currentRef() || catalog.repository);
+  renderGraph();
+  renderViewing();
+  render();
+}
+
+$("search").addEventListener("input", (event) => { state.query = event.target.value.trim(); render(); });
+$("goto").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const value = $("goto-ref").value.trim();
+  if (value) { chooseVersion(value); $("goto-ref").value = ""; }
+});
+$("refresh").addEventListener("click", loadHistory);
+window.addEventListener("hashchange", render);
+window.addEventListener("popstate", load);
+loadHistory();
+load();
+</script>
+</body>
+</html>

@@ -74,7 +74,7 @@ avc fetch --repo https://github.com/acme/artifacts data/raw/2024.csv -o .  # ./2
   liability.
 
 > [!IMPORTANT]
-> AVC is a **`0.1.0` prototype**. The local workflow and S3 transport work end
+> AVC is a **`0.2.0` prototype**. The local workflow and S3 transport work end
 > to end; `gs://` and `az://` still configure correctly and then return an
 > explicit unsupported-adapter error on transfer. On-disk formats are
 > provisional. See the [roadmap](docs/roadmap.md).
@@ -108,7 +108,7 @@ platform, check it against the release's `SHA256SUMS`, and put the binary on
 your `PATH`:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.2.0
 TARGET=x86_64-unknown-linux-gnu   # aarch64-unknown-linux-gnu on ARM Linux,
                                   # aarch64-apple-darwin on Apple Silicon,
                                   # x86_64-apple-darwin on Intel Macs
@@ -281,6 +281,19 @@ a manifest and reported the same way. `avc list` shows what a repository holds
 and whether the remote can supply it, **without downloading bytes**; give it a
 path to scope the listing, or a tracked directory to see the files inside it. `avc doctor` re-hashes cached
 objects and fails on any drift.
+
+`avc serve` puts the same catalog behind a web page, for whoever would rather
+click than type: pick a commit, branch, or tag from a commit graph, browse the
+repository's paths as they were at that version, look inside tracked directories, and download a
+file as itself or anything larger as a `.tar`. Every object is
+verified as it streams, and a corrupt one ends its download short instead of
+arriving as the wrong file. It listens on `127.0.0.1:8080` by default and needs
+no dependencies beyond the binary.
+
+```bash
+avc serve                                                  # this checkout
+avc serve --repo https://github.com/acme/artifacts --ref v1.0.0
+```
 
 Output is aligned ASCII, colored when the terminal wants it and plain when it
 does not — a pipe, `NO_COLOR`, or `--color never`. Anything a script parses

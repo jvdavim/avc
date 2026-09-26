@@ -161,7 +161,7 @@ fn resolve_commit(directory: &Path, url: &str, revision: &str) -> Result<String,
 /// a branch called `abc123` — is ambiguous by construction, and is treated as a
 /// ref first: this is only ever consulted after the server has said it has no
 /// such ref.
-fn could_be_commit_id(revision: &str) -> bool {
+pub(crate) fn could_be_commit_id(revision: &str) -> bool {
     (4..=40).contains(&revision.len()) && revision.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -178,6 +178,217 @@ fn is_unknown_ref(message: &str) -> bool {
     ]
     .iter()
     .any(|phrase| message.contains(phrase))
+}
+
+/// A bare copy of a remote repository's branches, tags, and history.
+///
+/// A pointer registry is text, so a full copy of it is small, and holding one
+/// turns every question a history browser asks — which commits exist, what
+/// their parents are, what a given commit's pointers said — into a local one.
+/// Removed when it goes out of scope.
+pub(crate) struct Mirror {
+    path: PathBuf,
+    url: String,
+}
+
+impl Mirror {
+    /// Copy `url`'s branches and tags into a temporary bare repository.
+    pub(crate) fn clone(url: &str) -> Result<Self, Failure> {
+        let mirror = Self {
+            path: temporary_path(),
+            url: url.to_owned(),
+        };
+        let target = mirror.path.display().to_string();
+        git(
+            &std::env::temp_dir(),
+            &["clone", "--bare", "--quiet", "--", url, &target],
+        )
+        .map_err(|error| explain(error, url, "its history"))?;
+        Ok(mirror)
+    }
+
+    /// Bring the copy up to date: new commits, moved branches, new tags, and
+    /// branches or tags since deleted.
+    pub(crate) fn update(&self) -> Result<(), Failure> {
+        git(
+            &self.path,
+            &[
+                "fetch",
+                "--quiet",
+                "--prune",
+                "origin",
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| explain(error, &self.url, "its history"))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// One commit, as a history browser draws it.
+#[derive(Debug)]
+pub(crate) struct Commit {
+    pub(crate) hash: String,
+    pub(crate) parents: Vec<String>,
+    pub(crate) author: String,
+    /// Seconds since the Unix epoch.
+    pub(crate) time: i64,
+    pub(crate) subject: String,
+}
+
+/// Up to `limit` commits reachable from any branch or tag of the repository in
+/// `directory` — and from `HEAD`, which in a checkout may be detached — newest
+/// first, every child ahead of its parents.
+pub(crate) fn history(directory: &Path, limit: usize) -> Result<Vec<Commit>, Failure> {
+    let limit = limit.to_string();
+    let mut arguments = vec![
+        "log",
+        "--branches",
+        "--tags",
+        "--topo-order",
+        "--format=%H%x1f%P%x1f%an%x1f%at%x1f%s%x1e",
+        "-n",
+        &limit,
+    ];
+    // A repository with no commits has no `HEAD` to name, and saying so is
+    // an error to `git log` rather than an empty history.
+    if head_commit(directory).is_some() {
+        arguments.push("HEAD");
+    }
+    let output = git(directory, &arguments)?;
+    Ok(parse_history(&output))
+}
+
+fn parse_history(output: &str) -> Vec<Commit> {
+    output
+        .split('\x1e')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split('\x1f');
+            let hash = fields.next().filter(|hash| !hash.is_empty())?.to_owned();
+            let parents = fields
+                .next()?
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            let author = fields.next()?.to_owned();
+            let time = fields.next()?.parse().unwrap_or(0);
+            let subject = fields.next().unwrap_or("").to_owned();
+            Some(Commit {
+                hash,
+                parents,
+                author,
+                time,
+                subject,
+            })
+        })
+        .collect()
+}
+
+/// The commit `HEAD` names in `directory`, if it names one.
+pub(crate) fn head_commit(directory: &Path) -> Option<String> {
+    git(directory, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .ok()
+        .map(|commit| commit.trim().to_owned())
+        .filter(|commit| !commit.is_empty())
+}
+
+/// The branches and tags a repository advertises, and its default branch.
+#[derive(Debug, Default)]
+pub(crate) struct Refs {
+    /// The branch `HEAD` points at, when the repository says.
+    pub(crate) head: Option<String>,
+    /// `(name, commit)`, by short name: `main`, not `refs/heads/main`.
+    pub(crate) branches: Vec<(String, String)>,
+    /// `(name, commit)`. An annotated tag is listed with the commit it tags,
+    /// not the tag object, so it compares equal to a branch at the same commit.
+    pub(crate) tags: Vec<(String, String)>,
+}
+
+impl Refs {
+    /// What to fetch for `name`, and the commit it names right now.
+    ///
+    /// A short name that is both a branch and a tag is ambiguous on the wire,
+    /// so it is answered with the fully qualified name of the tag — Git's own
+    /// preference when it resolves one locally.
+    pub(crate) fn resolve(&self, name: &str) -> Option<(String, String)> {
+        let find = |list: &[(String, String)], wanted: &str| {
+            list.iter()
+                .find(|(candidate, _)| candidate == wanted)
+                .map(|(_, commit)| commit.clone())
+        };
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            return find(&self.branches, branch).map(|commit| (name.to_owned(), commit));
+        }
+        if let Some(tag) = name.strip_prefix("refs/tags/") {
+            return find(&self.tags, tag).map(|commit| (name.to_owned(), commit));
+        }
+        if name == "HEAD" {
+            let head = self.head.as_deref()?;
+            return find(&self.branches, head).map(|commit| ("HEAD".to_owned(), commit));
+        }
+        match (find(&self.tags, name), find(&self.branches, name)) {
+            (Some(commit), Some(_)) => Some((format!("refs/tags/{name}"), commit)),
+            (Some(commit), None) | (None, Some(commit)) => Some((name.to_owned(), commit)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// List the branches and tags at `url`, without fetching anything else.
+pub(crate) fn list_refs(url: &str) -> Result<Refs, Failure> {
+    let directory = std::env::temp_dir();
+    let listing = git(&directory, &["ls-remote", "--heads", "--tags", url])
+        .map_err(|error| Failure::provider(format!("{error}\n  while listing {}", redact(url))))?;
+    let mut refs = parse_refs(&listing);
+    // Only asked for separately because `--heads --tags` filters `HEAD` out.
+    // A repository with no default branch is not an error, just unlabelled.
+    if let Ok(symref) = git(&directory, &["ls-remote", "--symref", url, "HEAD"]) {
+        refs.head = symref.lines().find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")?
+                .split('\t')
+                .next()
+                .map(str::to_owned)
+        });
+    }
+    Ok(refs)
+}
+
+/// Read `git ls-remote` output into branches and tags.
+fn parse_refs(listing: &str) -> Refs {
+    let mut refs = Refs::default();
+    let mut peeled = std::collections::HashMap::new();
+    for line in listing.lines() {
+        let Some((commit, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            refs.branches.push((branch.to_owned(), commit.to_owned()));
+        } else if let Some(tag) = name.strip_prefix("refs/tags/") {
+            match tag.strip_suffix("^{}") {
+                Some(tag) => {
+                    peeled.insert(tag.to_owned(), commit.to_owned());
+                }
+                None => refs.tags.push((tag.to_owned(), commit.to_owned())),
+            }
+        }
+    }
+    for (tag, commit) in &mut refs.tags {
+        if let Some(target) = peeled.remove(tag.as_str()) {
+            *commit = target;
+        }
+    }
+    refs
 }
 
 /// Say what was being looked for and where, and translate Git's own words for
@@ -318,6 +529,50 @@ mod tests {
         assert!(!is_unknown_ref(
             "fatal: unable to access 'https://host/': Could not resolve host"
         ));
+    }
+
+    #[test]
+    fn history_records_survive_any_subject() {
+        let commits = parse_history(
+            "aaaa\x1fbbbb cccc\x1fAda\x1f1700000000\x1fMerge: a, b; c\x1e\n\
+             bbbb\x1f\x1fAda\x1f1690000000\x1f\x1e\n",
+        );
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].parents, ["bbbb", "cccc"]);
+        assert_eq!(commits[0].subject, "Merge: a, b; c");
+        assert_eq!(commits[0].time, 1_700_000_000);
+        // A root commit has no parents, and a commit may have no subject.
+        assert!(commits[1].parents.is_empty());
+        assert_eq!(commits[1].subject, "");
+    }
+
+    #[test]
+    fn refs_resolve_the_way_git_would() {
+        let refs = parse_refs(
+            "aaaa\trefs/heads/main\n\
+             bbbb\trefs/heads/v2\n\
+             cccc\trefs/tags/v1\n\
+             dddd\trefs/tags/v2\n\
+             eeee\trefs/tags/v2^{}\n",
+        );
+        // An annotated tag names the commit it tags, not the tag object.
+        assert_eq!(
+            refs.tags,
+            [("v1".into(), "cccc".into()), ("v2".into(), "eeee".into())]
+        );
+        assert_eq!(refs.resolve("main"), Some(("main".into(), "aaaa".into())));
+        assert_eq!(refs.resolve("v1"), Some(("v1".into(), "cccc".into())));
+        // Ambiguous short names go to the tag, spelled so the server agrees.
+        assert_eq!(
+            refs.resolve("v2"),
+            Some(("refs/tags/v2".into(), "eeee".into()))
+        );
+        assert_eq!(
+            refs.resolve("refs/heads/v2"),
+            Some(("refs/heads/v2".into(), "bbbb".into()))
+        );
+        assert_eq!(refs.resolve("missing"), None);
+        assert_eq!(refs.resolve("HEAD"), None);
     }
 
     #[test]

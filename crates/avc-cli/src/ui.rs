@@ -146,20 +146,30 @@ pub fn note(text: &str) {
 /// being buffered first — a push of ten artifacts prints each as it lands
 /// rather than all of them at the end.
 pub fn action(verb: &str, style: Style, subject: &str, detail: Option<&str>) {
+    println!("{}", action_text(verb, style, subject, detail));
+}
+
+/// The line [`action`] prints, for a caller that has to write it itself.
+pub fn action_text(verb: &str, style: Style, subject: &str, detail: Option<&str>) -> String {
     let verb = paint(&format!("{verb:<VERB_WIDTH$}"), style);
     match detail {
-        Some(detail) => println!(
+        Some(detail) => format!(
             "{verb}{subject} {}",
             paint(&format!("({detail})"), Style::Dim)
         ),
-        None => println!("{verb}{subject}"),
+        None => format!("{verb}{subject}"),
     }
 }
 
 /// An indented `key   value` pair, for the handful of places that describe a
 /// configuration rather than a list of artifacts.
 pub fn field(key: &str, value: &str) {
-    println!("  {}  {value}", paint(&format!("{key:<9}"), Style::Dim));
+    println!("{}", field_text(key, value));
+}
+
+/// The line [`field`] prints, for a caller that has to write it itself.
+pub fn field_text(key: &str, value: &str) -> String {
+    format!("  {}  {value}", paint(&format!("{key:<9}"), Style::Dim))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
