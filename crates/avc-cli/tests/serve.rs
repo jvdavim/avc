@@ -148,9 +148,9 @@ impl Server {
             .stderr(Stdio::null())
             .spawn()
             .expect("the avc binary should run");
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         let mut address = None;
-        for line in stdout.lines() {
+        for line in lines.by_ref() {
             let line = line.unwrap();
             if let Some(url) = line.split_whitespace().find(|w| w.starts_with("http://")) {
                 address = Some(
@@ -161,6 +161,10 @@ impl Server {
                 break;
             }
         }
+        // Keep reading what the server logs, as a terminal would. Closing the
+        // pipe instead would test a server whose log nobody reads — which is
+        // `a_closed_log_does_not_stop_the_server`'s job, not every test's.
+        std::thread::spawn(move || lines.for_each(drop));
         Self {
             child,
             address: address.expect("serve should print the URL it listens on"),
@@ -449,6 +453,57 @@ fn refuses_a_version_the_repository_does_not_have() {
         assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
     }
     assert!(!marker.exists());
+}
+
+/// A server whose log is piped somewhere that stops reading — `avc serve |
+/// head`, or a supervisor that went away — must keep serving.
+#[test]
+fn a_closed_log_does_not_stop_the_server() {
+    let root = TempDir::new("closed-log");
+    let repo = publish(&root.0);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_avc"))
+        .args(["serve", "--repo", &repo, "--port", "0"])
+        .env("NO_COLOR", "1")
+        .current_dir(&root.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the avc binary should run");
+    let stderr = child.stderr.take().unwrap();
+    // Read only the line naming the address, then hang up, before the server
+    // has printed the rest of its banner or logged a single download.
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut address = None;
+    let mut line = String::new();
+    while address.is_none() && stdout.read_line(&mut line).unwrap() > 0 {
+        address = line
+            .split_whitespace()
+            .find(|word| word.starts_with("http://"))
+            .map(|url| {
+                url.trim_start_matches("http://")
+                    .trim_end_matches('/')
+                    .to_owned()
+            });
+        line.clear();
+    }
+    drop(stdout);
+    let server = Server {
+        child,
+        address: address.expect("serve should print the URL it listens on"),
+    };
+    // Twice: the first download's log line is a write to the dead pipe, and
+    // the second shows the server survived it.
+    for _ in 0..2 {
+        let (status, _, body) = server.get("/download?path=models/bert/weights.bin");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"bert weights\n");
+    }
+    // A write to a closed pipe that panicked would say so here, even when it
+    // happened after the response was sent.
+    drop(server);
+    let mut errors = String::new();
+    BufReader::new(stderr).read_to_string(&mut errors).unwrap();
+    assert!(!errors.contains("panicked"), "{errors}");
 }
 
 fn walk(root: &Path) -> Vec<PathBuf> {

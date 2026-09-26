@@ -84,10 +84,10 @@ pub struct ServeArgs {
 pub fn serve(args: &ServeArgs) -> Result<(), Failure> {
     let (url, root, mirror) = match &args.repo {
         Some(url) => {
-            ui::line(
+            say(&ui::paint(
                 &format!("reading the history of {}", git::redact(url)),
                 Style::Dim,
-            );
+            ));
             (url.clone(), None, Some(git::Mirror::clone(url)?))
         }
         None => {
@@ -129,24 +129,30 @@ pub fn serve(args: &ServeArgs) -> Result<(), Failure> {
     let address = listener.local_addr().map_err(crate::io_error)?;
     let loopback = address.ip().is_loopback();
 
-    ui::heading(&format!("serving {}", version.registry.describe()));
-    ui::field(
+    say(&ui::paint(
+        &format!("serving {}", version.registry.describe()),
+        Style::Bold,
+    ));
+    say(&ui::field_text(
         "objects",
         &version.store.as_ref().map_or_else(
             || "local cache only (no object store configured)".to_owned(),
             |store| store.describe(),
         ),
-    );
-    ui::field("url", &format!("http://{}/", display_address(address)));
+    ));
+    say(&ui::field_text(
+        "url",
+        &format!("http://{}/", display_address(address)),
+    ));
     if !loopback {
-        ui::line(
+        say(&ui::paint(
             "warning: the catalog is reachable from the network, and it serves every \
              artifact with this machine's credentials",
             Style::Warn,
-        );
+        ));
     }
-    ui::note("press Ctrl-C to stop");
-    println!();
+    say(&ui::paint("note: press Ctrl-C to stop", Style::Dim));
+    say("");
     drop(version);
 
     for connection in listener.incoming() {
@@ -155,6 +161,15 @@ pub fn serve(args: &ServeArgs) -> Result<(), Failure> {
         std::thread::spawn(move || handle(&catalog, stream, loopback));
     }
     Ok(())
+}
+
+/// Print one line of the server's log, and carry on if nobody is reading it.
+///
+/// `println!` panics when stdout has gone away — `avc serve | head`, or a
+/// supervisor that closed the pipe — and a server should not stop serving
+/// because its log went unread.
+fn say(line: &str) {
+    let _ = writeln!(std::io::stdout(), "{line}");
 }
 
 /// How the listening address is written in a URL: an IPv6 address needs
@@ -764,7 +779,7 @@ fn download(
         || "working tree".to_owned(),
         |commit| format!("at {commit}"),
     );
-    ui::action(
+    say(&ui::action_text(
         "served",
         Style::Ok,
         &wanted,
@@ -773,7 +788,7 @@ fn download(
             ui::plural(items.len(), "file"),
             ui::size(total)
         )),
-    );
+    ));
     Ok(())
 }
 
