@@ -1,6 +1,6 @@
 # CLI Reference
 
-Everything `avc` can do in `0.1.0`. Behavior described here reflects the current
+Everything `avc` can do in `0.2.0`. Behavior described here reflects the current
 implementation, including its gaps — where a flag is accepted but not yet
 honored, this page says so.
 

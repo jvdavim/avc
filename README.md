@@ -74,7 +74,7 @@ avc fetch --repo https://github.com/acme/artifacts data/raw/2024.csv -o .  # ./2
   liability.
 
 > [!IMPORTANT]
-> AVC is a **`0.1.0` prototype**. The local workflow and S3 transport work end
+> AVC is a **`0.2.0` prototype**. The local workflow and S3 transport work end
 > to end; `gs://` and `az://` still configure correctly and then return an
 > explicit unsupported-adapter error on transfer. On-disk formats are
 > provisional. See the [roadmap](docs/roadmap.md).
@@ -108,7 +108,7 @@ platform, check it against the release's `SHA256SUMS`, and put the binary on
 your `PATH`:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.2.0
 TARGET=x86_64-unknown-linux-gnu   # aarch64-unknown-linux-gnu on ARM Linux,
                                   # aarch64-apple-darwin on Apple Silicon,
                                   # x86_64-apple-darwin on Intel Macs
