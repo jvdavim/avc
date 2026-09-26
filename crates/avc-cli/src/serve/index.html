@@ -26,7 +26,18 @@
     margin: 0; background: var(--bg); color: var(--text);
     font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  .layout { display: grid; grid-template-columns: 400px minmax(0, 1fr); min-height: 100vh; }
+  .layout { display: grid; grid-template-columns: var(--aside-width, 400px) minmax(0, 1fr); min-height: 100vh; }
+  .resizer {
+    position: absolute; top: 0; right: -4px; width: 8px; height: 100%; z-index: 5;
+    cursor: col-resize; touch-action: none;
+  }
+  .resizer::after {
+    content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 2px;
+    background: transparent; transition: background .12s ease;
+  }
+  .resizer:hover::after, .resizer:focus-visible::after, body.resizing .resizer::after { background: var(--accent); }
+  .resizer:focus-visible { outline: none; }
+  body.resizing { cursor: col-resize; user-select: none; }
   aside {
     position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column;
     background: var(--panel); border-right: 1px solid var(--line);
@@ -95,6 +106,18 @@
   td.name a { color: var(--text); text-decoration: none; }
   td.name a:hover { color: var(--accent); text-decoration: underline; }
   .icon { display: inline-block; width: 1.4em; color: var(--muted); }
+  .name-inner { display: flex; align-items: baseline; gap: 2px; min-width: 0; }
+  .toggle {
+    flex: none; width: 1.5em; height: 1.5em; padding: 0; border: 0; border-radius: 4px; cursor: pointer;
+    background: transparent; color: var(--muted); font: inherit; line-height: 1.5em; text-align: center;
+  }
+  .toggle:hover { background: var(--line); color: var(--text); }
+  .toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .toggle span { display: inline-block; transition: transform .12s ease; }
+  .toggle[aria-expanded=true] span { transform: rotate(90deg); }
+  .spacer { flex: none; width: 1.5em; text-align: center; color: var(--muted); }
+  tr.child td { background: color-mix(in srgb, var(--hover) 45%, transparent); }
+  td.load-error { color: var(--bad); font-size: 12px; }
   .kind { color: var(--muted); font-size: 12px; margin-left: 6px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
   .hash { font-family: var(--mono); font-size: 12px; color: var(--muted); }
@@ -113,6 +136,7 @@
   @media (max-width: 900px) {
     .layout { grid-template-columns: minmax(0, 1fr); }
     aside { position: static; height: auto; max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--line); }
+    .resizer { display: none; }
   }
   @media (max-width: 640px) {
     header, main { padding-left: 16px; padding-right: 16px; }
@@ -133,6 +157,9 @@
   </div>
   <div class="graph-scroll" id="graph-scroll"><div class="graph" id="graph"><div class="empty">Loading history…</div></div></div>
   <div class="history-note" id="history-note"></div>
+  <div class="resizer" id="resizer" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Resize the history panel" aria-valuemin="240"
+       title="Drag to resize · double-click to reset"></div>
 </aside>
 <div>
 <header>
@@ -152,7 +179,7 @@
 </div>
 <script>
 "use strict";
-const state = { catalog: null, history: null, trees: new Map(), query: "" };
+const state = { catalog: null, history: null, trees: new Map(), expanded: new Set(), query: "" };
 const WORKTREE = "\u0000worktree";
 const SVG = "http://www.w3.org/2000/svg";
 const $ = (id) => document.getElementById(id);
@@ -237,6 +264,12 @@ async function rows(at) {
     return artifacts.filter((a) => a.path.toLowerCase().includes(q))
       .map((a) => ({ ...a, name: a.path }));
   }
+  return listing(at);
+}
+
+/** What sits directly below `at`, whichever filter is active. */
+async function listing(at) {
+  const artifacts = state.catalog.artifacts;
   const directory = at && owningDirectory(at);
   if (directory) {
     const listing = await tree(directory.path);
@@ -248,6 +281,35 @@ async function rows(at) {
   }
   const below = at ? artifacts.filter((a) => a.path.startsWith(at + "/")) : artifacts;
   return group(below, at, (a, name) => ({ ...a, name }));
+}
+
+/**
+ * `items` with the contents of every expanded folder inserted beneath it, one
+ * level deeper. A folder that cannot be read says so in its own row rather
+ * than failing the whole listing.
+ */
+async function withExpanded(items, depth) {
+  const out = [];
+  for (const item of items) {
+    out.push({ ...item, depth });
+    if (item.kind === "file" || !state.expanded.has(item.path)) continue;
+    try { out.push(...await withExpanded(await listing(item.path), depth + 1)); }
+    catch (error) { out.push({ kind: "error", message: error.message, depth: depth + 1 }); }
+  }
+  return out;
+}
+
+function toggle(path) {
+  if (state.expanded.has(path)) {
+    // Collapsing hides what is beneath, so forget that too: reopening shows
+    // one level, as a file browser does.
+    for (const open of [...state.expanded]) {
+      if (open === path || open.startsWith(path + "/")) state.expanded.delete(open);
+    }
+  } else {
+    state.expanded.add(path);
+  }
+  render();
 }
 
 function crumbs(at) {
@@ -265,13 +327,31 @@ function crumbs(at) {
 }
 
 function row(item) {
+  const indent = 12 + (item.depth || 0) * 20 + "px";
+  if (item.kind === "error") {
+    const cell = el("td", { class: "load-error", colspan: "6" }, "Could not open: " + item.message);
+    cell.style.paddingLeft = indent;
+    return el("tr", { class: "child" }, cell);
+  }
   const browsable = item.kind !== "file";
-  const icon = el("span", { class: "icon", "aria-hidden": "true" }, browsable ? "▸" : "·");
+  const open = state.expanded.has(item.path);
+  let icon;
+  if (browsable) {
+    icon = el("button", {
+      type: "button", class: "toggle", "aria-expanded": String(open),
+      "aria-label": (open ? "Collapse " : "Expand ") + item.name,
+    }, el("span", { "aria-hidden": "true" }, "▸"));
+    icon.addEventListener("click", () => toggle(item.path));
+  } else {
+    icon = el("span", { class: "spacer", "aria-hidden": "true" }, "·");
+  }
   const name = browsable
     ? el("a", { href: "#/" + item.path.split("/").map(encodeURIComponent).join("/") }, item.name + "/")
-    : document.createTextNode(item.name);
-  const cell = el("td", { class: "name" }, icon, name);
-  if (item.kind === "directory") cell.append(el("span", { class: "kind" }, "tracked directory"));
+    : el("span", {}, item.name);
+  const inner = el("div", { class: "name-inner" }, icon, name);
+  if (item.kind === "directory") inner.append(el("span", { class: "kind" }, "tracked directory"));
+  const cell = el("td", { class: "name" }, inner);
+  cell.style.paddingLeft = indent;
   const count = item.kind === "folder" ? plural(item.count, "file")
     : item.kind === "directory" && item.files !== null ? plural(item.files, "file") : "";
   const bytes = item.kind === "folder" && item.unknown ? null : item.size;
@@ -283,7 +363,7 @@ function row(item) {
     "aria-disabled": item.available ? null : "true",
     title: item.available ? null : "Some bytes are on neither the object store nor this machine",
   }, label);
-  return el("tr", {},
+  return el("tr", { class: item.depth ? "child" : null },
     cell,
     el("td", { class: "num hide-sm" }, count),
     el("td", { class: "num" }, size(bytes)),
@@ -299,8 +379,8 @@ async function render() {
   const at = here();
   crumbs(state.query ? "" : at);
   const panel = $("panel");
-  let items;
-  try { items = await rows(at); }
+  let items, shown;
+  try { items = await rows(at); shown = await withExpanded(items, 0); }
   catch (error) {
     if (token !== renderToken) return;
     panel.replaceChildren(el("div", { class: "error" }, error.message));
@@ -318,7 +398,7 @@ async function render() {
   const head = el("tr", {}, el("th", {}, "Name"), el("th", { class: "num hide-sm" }, "Files"),
     el("th", { class: "num" }, "Size"), el("th", { class: "hide-sm" }, "Object"),
     el("th", {}, "Status"), el("th", {}, ""));
-  panel.replaceChildren(el("table", {}, el("thead", {}, head), el("tbody", {}, ...items.map(row))));
+  panel.replaceChildren(el("table", {}, el("thead", {}, head), el("tbody", {}, ...shown.map(row))));
   const total = items.reduce((sum, item) => sum + (item.size || 0), 0);
   const available = items.filter((item) => item.available).length;
   $("summary").textContent = `${plural(items.length, "item")}, ${size(total)}: ` +
@@ -550,6 +630,7 @@ async function load() {
   renderGraph();
   renderViewing();
   state.trees.clear();
+  state.expanded.clear();
   $("summary").textContent = "";
   $("panel").replaceChildren(el("div", { class: "empty" },
     currentRef() ? `Loading ${currentRef()}…` : "Loading…"));
@@ -577,6 +658,57 @@ $("goto").addEventListener("submit", (event) => {
   if (value) { chooseVersion(value); $("goto-ref").value = ""; }
 });
 $("refresh").addEventListener("click", loadHistory);
+
+/* ---------- resizable history panel ---------- */
+
+const PANEL = { min: 240, fallback: 400, key: "avc-serve.history-width" };
+let panelWidth = PANEL.fallback;
+const panelMax = () => Math.max(PANEL.min, Math.floor(window.innerWidth * 0.7));
+
+function setPanelWidth(px, save) {
+  panelWidth = Math.round(Math.min(panelMax(), Math.max(PANEL.min, px)));
+  document.querySelector(".layout").style.setProperty("--aside-width", panelWidth + "px");
+  $("resizer").setAttribute("aria-valuenow", String(panelWidth));
+  $("resizer").setAttribute("aria-valuemax", String(panelMax()));
+  if (save) { try { localStorage.setItem(PANEL.key, String(panelWidth)); } catch (error) { /* not stored */ } }
+}
+
+(() => {
+  const resizer = $("resizer");
+  let stored = NaN;
+  try { stored = Number(localStorage.getItem(PANEL.key)); } catch (error) { /* nothing stored */ }
+  setPanelWidth(stored > 0 ? stored : PANEL.fallback, false);
+
+  resizer.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    resizer.setPointerCapture(event.pointerId);
+    document.body.classList.add("resizing");
+  });
+  resizer.addEventListener("pointermove", (event) => {
+    if (!resizer.hasPointerCapture(event.pointerId)) return;
+    setPanelWidth(event.clientX - resizer.parentElement.getBoundingClientRect().left, false);
+  });
+  const finish = (event) => {
+    if (!resizer.hasPointerCapture(event.pointerId)) return;
+    resizer.releasePointerCapture(event.pointerId);
+    document.body.classList.remove("resizing");
+    setPanelWidth(panelWidth, true);
+  };
+  resizer.addEventListener("pointerup", finish);
+  resizer.addEventListener("pointercancel", finish);
+  resizer.addEventListener("dblclick", () => setPanelWidth(PANEL.fallback, true));
+  resizer.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 96 : 24;
+    const next = { ArrowLeft: panelWidth - step, ArrowRight: panelWidth + step,
+      Home: PANEL.min, End: panelMax() }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    setPanelWidth(next, true);
+  });
+  // A narrower window may leave the panel wider than it is now allowed to be.
+  window.addEventListener("resize", () => setPanelWidth(panelWidth, false));
+})();
 window.addEventListener("hashchange", render);
 window.addEventListener("popstate", load);
 loadHistory();
