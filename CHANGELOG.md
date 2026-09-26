@@ -11,6 +11,13 @@ include a breaking format change. See
 
 ## [Unreleased]
 
+### Changed
+
+- `avc serve`: the history panel can be resized by dragging its edge (or with
+  the arrow keys), and the width is remembered. In the listing, the arrow beside
+  a folder or tracked directory now expands and collapses it in place; clicking
+  its name still goes into it.
+
 ## [0.2.0] - 2026-09-26
 
 ### Added

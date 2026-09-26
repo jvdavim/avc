@@ -779,6 +779,9 @@ a checkout, a *Working tree* entry sits on top, joined to the checked-out commit
   following its branch as it moves; a commit stays put.
 - **Type into *Go to branch, tag, or commit…*** for anything older than the
   graph shows — it holds the newest 500 commits.
+- **Drag the panel's right edge** to make it wider or narrower. The arrow keys
+  do the same once the edge has focus, and a double-click puts it back. The
+  width is remembered in the browser.
 
 Choosing a version reloads the catalog from the pointers committed at that
 revision, and every download then serves the objects *those* pointers name — so
@@ -814,10 +817,12 @@ Only names the repository advertises, the server's own default, and commit ids
 (4 to 40 hex characters) are accepted as a version; anything else is a `404`.
 That matters because the name is passed to Git.
 
-The page lists what the repository tracks as a tree of paths. A tracked
-directory can be opened to see the files inside it — its manifest is fetched
-from the remote when it is not cached, and remembered for as long as the server
-runs. Each row shows its size, object, and whether its bytes can be served.
+The page lists what the repository tracks as a tree of paths. The arrow beside
+a folder or a tracked directory expands it in place, nested beneath its row, and
+collapses it again; clicking the name instead goes into it. A tracked directory's
+files come from its manifest, which is fetched from the remote when it is not
+cached and remembered for as long as the server runs. Each row shows its size,
+object, and whether its bytes can be served.
 
 | Download of | Arrives as |
 | --- | --- |
