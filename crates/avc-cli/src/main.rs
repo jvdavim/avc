@@ -4,6 +4,7 @@ mod migrate;
 mod parallel;
 mod progress;
 mod registry;
+mod serve;
 mod ui;
 
 use std::fs::{self, File};
@@ -111,6 +112,14 @@ enum Command {
     /// any artifact is missing or differs, which makes it a gate a pipeline can
     /// fail on. See docs/ci-cd.md.
     Verify(ci::VerifyArgs),
+
+    /// Serve a web page for browsing and downloading a repository's artifacts.
+    ///
+    /// Lists what the repository tracks, looks inside tracked directories, and
+    /// downloads a file as itself or anything larger as a tar archive, laid out
+    /// the way `avc fetch` would lay it out. Every object is verified as it
+    /// streams. Listens on 127.0.0.1:8080 unless told otherwise.
+    Serve(serve::ServeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -379,6 +388,7 @@ fn run(command: Command) -> Result<(), Failure> {
         },
         Command::Fetch(args) => ci::fetch(&args),
         Command::Verify(args) => ci::verify(&args),
+        Command::Serve(args) => serve::serve(&args),
     }
 }
 

@@ -282,6 +282,19 @@ and whether the remote can supply it, **without downloading bytes**; give it a
 path to scope the listing, or a tracked directory to see the files inside it. `avc doctor` re-hashes cached
 objects and fails on any drift.
 
+`avc serve` puts the same catalog behind a web page, for whoever would rather
+click than type: pick a commit, branch, or tag from a commit graph, browse the
+repository's paths as they were at that version, look inside tracked directories, and download a
+file as itself or anything larger as a `.tar`. Every object is
+verified as it streams, and a corrupt one ends its download short instead of
+arriving as the wrong file. It listens on `127.0.0.1:8080` by default and needs
+no dependencies beyond the binary.
+
+```bash
+avc serve                                                  # this checkout
+avc serve --repo https://github.com/acme/artifacts --ref v1.0.0
+```
+
 Output is aligned ASCII, colored when the terminal wants it and plain when it
 does not — a pipe, `NO_COLOR`, or `--color never`. Anything a script parses
 should use `--porcelain` instead, which is tab-separated and stable.

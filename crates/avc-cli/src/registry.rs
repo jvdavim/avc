@@ -32,9 +32,9 @@ pub(crate) struct Registry {
     /// belong in the worktree the caller is standing in. A registry named by
     /// URL has no worktree at all.
     worktree: Option<PathBuf>,
-    /// Held only to keep a temporary checkout alive for this registry's
+    /// Keeps a temporary checkout alive for this registry's
     /// lifetime; dropping it deletes the directory `repo.root` points into.
-    _checkout: Option<git::Checkout>,
+    checkout: Option<git::Checkout>,
 }
 
 impl Registry {
@@ -43,14 +43,20 @@ impl Registry {
     /// Nothing but pointers and configuration is read: artifacts are gitignored,
     /// so the checkout is text, and the bytes come later from the object store.
     pub(crate) fn from_git(url: &str, revision: &str) -> Result<Self, Failure> {
-        let checkout = git::Checkout::at(url, revision)?;
+        Self::from_git_via(url, url, revision)
+    }
+
+    /// The same, reading the pointers from `source` — a local copy of the
+    /// repository at `url` — while still describing it as `url`.
+    pub(crate) fn from_git_via(source: &str, url: &str, revision: &str) -> Result<Self, Failure> {
+        let checkout = git::Checkout::at(source, revision)?;
         let description = format!("{}@{} ({revision})", git::redact(url), checkout.commit());
         let repo = Repo::at(checkout.path().to_path_buf())?;
         Ok(Self {
             repo,
             description,
             worktree: None,
-            _checkout: Some(checkout),
+            checkout: Some(checkout),
         })
     }
 
@@ -68,7 +74,7 @@ impl Registry {
             description: root.display().to_string(),
             worktree: Some(root.clone()),
             repo: Repo::at(root)?,
-            _checkout: None,
+            checkout: None,
         })
     }
 
@@ -91,7 +97,7 @@ impl Registry {
             repo,
             description,
             worktree: Some(root),
-            _checkout: Some(checkout),
+            checkout: Some(checkout),
         })
     }
 
@@ -124,6 +130,12 @@ impl Registry {
     /// simply find nothing there and go to the object store instead.
     pub(crate) fn repo(&self) -> &Repo {
         &self.repo
+    }
+
+    /// The commit the pointers were read at, abbreviated, or `None` for a
+    /// working tree.
+    pub(crate) fn commit(&self) -> Option<String> {
+        self.checkout.as_ref().map(git::Checkout::commit)
     }
 
     pub(crate) fn describe(&self) -> &str {

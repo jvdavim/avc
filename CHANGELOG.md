@@ -11,6 +11,19 @@ include a breaking format change. See
 
 ## [Unreleased]
 
+### Added
+
+- `avc serve` hosts a small web catalog of a repository's artifacts: browse its
+  paths, look inside tracked directories, and download a file, a tracked
+  directory, or a whole prefix — at any version. A commit graph down the side
+  of the page shows every branch head and tag; clicking a commit, branch, or
+  tag switches the catalog to that version, and each download serves the
+  objects that version's pointers name. Anything beyond one file downloads as a `.tar`
+  laid out the way `avc fetch` lays it out. Objects are verified while they
+  stream, and a corrupt one ends its response short of `Content-Length` so the
+  download fails rather than saving the wrong bytes. Built on `std::net`, so it
+  adds no dependencies.
+
 ## [0.1.0] - 2026-09-05
 
 First release. Iteration 0 — the on-disk formats are provisional.
